@@ -1,4 +1,4 @@
--- Minimal patched attempt (server only) – may not fire in new TextChat.
+-- Minimal patched attempt (server only) ï¿½ may not fire in new TextChat.
 -- If this does not log [ChatGiveCash][MSG] when you type 'cash', use the Remote approach.
 
 local AMOUNT = 500
@@ -11,14 +11,8 @@ local DEBUG = true
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TextChatService = game:GetService("TextChatService")
-
-local PlayerDataService
-pcall(function()
-	local m = game.ServerScriptService:FindFirstChild("Modules")
-	if m and m:FindFirstChild("PlayerDataService") then
-		PlayerDataService = require(m.PlayerDataService)
-	end
-end)
+local ServerScriptService = game:GetService("ServerScriptService")
+local PlayerProfileService = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("PlayerProfileService"))
 
 local function log(...) if DEBUG then print("[ChatGiveCash]", ...) end end
 local function warnf(...) warn("[ChatGiveCash]", ...) end
@@ -44,28 +38,17 @@ end
 local function strip(msg) return msg:gsub("^[/!]","") end
 
 local function getCoins(player)
-	if PlayerDataService and PlayerDataService.GetCoins then
-		return PlayerDataService.GetCoins(player)
-	end
-	local ls=player:FindFirstChild("leaderstats")
-	local c=ls and ls:FindFirstChild("Coins")
-	return c and c.Value or 0
+    return PlayerProfileService.GetCoins(player)
 end
 
 local function grant(player)
-	local before=getCoins(player)
-	if PlayerDataService and PlayerDataService.IncrementCoins then
-		PlayerDataService.IncrementCoins(player, AMOUNT)
-		if SAVE_IMMEDIATELY and PlayerDataService.SaveImmediately then
-			pcall(function() PlayerDataService.SaveImmediately(player,"ChatGiveCash") end)
-		end
-	else
-		local ls=player:FindFirstChild("leaderstats")
-		local c=ls and ls:FindFirstChild("Coins")
-		if c then c.Value += AMOUNT end
-	end
-	local after=getCoins(player)
-	log(string.format("Granted %d to %s (before=%d after=%d)", AMOUNT, player.Name, before, after))
+    local before = getCoins(player)
+    PlayerProfileService.IncrementCoins(player, AMOUNT)
+    if SAVE_IMMEDIATELY and PlayerProfileService.SaveNow then
+        pcall(function() PlayerProfileService.SaveNow(player, "ChatGiveCash") end)
+    end
+    local after = getCoins(player)
+    log(string.format("Granted %d to %s (before=%d after=%d)", AMOUNT, player.Name, before, after))
 end
 
 local function handle(player, raw, src)

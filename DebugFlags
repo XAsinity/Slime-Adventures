@@ -1,0 +1,28 @@
+local DebugFlags = {
+    -- Master category toggles
+    EggDebug          = false,  -- world eggs + inventory save pipeline
+    SlimeDebug        = false,  -- world slimes / captured slimes
+    ToolDebug         = false,  -- egg/food tools
+    PlayerDataDebug   = false,  -- PlayerDataService / Orchestrator
+}
+
+local function tagPrint(tag, ...)
+    print(string.format("[DebugFlags][%s]", tag), ...)
+end
+
+function DebugFlags.Set(category, value)
+    if DebugFlags[category] == nil then
+        tagPrint("Warn", "Unknown category:", category)
+        return
+    end
+    DebugFlags[category] = value and true or false
+    tagPrint("Set", category .. "=" .. tostring(DebugFlags[category]))
+end
+
+-- Convenience setters
+function DebugFlags.SetEggDebug(v)        DebugFlags.Set("EggDebug", v) end
+function DebugFlags.SetSlimeDebug(v)      DebugFlags.Set("SlimeDebug", v) end
+function DebugFlags.SetToolDebug(v)       DebugFlags.Set("ToolDebug", v) end
+function DebugFlags.SetPlayerDataDebug(v) DebugFlags.Set("PlayerDataDebug", v) end
+
+return DebugFlags

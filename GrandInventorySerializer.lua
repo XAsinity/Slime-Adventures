@@ -1,15 +1,13 @@
 -- GrandInventorySerializer.lua
--- Version: v1.0-grand-unified
--- Aggregates: WorldSlime, WorldEgg, FoodTool, EggTool, CapturedSlime serializers
--- Provides a single entry point: Serialize(player, isFinal), Restore(player, data)
--- Each sub-serializer is namespaced; config is unified.
--- No logic is left out; all features and configs preserved.
+-- Now routes all persistence through PlayerProfileService
 
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local Workspace           = game:GetService("Workspace")
 local RunService          = game:GetService("RunService")
 local HttpService         = game:GetService("HttpService")
+
+local PlayerProfileService = require(ServerScriptService.Modules:WaitForChild("PlayerProfileService"))
 
 local GrandInventorySerializer = { Name = "grandInventory" }
 
@@ -33,6 +31,9 @@ GrandInventorySerializer.CONFIG = {
 		TemplateFolders = { "Assets", "EggTemplates", "WorldEggs" },
 		DefaultTemplateName = "Egg",
 		RestoreEggsReady = false,
+		-- NEW: accept eggs that have Placed=true but ManualHatch not yet set for a brief grace
+		AcceptMissingManualHatchGraceSeconds = 10,
+		AutoCaptureOnEggPlacement = true,
 	},
 	-- FoodTool
 	FoodTool = {
@@ -81,6 +82,21 @@ GrandInventorySerializer.CONFIG = {
 local function dprint(...)
 	if GrandInventorySerializer.CONFIG.Debug then print("[GrandInvSer]", ...) end
 end
+
+local clock = os.clock
+
+local DebugFlags = require(ServerScriptService.Modules:WaitForChild("DebugFlags"))
+
+local function eggdbg(...)
+	-- Guard: only prints if flag true
+	if DebugFlags and DebugFlags.EggDebug then
+		print("[EggDbg][GrandInvSer]", ...)
+	end
+end
+
+-- World egg state tables (single definition; removed legacy preserve-across-reload pattern)
+local we_lastSnapshot = {}
+local we_immediateCaptures = {}
 
 -------------------------------------------------------------------------------
 -- WorldSlime Serializer
@@ -155,177 +171,171 @@ local function ws_scan(player)
 	end
 	return out
 end
+
 local function ws_applyColors(model)
-	for attr,short in pairs({ BodyColor="bc", AccentColor="ac", EyeColor="ec" }) do
-		local v=model:GetAttribute(attr)
-		if typeof(v)=="string" then
-			local c=ws_hexToColor3(v)
-			if c then
-				model:SetAttribute(attr, c)
-				model:SetAttribute(attr.."_Hex", v)
-			end
-		end
-	end
+    for attr,short in pairs({ BodyColor="bc", AccentColor="ac", EyeColor="ec" }) do
+        local v=model:GetAttribute(attr)
+        if typeof(v)=="string" then
+            local c=ws_hexToColor3(v)
+            if c then
+                model:SetAttribute(attr, c)
+                model:SetAttribute(attr.."_Hex", v)
+            end
+        end
+    end
 end
+
 local function ws_serialize(player, isFinal)
-	local slimes=ws_scan(player)
-	local list={}
-	local seen={}
-	local now=os.time()
-	local plot, origin
-	for _,m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and m:GetAttribute("UserId")==player.UserId and m.Name:match("^Player%d+$") then
-			plot=m; break
-		end
-	end
-	if plot then
-		local zone=plot:FindFirstChild("SlimeZone")
-		if zone and zone:IsA("BasePart") then origin=zone end
-	end
-	for _,m in ipairs(slimes) do
-		local sid=m:GetAttribute("SlimeId")
-		if WSCONFIG.DedupeOnSerialize and sid and seen[sid] then
-			dprint("Skip duplicate live slime SlimeId="..sid)
-		else
-			local prim=m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-			if prim then
-				local cf=prim.CFrame
-				local entry={ px=cf.X, py=cf.Y, pz=cf.Z }
-				if WSCONFIG.UseLocalCoords and origin then
-					local lcf=origin.CFrame:ToObjectSpace(cf)
-					entry.lpx, entry.lpy, entry.lpz = lcf.X,lcf.Y,lcf.Z
-					entry.lry = math.atan2(-lcf.LookVector.X, -lcf.LookVector.Z)
-				else
-					entry.ry = math.atan2(-cf.LookVector.X, -cf.LookVector.Z)
-				end
-				for attr,short in pairs(WS_ATTR_MAP) do
-					local v=m:GetAttribute(attr)
-					if v~=nil then
-						if colorKeys[short] and typeof(v)=="Color3" then
-							v=ws_colorToHex(v)
-						end
-						entry[short]=v
-					end
-				end
-				entry.id = sid
-				entry.lg = now
-				list[#list+1]=entry
-				if sid then seen[sid]=true end
-				if #list >= WSCONFIG.MaxWorldSlimesPerPlayer then
-					dprint("MaxWorldSlimesPerPlayer reached.")
-					break
-				end
-			end
-		end
-	end
-	if #list>0 then
-		ws_lastSnapshot[player.UserId]={ list=list, t=os.clock() }
-	elseif isFinal then
-		local snap=ws_lastSnapshot[player.UserId]
-		if snap and snap.list and #snap.list>0 then
-			dprint(("Final: using cached worldSlimes snapshot count=%d"):format(#snap.list))
-			list = snap.list
-		end
-	end
-	dprint(("WorldSlime: Serialize player=%s final=%s count=%d"):format(player.Name, tostring(isFinal), #list))
-	return list
-end
+    local slimes = ws_scan(player)
+    local list = {}
+    local seen = {}
+    local now = os.time()
+    local plot, origin
+
+    for _,m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") and m:GetAttribute("UserId") == player.UserId and m.Name:match("^Player%d+$") then
+            plot = m
+            break
+        end
+    end
+    if plot then
+        local zone = plot:FindFirstChild("SlimeZone")
+        if zone and zone:IsA("BasePart") then origin = zone end
+    end
+    for _,m in ipairs(slimes) do
+        local sid = m:GetAttribute("SlimeId")
+        if WSCONFIG.DedupeOnSerialize and sid and seen[sid] then
+            dprint("Skip duplicate live slime SlimeId="..sid)
+        else
+            local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+            if prim then
+                local cf = prim.CFrame
+                local entry = { px = cf.X, py = cf.Y, pz = cf.Z }
+                if WSCONFIG.UseLocalCoords and origin then
+                    local lcf = origin.CFrame:ToObjectSpace(cf)
+                    entry.lpx, entry.lpy, entry.lpz = lcf.X, lcf.Y, lcf.Z
+                    entry.lry = math.atan2(-lcf.LookVector.X, -lcf.LookVector.Z)
+                else
+                    entry.ry = math.atan2(-cf.LookVector.X, -cf.LookVector.Z)
+                end
+                for attr,short in pairs(WS_ATTR_MAP) do
+                    local v = m:GetAttribute(attr)
+                    if v ~= nil then
+                        if colorKeys[short] and typeof(v) == "Color3" then
+                            v = ws_colorToHex(v)
+                        end
+                        entry[short] = v
+                    end
+                end
+                entry.id = sid
+                entry.lg = now
+                list[#list+1] = entry
+                if sid then seen[sid] = true end
+                if #list >= WSCONFIG.MaxWorldSlimesPerPlayer then
+                    dprint("MaxWorldSlimesPerPlayer reached.")
+                    break
+                end
+            end
+        end
+    end
+    if #list > 0 then
+        ws_lastSnapshot[player.UserId] = { list = list, t = os.clock() }
+    elseif isFinal then
+        local snap = ws_lastSnapshot[player.UserId]
+        if snap and snap.list and #snap.list > 0 then
+            dprint(("Final: using cached worldSlimes snapshot count=%d"):format(#snap.list))
+            list = snap.list
+        end
+    end
+    dprint(("WorldSlime: Serialize player=%s final=%s count=%d"):format(player.Name, tostring(isFinal), #list))
+    return list
+end 
+
+-- WorldSlime Restore function (refactored)
 local function ws_restore(player, list)
-	if not list or #list==0 then
-		dprint("WorldSlime: Restore: no entries")
-		return
-	end
-	if ws_restoredOnce[player] and WSCONFIG.SkipSecondPassIfComplete then
-		local allPresent=true
-		for _,e in ipairs(list) do
-			local sid=e.id
-			if sid then
-				local idx=ws_liveIndex[player.UserId]
-				if not (idx and idx[sid]) then
-					allPresent=false; break
-				end
-			end
-		end
-		if allPresent then
-			dprint("WorldSlime: Restore skipped (already present).")
-			return
-		end
-	end
-	ws_scan(player)
-	local plot, origin
-	for _,m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and m:GetAttribute("UserId")==player.UserId and m.Name:match("^Player%d+$") then
-			plot=m; break
-		end
-	end
-	if plot then
-		local zone=plot:FindFirstChild("SlimeZone")
-		if zone and zone:IsA("BasePart") then origin=zone end
-	end
-	local parent=plot or Workspace
-	local created,reused,skipped=0,0,0
-	for _,e in ipairs(list) do
-		local sid=e.id
-		if sid and WSCONFIG.DedupeOnRestore then
-			local idx=ws_liveIndex[player.UserId]
-			local existing = idx and idx[sid]
-			if existing and existing.Parent then
-				local cf
-				if origin and e.lpx then
-					cf = origin.CFrame * CFrame.new(e.lpx,e.lpy,e.lpz)
-				elseif e.px then
-					cf = CFrame.new(e.px,e.py,e.pz)
-				end
-				if cf then pcall(function() existing:PivotTo(cf) end) end
-				if WSCONFIG.MarkWorldSlimeAttribute then existing:SetAttribute("WorldSlime", true) end
-				ws_applyColors(existing)
-				reused += 1
-			else
-				local slime
-				local SlimeFactory
-				pcall(function()
-					SlimeFactory = require(ServerScriptService.Modules:WaitForChild("SlimeFactory"))
-				end)
-				if SlimeFactory and SlimeFactory.RestoreFromSnapshot then
-					local ok,res = pcall(function()
-						return SlimeFactory.RestoreFromSnapshot(e, player, parent)
-					end)
-					if ok then slime=res end
-				end
-				if not slime then
-					local assets=ReplicatedStorage:FindFirstChild("Assets")
-					local tmpl=assets and assets:FindFirstChild("Slime")
-					if tmpl and tmpl:IsA("Model") then slime=tmpl:Clone() end
-				end
-				if slime then
-					slime.Parent=parent
-					if WSCONFIG.MarkWorldSlimeAttribute then slime:SetAttribute("WorldSlime", true) end
-					slime:SetAttribute("SlimeId", sid)
-					ws_registerModel(player, slime)
-					ws_applyColors(slime)
-					local cf
-					if origin and e.lpx then
-						cf = origin.CFrame * CFrame.new(e.lpx,e.lpy,e.lpz)
-					elseif e.px then
-						cf = CFrame.new(e.px,e.py,e.pz)
-					end
-					if cf then pcall(function() slime:PivotTo(cf) end) end
-					created += 1
-				else
-					skipped += 1
-				end
-			end
-		else
-			skipped += 1
-		end
-		if (created + reused) >= WSCONFIG.MaxWorldSlimesPerPlayer then
-			dprint("WorldSlime: MaxWorldSlimesPerPlayer reached during restore.")
-			break
-		end
-	end
-	dprint(("WorldSlime: Restore complete created=%d reused=%d skipped=%d total=%d"):
-		format(created,reused,skipped,created+reused))
-	ws_restoredOnce[player]=true
+    if not player or not list or #list == 0 then
+        dprint("WorldSlime: Restore: none")
+        return
+    end
+
+    ws_scan(player)
+    local plot, origin
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") and m:GetAttribute("UserId") == player.UserId and m.Name:match("^Player%d+$") then
+            plot = m
+            break
+        end
+    end
+    if plot then
+        local zone = plot:FindFirstChild("SlimeZone")
+        if zone and zone:IsA("BasePart") then origin = zone end
+    end
+    local parent = plot or Workspace
+    local created, reused, skipped = 0, 0, 0
+    for _, e in ipairs(list) do
+        local sid = e.id
+        if sid and WSCONFIG.DedupeOnRestore then
+            local idx = ws_liveIndex[player.UserId]
+            local existing = idx and idx[sid]
+            if existing and existing.Parent then
+                local cf
+                if origin and e.lpx then
+                    cf = origin.CFrame * CFrame.new(e.lpx, e.lpy, e.lpz)
+                elseif e.px then
+                    cf = CFrame.new(e.px, e.py, e.pz)
+                end
+                if cf then pcall(function() existing:PivotTo(cf) end) end
+                if WSCONFIG.MarkWorldSlimeAttribute then existing:SetAttribute("WorldSlime", true) end
+                ws_applyColors(existing)
+                reused += 1
+            else
+                local slime
+                local SlimeFactory
+                pcall(function()
+                    SlimeFactory = require(ServerScriptService.Modules:WaitForChild("SlimeFactory"))
+                end)
+                if SlimeFactory and SlimeFactory.RestoreFromSnapshot then
+                    local ok, res = pcall(function()
+                        return SlimeFactory.RestoreFromSnapshot(e, player, parent)
+                    end)
+                    if ok then slime = res end
+                end
+                if not slime then
+                    local assets = ReplicatedStorage:FindFirstChild("Assets")
+                    local tmpl = assets and assets:FindFirstChild("Slime")
+                    if tmpl and tmpl:IsA("Model") then slime = tmpl:Clone() end
+                end
+                if slime then
+                    slime.Parent = parent
+                    if WSCONFIG.MarkWorldSlimeAttribute then slime:SetAttribute("WorldSlime", true) end
+                    slime:SetAttribute("SlimeId", sid)
+                    ws_registerModel(player, slime)
+                    ws_applyColors(slime)
+                    local cf
+                    if origin and e.lpx then
+                        cf = origin.CFrame * CFrame.new(e.lpx, e.lpy, e.lpz)
+                    elseif e.px then
+                        cf = CFrame.new(e.px, e.py, e.pz)
+                    end
+                    if cf then pcall(function() slime:PivotTo(cf) end) end
+                    -- Fire DescendantAdded manually so EggService registers the egg
+                    plot.DescendantAdded:Fire(slime)
+                    created += 1
+                else
+                    skipped += 1
+                end
+            end
+        else
+            skipped += 1
+        end
+        if (created + reused) >= WSCONFIG.MaxWorldSlimesPerPlayer then
+            dprint("WorldSlime: MaxWorldSlimesPerPlayer reached during restore.")
+            break
+        end
+    end
+    dprint(("WorldSlime: Restore complete created=%d reused=%d skipped=%d total=%d")
+        :format(created, reused, skipped, created + reused))
+    ws_restoredOnce[player] = true
 end
 
 -------------------------------------------------------------------------------
@@ -336,7 +346,32 @@ local WE_ATTR_MAP = {
 	Rarity="ra", ValueBase="vb", ValuePerGrowth="vg", WeightScalar="ws",
 	MovementScalar="mv", MutationRarityBonus="mb"
 }
-local we_lastSnapshot = {}
+
+-- Add / replace we_mergeEntry with rich logging:
+local function we_mergeEntry(userId, entry, src)
+	if not userId or not entry or not entry.id then return end
+	local snap = we_lastSnapshot[userId]
+	if not snap then
+		snap = { list = {}, t = clock(), source = src or "immediate" }
+		we_lastSnapshot[userId] = snap
+	end
+	local replaced = false
+	for i,e in ipairs(snap.list) do
+		if e.id == entry.id then
+			snap.list[i] = entry
+			replaced = true
+			break
+		end
+	end
+	if not replaced then
+		table.insert(snap.list, entry)
+	end
+	snap.t = clock()
+	snap.source = src or snap.source
+	eggdbg(string.format("MergeEntry uid=%d id=%s replaced=%s total=%d src=%s",
+		userId, tostring(entry.id), tostring(replaced), #snap.list, tostring(src)))
+end
+
 local function we_findPlayerPlot(player)
 	for _,m in ipairs(Workspace:GetChildren()) do
 		if m:IsA("Model")
@@ -371,8 +406,34 @@ end
 local function we_enumeratePlotEggs(player)
 	local plot = we_findPlayerPlot(player)
 	if not plot then
-		dprint("[WorldEggSer][Debug] No plot found for player", player.Name)
-		return {}, plot, nil
+		dprint("[WorldEggSer][Debug] No plot found for player", player.Name, " (fallback scan Workspace)")
+		-- FALLBACK: allow eggs parented directly to Workspace (legacy)
+		local now = os.time()
+		local list = {}
+		for _,desc in ipairs(Workspace:GetDescendants()) do
+			if desc:IsA("Model") and desc.Name=="Egg" then
+				if desc:GetAttribute("Placed")
+					and desc:GetAttribute("ManualHatch")
+					and desc:GetAttribute("OwnerUserId")==player.UserId then
+					local prim = desc.PrimaryPart or desc:FindFirstChildWhichIsA("BasePart")
+					if prim then
+						local eggId = desc:GetAttribute("EggId") or ("Egg_"..math.random(1,1e9))
+						local hatchAt = desc:GetAttribute("HatchAt")
+						local hatchTime = desc:GetAttribute("HatchTime")
+						if hatchAt and hatchTime then
+							local cf = prim:GetPivot()
+							list[#list+1] = {
+								id = eggId, ht = hatchTime, ha = hatchAt,
+								tr = math.max(0, hatchAt - now),
+								px = cf.X, py = cf.Y, pz = cf.Z,
+								cr = desc:GetAttribute("PlacedAt") or (now - hatchTime),
+							}
+						end
+					end
+				end
+			end
+		end
+		return list, nil, nil
 	end
 	local origin = we_getPlotOrigin(plot)
 	local now = os.time()
@@ -384,9 +445,29 @@ local function we_enumeratePlotEggs(player)
 			local manualHatch = desc:GetAttribute("ManualHatch")
 			local ownerUserId = desc:GetAttribute("OwnerUserId")
 			local ownerMatch = tostring(ownerUserId) == tostring(player.UserId)
-			dprint(("[WorldEggSer][Debug] Candidate: %s | Placed=%s ManualHatch=%s OwnerUserId=%s OwnerMatch=%s")
-				:format(desc:GetFullName(), tostring(placed), tostring(manualHatch), tostring(ownerUserId), tostring(ownerMatch)))
+
+			local accept = false
 			if placed and manualHatch and ownerMatch then
+				accept = true
+			elseif placed and ownerMatch then
+				-- Grace path: ManualHatch not yet replicated/assigned
+				local grace = WECONFIG.AcceptMissingManualHatchGraceSeconds or 0
+				if grace > 0 then
+					local placedAt = tonumber(desc:GetAttribute("PlacedAt")) or 0
+					local age = now - placedAt
+					if placedAt > 0 and age >= 0 and age <= grace then
+						accept = true
+						dprint(("[WorldEggSer][Grace] Accepting egg without ManualHatch (age=%.2fs <= %.2fs): %s")
+							:format(age, grace, desc:GetFullName()))
+					end
+				end
+			end
+
+			dprint(("[WorldEggSer][Debug] Candidate: %s | Placed=%s ManualHatch=%s OwnerUserId=%s OwnerMatch=%s Accept=%s")
+				:format(desc:GetFullName(), tostring(placed), tostring(manualHatch), tostring(ownerUserId), tostring(ownerMatch), tostring(accept)))
+
+			if accept then
+				-- (existing code that builds entry) ...
 				local prim = desc.PrimaryPart or desc:FindFirstChildWhichIsA("BasePart")
 				if prim then
 					local eggId = desc:GetAttribute("EggId") or ("Egg_"..math.random(1,1e9))
@@ -413,15 +494,20 @@ local function we_enumeratePlotEggs(player)
 						end
 						list[#list+1] = e
 						dprint("[WorldEggSer][Debug] -- Egg accepted for serialization:", eggId)
+						eggdbg(string.format("Enumerate accept uid=%d id=%s tr=%.1f pos=(%.1f,%.1f,%.1f)",
+							player.UserId, tostring(e.id), tonumber(e.tr or -1),
+							e.px or 0, e.py or 0, e.pz or 0))
 					end
 				end
 			end
 		end
 	end
+	eggdbg(string.format("Enumerate done uid=%d count=%d", player.UserId, #list))
 	dprint("[WorldEggSer][Debug] Total eggs found for serialization:", #list)
 	return list, plot, origin
 end
 local function we_serialize(player, isFinal)
+	local t0 = clock()
 	local ok, liveList, plot, origin = pcall(function()
 		local ll, pl, orp = we_enumeratePlotEggs(player)
 		return ll, pl, orp
@@ -430,11 +516,16 @@ local function we_serialize(player, isFinal)
 		warn("[WorldEggSer] enumerate error:", liveList)
 		liveList={}
 	end
+
+	-- Cache every non-empty live scan
 	if #liveList>0 then
 		we_lastSnapshot[player.UserId] = { list = liveList, t = os.clock() }
 	end
+
 	local usedCache=false
 	local source="live"
+
+	-- If final & nothing live, attempt existing snapshot / EggService export (existing logic)
 	if isFinal and #liveList==0 then
 		local EggService
 		pcall(function()
@@ -448,13 +539,11 @@ local function we_serialize(player, isFinal)
 				local now=os.time()
 				local bridge={}
 				for _,e in ipairs(ex) do
-					bridge[#bridge+1]={
-						id=e.eggId, ht=e.hatchTime, ha=e.hatchAt,
+					bridge[#bridge+1]={ id=e.eggId, ht=e.hatchTime, ha=e.hatchAt,
 						tr=math.max(0,(e.hatchAt or now)-now),
 						px=0,py=0,pz=0,
 						cr=e.placedAt or (e.hatchAt and (e.hatchAt-e.hatchTime)) or (now-(e.hatchTime or 0)),
-						ra=e.rarity, vb=e.valueBase, vg=e.valuePerGrowth,
-					}
+						ra=e.rarity, vb=e.valueBase, vg=e.valuePerGrowth }
 				end
 				liveList=bridge
 				usedCache=true
@@ -463,15 +552,57 @@ local function we_serialize(player, isFinal)
 		end
 		if #liveList==0 then
 			local snap=we_lastSnapshot[player.UserId]
-			if snap and #snap.list>0 then
+			if snap and snap.list and #snap.list>0 then
 				liveList=snap.list
 				usedCache=true
 				source="LastSnapshot"
 			end
 		end
+	else
+		-- MERGE SAFEGUARD: if current scan has fewer eggs than last snapshot (likely race)
+		local prev = we_lastSnapshot[player.UserId]
+		if prev and prev.list and #prev.list > 0 and #liveList < #prev.list then
+			local now = os.time()
+			-- build id sets
+			local present = {}
+			for _,e in ipairs(liveList) do
+				if e.id then present[e.id]=true end
+			end
+			local added=0
+			for _,old in ipairs(prev.list) do
+				if old.id and not present[old.id] then
+					-- Skip if clearly expired (hatched) long ago (grace 10s)
+					local ha = old.ha or 0
+					if ha == 0 or (now - ha) <= 10 then
+						local clone={}
+						for k,v in pairs(old) do clone[k]=v end
+						clone.merged=true
+						liveList[#liveList+1]=clone
+						added += 1
+					end
+				end
+			end
+			if added>0 then
+				usedCache=true
+				source = source.."+MergedPrev"
+				dprint(("[WorldEggSer][Merge] Reinserted %d missing eggs (prev=%d liveBefore=%d liveAfter=%d)")
+					:format(added, #prev.list, (#liveList - added), #liveList))
+			end
+		end
 	end
-	dprint(("WorldEgg: Serialize player=%s final=%s count=%d usedCache=%s source=%s"):
-		format(player.Name, tostring(isFinal), #liveList, tostring(usedCache), source))
+
+	dprint(string.format(
+		"WorldEgg: Serialize player=%s final=%s count=%d usedCache=%s source=%s",
+		player.Name, tostring(isFinal), #liveList, tostring(usedCache), source))
+	eggdbg(string.format("SerializeBegin player=%s isFinal=%s dv?=%s",
+		player.Name, tostring(isFinal), tostring(player:FindFirstChild("DataVersion"))))
+	eggdbg(string.format("SerializeSources live=%d lastSnapshot=%d snapshotAge=%.3fs isFinal=%s",
+		#liveList,
+		(we_lastSnapshot[player.UserId] and #(we_lastSnapshot[player.UserId].list) or 0),
+		we_lastSnapshot[player.UserId] and (clock() - we_lastSnapshot[player.UserId].t) or -1,
+		tostring(isFinal)))
+	eggdbg(string.format("SerializeResult player=%s count=%d elapsed=%.4fs source=%s",
+		player.Name, #liveList, clock()-t0, source or "live"))
 	return liveList
 end
 local function we_restore(player, list)
@@ -557,7 +688,10 @@ local FT_ATTRS = {
 	OwnerUserId="ow", ToolUniqueId="uid"
 }
 local ft_restoreBatchCounter=0
-local function ft_dprint(...) if FTCONFIG.Debug then print("[FoodSer]", ...) end end
+local function ft_dprint(...) 
+	if FTCONFIG.Debug then print("[FoodSer]", ...) end
+end
+
 local function ft_qualifies(tool)
 	return tool:IsA("Tool") and (tool:GetAttribute("FoodItem") or tool:GetAttribute("FoodId"))
 end
@@ -722,7 +856,7 @@ local function ft_restore(player, list)
 			end
 		end)
 	end
-end
+end -- cs_restore
 
 -------------------------------------------------------------------------------
 -- EggTool Serializer
@@ -948,215 +1082,247 @@ end
 -------------------------------------------------------------------------------
 local CSCONFIG = GrandInventorySerializer.CONFIG.CapturedSlime
 local CS_EXPORT_ATTRS = {
-	Version="ver", SlimeId="id", Rarity="ra", GrowthProgress="gp",
-	CurrentValue="cv", ValueFull="vf", ValueBase="vb", ValuePerGrowth="vg",
-	MutationStage="ms", Tier="ti", WeightPounds="wt", FedFraction="ff",
-	BodyColor="bc", AccentColor="ac", EyeColor="ec", CapturedAt="ca",
-	MovementScalar="mv", WeightScalar="ws", MutationRarityBonus="mb",
-	MaxSizeScale="mx", StartSizeScale="st", CurrentSizeScale="css",
-	SizeLuckRolls="lr", FeedBufferSeconds="fb", FeedBufferMax="fx",
-	HungerDecayRate="hd", CurrentFullness="cf", FeedSpeedMultiplier="fs",
-	LastHungerUpdate="lu",
-}
-local CS_COLOR_KEYS={ bc=true, ac=true, ec=true }
-local CS_ENTRY_VERSION=1
-local function cs_hexToColor(s)
-	if type(s)~="string" or #s<6 then return nil end
-	s = s:gsub("^#","")
-	if #s<6 then return nil end
-	local r=tonumber(s:sub(1,2),16)
-	local g=tonumber(s:sub(3,4),16)
-	local b=tonumber(s:sub(5,6),16)
-	if not (r and g and b) then return nil end
-	return Color3.fromRGB(r,g,b)
-end
-local function cs_getTemplate()
-	local folder=ReplicatedStorage:FindFirstChild(CSCONFIG.TemplateFolder)
-	if not folder then return nil end
-	local tmpl=folder:FindFirstChild(CSCONFIG.TemplateNameCaptured)
-	if tmpl and tmpl:IsA("Tool") then return tmpl end
-	return nil
-end
-local function cs_ensureHandle(tool)
-	if tool:FindFirstChild("Handle") then return end
-	local h=Instance.new("Part")
-	h.Name="Handle"
-	h.Size=Vector3.new(1,1,1)
-	h.CanCollide=false
-	h.Anchored=false
-	h.Parent=tool
-end
-local function cs_applyEntry(tool, entry)
-	for attr,short in pairs(CS_EXPORT_ATTRS) do
-		if attr=="Version" then continue end
-		local v = entry[short]
-		if v~=nil then
-			if CS_COLOR_KEYS[short] and type(v)=="string" then
-				local c=cs_hexToColor(v); if c then v=c end
-			end
-			tool:SetAttribute(attr, v)
-		end
-	end
-	tool:SetAttribute("SlimeItem", true)
-	tool:SetAttribute("SlimeId", tool:GetAttribute("SlimeId") or entry.id)
-	tool:SetAttribute("ServerIssued", true)
-	tool:SetAttribute("ServerRestore", true)
-	tool:SetAttribute("PersistentCaptured", true)
-	tool:SetAttribute("__CapSerVersion", CSCONFIG.Version or "3.4")
-end
-local function cs_buildTool(entry)
-	local tool
-	local template=cs_getTemplate()
-	if template then
-		local ok,clone=pcall(function() return template:Clone() end)
-		if ok and clone then tool=clone end
-	end
-	if not tool then tool=Instance.new("Tool") end
-	tool.Name = entry.nm or "CapturedSlime"
-	cs_ensureHandle(tool)
-	cs_applyEntry(tool, entry)
-	return tool
-end
-local function cs_instrumentLifecycle(player, tool)
-	if not CSCONFIG.RequireStableHeartbeats then return end
-	local t0=os.clock()
-	tool.AncestryChanged:Connect(function(_,parent)
-		if os.clock()-t0 <= CSCONFIG.LifeCycleWatchSeconds and not parent then
-			print(("[CapSer][LC] %s removed %.2fs after restore"):format(tool.Name, os.clock()-t0))
-		end
-	end)
-	tool.Destroying:Connect(function()
-		if os.clock()-t0 <= CSCONFIG.LifeCycleWatchSeconds then
-			print(("[CapSer][LC] %s destroyed %.2fs after restore"):format(tool.Name, os.clock()-t0))
-		end
-	end)
-end
-local function cs_collect(player)
-	local out={}
-	local function scan(container)
-		if not container then return end
-		for _,c in ipairs(container:GetChildren()) do
-			if c:IsA("Tool") and (c:GetAttribute("SlimeItem") or c:GetAttribute("SlimeId")) then
-				out[#out+1]=c
-			end
-		end
-	end
-	scan(player:FindFirstChildOfClass("Backpack"))
-	scan(player.Character)
-	return out
-end
-local function cs_serialize(player, isFinal)
-	local tools=cs_collect(player)
-	local list, seen={}, {}
-	for _,tool in ipairs(tools) do
-		local slimeId=tool:GetAttribute("SlimeId")
-		if slimeId and seen[slimeId] and CSCONFIG.DeduplicateOnRestore then
-			-- skip duplicate
-		else
-			seen[slimeId]=true
-			local entry={ ver=CS_ENTRY_VERSION, nm=tool.Name }
-			for attr,short in pairs(CS_EXPORT_ATTRS) do
-				if attr~="Version" then
-					local v=tool:GetAttribute(attr)
-					if v~=nil then
-						if CS_COLOR_KEYS[short] and typeof(v)=="Color3" then
-							v=ws_colorToHex(v)
-						end
-						entry[short]=v
-					end
-				end
-			end
-			entry.id = entry.id or slimeId
-			list[#list+1]=entry
-			if #list >= CSCONFIG.MaxStored then
-				dprint("CapturedSlime: MaxStored reached for "..player.Name)
-				break
-			end
-		end
-	end
-	dprint("CapturedSlime: Serialize count="..#list..(isFinal and " (FINAL)" or ""))
-	return list
-end
-local function cs_restore(player, list)
-	if not list or #list==0 then
-		dprint("CapturedSlime: Restore: none")
-		return
-	end
-	local template=cs_getTemplate()
-	if template then
-		dprint("CapturedSlime: Template found: "..template:GetFullName())
-	else
-		dprint("CapturedSlime: Template NOT found (fallback).")
-	end
-	local bp=player:FindFirstChildOfClass("Backpack")
-	if not bp then
-		task.delay(0.25,function()
-			if player.Parent then cs_restore(player, list) end
-		end)
-		return
-	end
-	dprint("CapturedSlime: Restore entries="..#list)
-	local seen,accepted,skipped={},0,0
-	for _,e in ipairs(list) do
-		local id=e.id
-		if id and seen[id] and CSCONFIG.DeduplicateOnRestore then
-			skipped += 1
-		else
-			seen[id]=true
-			if accepted >= CSCONFIG.MaxStored then
-				dprint("CapturedSlime: MaxStored reached during restore")
-				break
-			end
-			local tool=cs_buildTool(e)
-			tool:SetAttribute("RestoreStamp", os.clock())
-			if CSCONFIG.RequireStableHeartbeats then
-				tool:SetAttribute("StableHeartbeats",0)
-			end
-			tool:SetAttribute("RestoreBatchId",1)
-			tool.Parent=bp
-			cs_instrumentLifecycle(player, tool)
-			accepted += 1
-		end
-	end
-	dprint(("CapturedSlime: Restore complete accepted=%d skipped=%d"):format(accepted, skipped))
-	if CSCONFIG.RequireStableHeartbeats then
-		local hb,count
-		hb = RunService.Heartbeat:Connect(function()
-			count=(count or 0)+1
-			for _,tool in ipairs(bp:GetChildren()) do
-				if tool:IsA("Tool") and tool:GetAttribute("SlimeItem") then
-					local cur=tool:GetAttribute("StableHeartbeats") or 0
-					if cur < CSCONFIG.StableHeartbeatCount then
-						tool:SetAttribute("StableHeartbeats", math.min(CSCONFIG.StableHeartbeatCount, cur+1))
-					end
-				end
-			end
-			if count >= CSCONFIG.StableHeartbeatCount then
-				hb:Disconnect()
-			end
-		end)
-	end
-end
-
--------------------------------------------------------------------------------
--- GRAND SERIALIZER INTERFACE
--------------------------------------------------------------------------------
-function GrandInventorySerializer:Serialize(player, isFinal)
-	return {
-		worldSlimes      = ws_serialize(player, isFinal),
-		worldEggs        = we_serialize(player, isFinal),
-		foodTools        = ft_serialize(player, isFinal),
-		eggTools         = et_serialize(player, isFinal),
-		capturedSlimes   = cs_serialize(player, isFinal),
+		Version="ver", SlimeId="id", Rarity="ra", GrowthProgress="gp",
+		CurrentValue="cv", ValueFull="vf", ValueBase="vb", ValuePerGrowth="vg",
+		MutationStage="ms", Tier="ti", WeightPounds="wt", FedFraction="ff",
+		BodyColor="bc", AccentColor="ac", EyeColor="ec", CapturedAt="ca",
+		MovementScalar="mv", WeightScalar="ws", MutationRarityBonus="mb",
+		MaxSizeScale="mx", StartSizeScale="st", CurrentSizeScale="css",
+		SizeLuckRolls="lr", FeedBufferSeconds="fb", FeedBufferMax="fx",
+		HungerDecayRate="hd", CurrentFullness="cf", FeedSpeedMultiplier="fs",
+		LastHungerUpdate="lu",
 	}
-end
+	local CS_COLOR_KEYS={ bc=true, ac=true, ec=true }
+	local CS_ENTRY_VERSION=1
+	local CS_UID_KEY = "ToolUniqueId"
 
-function GrandInventorySerializer:Restore(player, data)
-	if data.worldSlimes then ws_restore(player, data.worldSlimes) end
-	if data.worldEggs then we_restore(player, data.worldEggs) end
-	if data.foodTools then ft_restore(player, data.foodTools) end
-	if data.eggTools then et_restore(player, data.eggTools) end
-	if data.capturedSlimes then cs_restore(player, data.capturedSlimes) end
-end
+	local function cs_hexToColor(s)
+		if type(s)~="string" or #s<6 then return nil end
+		s = s:gsub("^#","")
+		if #s<6 then return nil end
+		local r=tonumber(s:sub(1,2),16)
+		local g=tonumber(s:sub(3,4),16)
+		local b=tonumber(s:sub(5,6),16)
+		if not (r and g and b) then return nil end
+		return Color3.fromRGB(r,g,b)
+	end -- cs_hexToColor
 
-return GrandInventorySerializer
+	local function cs_getTemplate()
+		local folder=ReplicatedStorage:FindFirstChild(CSCONFIG.TemplateFolder)
+		if not folder then return nil end
+		local tmpl=folder:FindFirstChild(CSCONFIG.TemplateNameCaptured)
+		if tmpl and tmpl:IsA("Tool") then return tmpl end
+		return nil
+	end -- cs_getTemplate
+
+	local function cs_ensureHandle(tool)
+		if tool:FindFirstChild("Handle") then return end
+		local h=Instance.new("Part")
+		h.Name="Handle"
+		h.Size=Vector3.new(1,1,1)
+		h.CanCollide=false
+		h.Anchored=false
+		h.Parent=tool
+	end -- cs_ensureHandle
+
+	local function cs_applyEntry(tool, entry)
+		for attr,short in pairs(CS_EXPORT_ATTRS) do
+			if attr ~= "Version" then
+				local v = entry[short]
+				if v~=nil then
+					if CS_COLOR_KEYS[short] and type(v)=="string" then
+						local c=cs_hexToColor(v); if c then v=c end
+					end
+					tool:SetAttribute(attr, v)
+				end
+			end
+		end
+		tool:SetAttribute("SlimeItem", true)
+		tool:SetAttribute("SlimeId", tool:GetAttribute("SlimeId") or entry.id)
+		tool:SetAttribute("ServerIssued", true)
+		tool:SetAttribute("ServerRestore", true)
+		tool:SetAttribute("PersistentCaptured", true)
+		tool:SetAttribute("__CapSerVersion", CSCONFIG.Version or "3.4")
+	end -- cs_applyEntry
+
+	local function cs_buildTool(entry)
+		local tool
+		local template=cs_getTemplate()
+		if template then
+			local ok,clone=pcall(function() return template:Clone() end)
+			if ok and clone then tool=clone end
+		end
+		if not tool then tool=Instance.new("Tool") end
+		tool.Name = entry.nm or "CapturedSlime"
+		cs_ensureHandle(tool)
+		cs_applyEntry(tool, entry)
+		if not tool:GetAttribute(CS_UID_KEY) then
+			tool:SetAttribute(CS_UID_KEY, HttpService:GenerateGUID(false))
+		end
+		return tool
+	end -- cs_buildTool
+
+	local function cs_instrumentLifecycle(player, tool)
+		if not CSCONFIG.RequireStableHeartbeats then return end
+		local t0=os.clock()
+		tool.AncestryChanged:Connect(function(_,parent)
+			if os.clock()-t0 <= CSCONFIG.LifeCycleWatchSeconds and not parent then
+				print(("[CapSer][LC] %s removed %.2fs after restore"):format(tool.Name, os.clock()-t0))
+			end
+		end)
+		tool.Destroying:Connect(function()
+			if os.clock()-t0 <= CSCONFIG.LifeCycleWatchSeconds then
+				print(("[CapSer][LC] %s destroyed %.2fs after restore"):format(tool.Name, os.clock()-t0))
+			end
+		end)
+	end -- cs_instrumentLifecycle
+
+	local function cs_collect(player)
+		local out={}
+		local function scan(container)
+			if not container then return end
+			for _,c in ipairs(container:GetChildren()) do
+				if c:IsA("Tool") and (c:GetAttribute("SlimeItem") or c:GetAttribute("SlimeId")) then
+					out[#out+1]=c
+				end
+			end
+		end
+		scan(player:FindFirstChildOfClass("Backpack"))
+		scan(player.Character)
+		dprint(("[CapturedSlime][Collect] player=%s found=%d"):format(player.Name, #out))
+		return out
+	end -- cs_collect
+
+	local function cs_serialize(player, isFinal)
+		local tools=cs_collect(player)
+		local list, seen={}, {}
+		for _,tool in ipairs(tools) do
+			local slimeId=tool:GetAttribute("SlimeId")
+			if slimeId and seen[slimeId] and CSCONFIG.DeduplicateOnRestore then
+				-- duplicate skipped
+			else
+				seen[slimeId]=true
+				local entry={ ver=CS_ENTRY_VERSION, nm=tool.Name }
+				for attr,short in pairs(CS_EXPORT_ATTRS) do
+					if attr~="Version" then
+						local v=tool:GetAttribute(attr)
+						if v~=nil then
+							if CS_COLOR_KEYS[short] and typeof(v)=="Color3" then
+								v=ws_colorToHex(v)
+							end
+							entry[short]=v
+						end
+					end
+				end
+				entry.id = entry.id or slimeId
+				list[#list+1]=entry
+				if #list >= CSCONFIG.MaxStored then
+					dprint("CapturedSlime: MaxStored reached for "..player.Name)
+					break
+				end
+			end
+		end
+		dprint("CapturedSlime: Serialize count="..#list..(isFinal and " (FINAL)" or ""))
+		return list
+	end -- cs_serialize
+
+	local function cs_restore(player, list)
+		if not list or #list==0 then
+			dprint("CapturedSlime: Restore: none")
+			return
+		end
+		local template=cs_getTemplate()
+		if template then
+			dprint("CapturedSlime: Template found: "..template:GetFullName())
+		else
+			dprint("CapturedSlime: Template NOT found (fallback).")
+		end
+		local bp=player:FindFirstChildOfClass("Backpack")
+		if not bp then
+			task.delay(0.25,function()
+				if player.Parent then cs_restore(player, list) end
+			end)
+			return
+		end
+		dprint("CapturedSlime: Restore entries="..#list)
+		local seen,accepted,skipped={},0,0
+		for _,e in ipairs(list) do
+			local id=e.id
+			if id and seen[id] and CSCONFIG.DeduplicateOnRestore then
+				skipped += 1
+			else
+				seen[id]=true
+				if accepted >= CSCONFIG.MaxStored then
+					dprint("CapturedSlime: MaxStored reached during restore")
+					break
+				end
+				local tool=cs_buildTool(e)
+				tool:SetAttribute("RestoreStamp", os.clock())
+				if CSCONFIG.RequireStableHeartbeats then
+					tool:SetAttribute("StableHeartbeats",0)
+				end
+				tool:SetAttribute("RestoreBatchId",1)
+				tool.Parent=bp
+				cs_instrumentLifecycle(player, tool)
+				accepted += 1
+			end
+		end
+		dprint(("CapturedSlime: Restore complete accepted=%d skipped=%d"):format(accepted, skipped))
+		if CSCONFIG.RequireStableHeartbeats then
+			local hb,count
+			hb = RunService.Heartbeat:Connect(function()
+				count=(count or 0)+1
+				for _,tool in ipairs(bp:GetChildren()) do
+					if tool:IsA("Tool") and tool:GetAttribute("SlimeItem") then
+						local cur=tool:GetAttribute("StableHeartbeats") or 0
+						if cur < CSCONFIG.StableHeartbeatCount then
+							tool:SetAttribute("StableHeartbeats", math.min(CSCONFIG.StableHeartbeatCount, cur+1))
+						end
+					end
+				end
+				if count >= CSCONFIG.StableHeartbeatCount then
+					hb:Disconnect()
+				end
+			end)
+		end
+	end -- cs_restore
+
+	-------------------------------------------------------------------------------
+	-- GRAND SERIALIZER INTERFACE
+	-------------------------------------------------------------------------------
+	function GrandInventorySerializer:Serialize(player, isFinal)
+		local data = {
+			worldSlimes    = ws_serialize(player, isFinal),
+			worldEggs      = we_serialize(player, isFinal),
+			foodTools      = ft_serialize(player, isFinal),
+			eggTools       = et_serialize(player, isFinal),
+			capturedSlimes = cs_serialize(player, isFinal),
+		}
+		-- Immediately persist to PlayerProfileService
+		local profile = PlayerProfileService.GetProfile(player)
+		if profile and profile.inventory then
+			profile.inventory.worldSlimes    = data.worldSlimes
+			profile.inventory.worldEggs      = data.worldEggs
+			profile.inventory.foodTools      = data.foodTools
+			profile.inventory.eggTools       = data.eggTools
+			profile.inventory.capturedSlimes = data.capturedSlimes
+			PlayerProfileService.SaveNow(player, isFinal and "GrandInventoryFinal" or "GrandInventoryUpdate")
+			if isFinal then
+				PlayerProfileService.ForceFullSaveNow(player, "GrandInventoryFinal")
+			end
+		end
+		return data
+	end
+
+	function GrandInventorySerializer:Restore(player, data)
+		print("[GrandInvSer][Restore] Data received:", data and data.worldEggs and #data.worldEggs or "nil")
+		if data.worldSlimes    then ws_restore(player, data.worldSlimes) end
+		if data.worldEggs      then we_restore(player, data.worldEggs) end
+		if data.foodTools      then ft_restore(player, data.foodTools) end
+		if data.eggTools       then et_restore(player, data.eggTools) end
+		if data.capturedSlimes then cs_restore(player, data.capturedSlimes) end
+		-- Mark dirty and persist after restore
+		PlayerProfileService.SaveNow(player, "GrandInventoryRestore")
+	end
+
+	return GrandInventorySerializer -- EOF

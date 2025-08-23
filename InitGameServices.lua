@@ -88,7 +88,7 @@ if not invRestoredEvent then
 end
 
 ----------------------------------------------------------------
--- 2. PlayerDataService (compat over new orchestrator) + GRAND SERIALIZER REGISTRATION
+-- 2. PlayerProfileService (Unified Data Owner) + GRAND SERIALIZER REGISTRATION
 ----------------------------------------------------------------
 local Modules = ServerScriptService:WaitForChild("Modules")
 
@@ -111,22 +111,21 @@ local function safeRequire(name, required)
 	end
 end
 
-local PlayerDataService = safeRequire("PlayerDataService", true)
+local PlayerProfileService = safeRequire("PlayerProfileService", true)
 local GrandInventorySerializer = safeRequire("GrandInventorySerializer", true)
 local InventoryService = safeRequire("InventoryService", true)
 
--- *** CRITICAL UPDATE: Register GrandInventorySerializer BEFORE InventoryService.Init! ***
+-- Register GrandInventorySerializer BEFORE InventoryService.Init!
 InventoryService.RegisterSerializer(GrandInventorySerializer)
 InventoryService.Init()
 log("Registered GrandInventorySerializer and initialized InventoryService.")
 
 -- Register factions before Init (so profile blank creation seeds correct standings)
 for faction, initStanding in pairs(CONFIG.RegisterFactions) do
-	PlayerDataService.RegisterFaction(faction, initStanding)
+	-- If you have faction logic, add it here or in PlayerProfileService
 end
 
-PlayerDataService.Init()
-log("PlayerDataService (compat) initialized first.")
+-- No need to call PlayerDataService.Init() or PlayerProfileOrchestrator.Init()
 
 ----------------------------------------------------------------
 -- 3. PlotManager + assignment
@@ -192,9 +191,7 @@ local WorldAssetCleanup        = safeRequire("WorldAssetCleanup")
 local ShopService              = safeRequire("ShopService")
 local CoreStatsService         = safeRequire("CoreStatsService")
 local PreExitInventorySync     = safeRequire("PreExitInventorySync")
-local PlayerProfileOrchestrator= safeRequire("PlayerProfileOrchestrator")
 
--- Explicit initializations
 if GrowthPersistenceService and GrowthPersistenceService.Init then
 	local ok, err = pcall(GrowthPersistenceService.Init)
 	if ok then
@@ -229,18 +226,6 @@ if ShopService and ShopService.Init then
 	else
 		warnf("ShopService.Init error: "..tostring(err))
 	end
-end
-
--- Legacy direct GrowthStampDirty handling is now largely handled by GrowthPersistenceService
-local growthDirtyEvent = ReplicatedStorage:FindFirstChild("GrowthStampDirty")
-if growthDirtyEvent and growthDirtyEvent:IsA("BindableEvent") then
-	growthDirtyEvent.Event:Connect(function(userId, reason)
-		local player = Players:GetPlayerByUserId(userId)
-		if player and player.Parent then
-			PlayerDataService.MarkDirty(player, reason or "GrowthStamp")
-			PlayerDataService.SaveImmediately(player, "GrowthStampFlush", {skipWorld=true})
-		end
-	end)
 end
 
 ----------------------------------------------------------------
@@ -300,19 +285,19 @@ task.spawn(function()
 		task.wait(interval)
 		local list = Players:GetPlayers()
 		if #list == 0 then continue end
-		if PlayerDataService and PlayerDataService.Get then
+		if PlayerProfileService and PlayerProfileService.Get then
 			for _,plr in ipairs(list) do
-				local prof = PlayerDataService.Get(plr)
+				local prof = PlayerProfileService.Get(plr)
 				if prof then
 					print(string.format(
 						"[PersistSummary] %s coins=%d captured=%d worldSlimes=%d worldEggs=%d eggTools=%d foodTools=%d dv=%d",
 						plr.Name,
 						prof.coins or 0,
-						#(prof.slimes or {}),
-						#(prof.worldSlimes or {}),
-						#(prof.worldEggs or {}),
-						#(prof.eggTools or {}),
-						#(prof.foodTools or {}),
+						#(prof.inventory.capturedSlimes or {}),
+						#(prof.inventory.worldSlimes or {}),
+						#(prof.inventory.worldEggs or {}),
+						#(prof.inventory.eggTools or {}),
+						#(prof.inventory.foodTools or {}),
 						prof.dataVersion or -1
 						))
 				end
