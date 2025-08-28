@@ -1,130 +1,100 @@
--- PreExitInventorySync.lua
--- Registers a pre-exit callback with PlayerProfileService to force
--- a last-moment raw enumeration of live tool inventories (food, egg, captured slimes).
--- Ensures immediate-leave purchases are always persisted, regardless of gating.
+-- Minimal PreExitInventorySync stub: captures server-side inventory and forces a save on PlayerRemoving
+local Players        = game:GetService("Players")
+local Workspace      = game:GetService("Workspace")
+local ServerStorage  = game:GetService("ServerStorage")
+local HttpService    = game:GetService("HttpService")
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local ServerScriptService = game:GetService("ServerScriptService")
+local PlayerProfileService = require(game.ServerScriptService.Modules:WaitForChild("PlayerProfileService"))
 
-local PlayerProfileService = require(ServerScriptService.Modules:WaitForChild("PlayerProfileService"))
+local PreExitInventorySync = {}
 
-local function collectTools(player)
-    local bp = player:FindFirstChildOfClass("Backpack")
-    local char = player.Character
-    local function grab(container, pred, out)
-        if not container then return end
-        for _,c in ipairs(container:GetChildren()) do
-            if c:IsA("Tool") and pred(c) then
-                out[#out+1] = c
-            end
-        end
-    end
-    local food, eggs, caps = {}, {}, {}
-    grab(bp,   function(t) return t:GetAttribute("FoodItem") or t:GetAttribute("FoodId") end, food)
-    grab(char, function(t) return t:GetAttribute("FoodItem") or t:GetAttribute("FoodId") end, food)
-    grab(bp,   function(t) return t:GetAttribute("EggId") and not t:GetAttribute("Placed") end, eggs)
-    grab(char, function(t) return t:GetAttribute("EggId") and not t:GetAttribute("Placed") end, eggs)
-    grab(bp,   function(t) return t:GetAttribute("SlimeItem") or t:GetAttribute("SlimeId") end, caps)
-    grab(char, function(t) return t:GetAttribute("SlimeItem") or t:GetAttribute("SlimeId") end, caps)
-    return food, eggs, caps
+local function collect_world_slimes(userId)
+	local out = {}
+	for _,inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Slime" and tostring(inst:GetAttribute("OwnerUserId")) == tostring(userId) then
+			local entry = { id = inst:GetAttribute("SlimeId"), px = 0, py = 0, pz = 0 }
+			local prim = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+			if prim then
+				local cf = prim:GetPivot()
+				entry.px, entry.py, entry.pz = cf.X, cf.Y, cf.Z
+			end
+			out[#out+1] = entry
+		end
+	end
+	return out
 end
 
-local function buildFoodEntry(tool)
-    return {
-        nm  = tool.Name,
-        fid = tool:GetAttribute("FoodId") or tool.Name,
-        rf  = tool:GetAttribute("RestoreFraction"),
-        fb  = tool:GetAttribute("FeedBufferBonus"),
-        cs  = tool:GetAttribute("Consumable"),
-        ch  = tool:GetAttribute("Charges"),
-        cd  = tool:GetAttribute("FeedCooldownOverride"),
-        ow  = tool:GetAttribute("OwnerUserId"),
-        uid = tool:GetAttribute("ToolUniqueId"),
-    }
+local function collect_world_eggs(userId)
+	local out = {}
+	for _,inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Egg" and tostring(inst:GetAttribute("OwnerUserId")) == tostring(userId) then
+			local prim = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+			local cf = prim and prim:GetPivot() or CFrame.new()
+			local id = inst:GetAttribute("EggId") or ("Egg_"..tostring(math.random(1,1e9)))
+			out[#out+1] = { id = id, px = cf.X, py = cf.Y, pz = cf.Z, ht = inst:GetAttribute("HatchTime"), ha = inst:GetAttribute("HatchAt"), tr = 0 }
+		end
+	end
+	return out
 end
 
-local function buildEggEntry(tool)
-    return {
-        nm  = tool.Name,
-        id  = tool:GetAttribute("EggId"),
-        ra  = tool:GetAttribute("Rarity"),
-        ht  = tool:GetAttribute("HatchTime"),
-        vb  = tool:GetAttribute("ValueBase"),
-        vg  = tool:GetAttribute("ValuePerGrowth"),
-        ws  = tool:GetAttribute("WeightScalar"),
-        ms  = tool:GetAttribute("MovementScalar"),
-        mb  = tool:GetAttribute("MutationRarityBonus"),
-        ou  = tool:GetAttribute("OwnerUserId"),
-    }
+local function collect_staged_tools(userId)
+	local eggTools, foodTools, captured = {}, {}, {}
+	for _,inst in ipairs(ServerStorage:GetDescendants()) do
+		if inst:IsA("Tool") then
+			local owner = inst:GetAttribute("OwnerUserId")
+			if tostring(owner) == tostring(userId) then
+				if inst:GetAttribute("FoodItem") or inst:GetAttribute("FoodId") then
+					table.insert(foodTools, { nm = inst.Name, fid = inst:GetAttribute("FoodId"), uid = inst:GetAttribute("ToolUniqueId") })
+				elseif inst:GetAttribute("SlimeItem") or inst:GetAttribute("Captured") then
+					table.insert(captured, { nm = inst.Name, id = inst:GetAttribute("SlimeId"), uid = inst:GetAttribute("ToolUniqueId") })
+				else
+					table.insert(eggTools, { nm = inst.Name, id = inst:GetAttribute("EggId") or inst:GetAttribute("ToolUniqueId"), uid = inst:GetAttribute("ToolUniqueId") })
+				end
+			end
+		end
+	end
+	return nil, eggTools, foodTools, captured  -- Fix: remove undefined 'world' global
 end
 
-local function buildCapEntry(tool)
-    return {
-        nm  = tool.Name,
-        id  = tool:GetAttribute("SlimeId"),
-        ra  = tool:GetAttribute("Rarity"),
-        gp  = tool:GetAttribute("GrowthProgress"),
-        cv  = tool:GetAttribute("CurrentValue"),
-        vf  = tool:GetAttribute("ValueFull"),
-        vb  = tool:GetAttribute("ValueBase"),
-        vg  = tool:GetAttribute("ValuePerGrowth"),
-        ms  = tool:GetAttribute("MutationStage"),
-        ti  = tool:GetAttribute("Tier"),
-        wt  = tool:GetAttribute("WeightPounds"),
-        ff  = tool:GetAttribute("FedFraction"),
-        bc  = tool:GetAttribute("BodyColor"),
-        ac  = tool:GetAttribute("AccentColor"),
-        ec  = tool:GetAttribute("EyeColor"),
-        ca  = tool:GetAttribute("CapturedAt"),
-        mv  = tool:GetAttribute("MovementScalar"),
-        ws  = tool:GetAttribute("WeightScalar"),
-        mb  = tool:GetAttribute("MutationRarityBonus"),
-        mx  = tool:GetAttribute("MaxSizeScale"),
-        st  = tool:GetAttribute("StartSizeScale"),
-        css = tool:GetAttribute("CurrentSizeScale"),
-        lr  = tool:GetAttribute("SizeLuckRolls"),
-        fb  = tool:GetAttribute("FeedBufferSeconds"),
-        fx  = tool:GetAttribute("FeedBufferMax"),
-        hd  = tool:GetAttribute("HungerDecayRate"),
-        cf  = tool:GetAttribute("CurrentFullness"),
-        fs  = tool:GetAttribute("FeedSpeedMultiplier"),
-        lu  = tool:GetAttribute("LastHungerUpdate"),
-    }
+function PreExitInventorySync.Init()
+	-- safe attach: idempotent
+	if PreExitInventorySync._installed then return end
+	PreExitInventorySync._installed = true
+
+	Players.PlayerRemoving:Connect(function(player)
+		if not player then return end
+		local ok, err = pcall(function()
+			local uid = player.UserId
+			-- collect server-side inventories
+			local worldSlimes = collect_world_slimes(uid)
+			local worldEggs   = collect_world_eggs(uid)
+			local _, eggTools, foodTools, captured = collect_staged_tools(uid)
+
+			-- obtain profile (use GetProfile helper)
+			local profile = PlayerProfileService.GetProfile(player)
+			if not profile then
+				-- nothing we can do
+				return
+			end
+
+			profile.inventory = profile.inventory or {}
+			profile.inventory.worldSlimes    = worldSlimes or {}
+			profile.inventory.worldEggs      = worldEggs   or {}
+			profile.inventory.eggTools       = eggTools    or {}
+			profile.inventory.foodTools      = foodTools   or {}
+			profile.inventory.capturedSlimes = captured     or {}
+
+			profile.meta = profile.meta or {}
+			profile.meta.lastPreExitSnapshot = os.time()
+
+			-- request immediate persistence
+			pcall(function() PlayerProfileService.SaveNow(player, "PreExitInventorySync") end)
+			pcall(function() PlayerProfileService.ForceFullSaveNow(player, "PreExitInventorySync_Force") end)
+		end)
+		if not ok then
+			warn("[PreExitInventorySync] PlayerRemoving handler error for", player and player.Name or "nil", err)
+		end
+	end)
 end
 
-local function syncInventoryOnExit(player)
-    if not player.Parent then return end
-    local foodTools, eggTools, capTools = collectTools(player)
-
-    local foodEntries = {}
-    for _,t in ipairs(foodTools) do
-        foodEntries[#foodEntries+1] = buildFoodEntry(t)
-    end
-
-    local eggEntries = {}
-    for _,t in ipairs(eggTools) do
-        eggEntries[#eggEntries+1] = buildEggEntry(t)
-    end
-
-    local capEntries = {}
-    for _,t in ipairs(capTools) do
-        capEntries[#capEntries+1] = buildCapEntry(t)
-    end
-
-    local profile = PlayerProfileService.GetProfile(player)
-    profile.inventory = profile.inventory or {}
-    profile.inventory.foodTools      = foodEntries
-    profile.inventory.eggTools       = eggEntries
-    profile.inventory.capturedSlimes = capEntries
-
-    print(string.format(
-        "[PreExitSync] %s food=%d eggs=%d captured=%d",
-        player.Name, #foodEntries, #eggEntries, #capEntries))
-
-    PlayerProfileService.MarkDirty(player, "PreExitSync")
-end
-
-Players.PlayerRemoving:Connect(syncInventoryOnExit)
-
-return true
+return PreExitInventorySync

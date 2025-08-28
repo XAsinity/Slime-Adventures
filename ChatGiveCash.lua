@@ -1,4 +1,4 @@
--- Minimal patched attempt (server only) � may not fire in new TextChat.
+-- Minimal patched attempt (server only) ? may not fire in new TextChat.
 -- If this does not log [ChatGiveCash][MSG] when you type 'cash', use the Remote approach.
 
 local AMOUNT = 500
@@ -38,17 +38,17 @@ end
 local function strip(msg) return msg:gsub("^[/!]","") end
 
 local function getCoins(player)
-    return PlayerProfileService.GetCoins(player)
+	return PlayerProfileService.GetCoins(player)
 end
 
 local function grant(player)
-    local before = getCoins(player)
-    PlayerProfileService.IncrementCoins(player, AMOUNT)
-    if SAVE_IMMEDIATELY and PlayerProfileService.SaveNow then
-        pcall(function() PlayerProfileService.SaveNow(player, "ChatGiveCash") end)
-    end
-    local after = getCoins(player)
-    log(string.format("Granted %d to %s (before=%d after=%d)", AMOUNT, player.Name, before, after))
+	local before = getCoins(player)
+	PlayerProfileService.IncrementCoins(player, AMOUNT)
+	if SAVE_IMMEDIATELY and PlayerProfileService.SaveNow then
+		pcall(function() PlayerProfileService.SaveNow(player, "ChatGiveCash") end)
+	end
+	local after = getCoins(player)
+	log(string.format("Granted %d to %s (before=%d after=%d)", AMOUNT, player.Name, before, after))
 end
 
 local function handle(player, raw, src)

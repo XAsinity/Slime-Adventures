@@ -117,6 +117,22 @@ local function ensureEggMetadata()
 	end
 end
 
+-- Mark server-restored tools at startup so client preservation checks run before any preview/cleanup
+do
+	local ok, err = pcall(function()
+		if not tool then return end
+		ensureEggMetadata() -- ensure attributes exist (EggId / ServerIssued) immediately
+		if tool:GetAttribute("ServerIssued") then
+			tool:SetAttribute("ServerRestore", true)
+			tool:SetAttribute("PreserveOnClient", true)
+			dprint("Marked tool as ServerRestore/PreserveOnClient at startup")
+		end
+	end)
+	if not ok then
+		warn("EggTool client startup preserve mark failed:", err)
+	end
+end
+
 ----------------------------------------------------------------
 -- PRIMARY / HELD VISUAL
 ----------------------------------------------------------------
@@ -200,7 +216,25 @@ local function createPreview()
 	end
 end
 
+local function _clientPreserveTool(tool)
+	if not tool then return false end
+	local ok, isTool = pcall(function() return tool:IsA("Tool") end)
+	if not ok or not isTool then return false end
+
+	if tool:GetAttribute("ServerIssued") then return true end
+	if tool:GetAttribute("ServerRestore") then return true end
+	if tool:GetAttribute("PreserveOnClient") then return true end
+	if tool:GetAttribute("EggId") then return true end
+	if tool:GetAttribute("ToolUniqueId") then return true end
+	return false
+end
+
+-- Example usage: guard preview removal if tool preserved
 local function destroyPreview()
+	if _clientPreserveTool(tool) then
+		dprint("Preserving server-restored egg tool; skipping preview destroy.")
+		return
+	end
 	if previewModel then previewModel:Destroy() end
 	previewModel = nil
 	previewHighlight = nil

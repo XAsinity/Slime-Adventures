@@ -62,16 +62,16 @@ PlotManager.MaxPlayers = 6
 PlotManager.PlotNamePattern = "^Player(%d+)$"
 
 PlotManager.Config = {
-    -- Clear dynamic owned assets (slimes, eggs, decor with OwnerUserId) on player leave
-    ClearOwnedAssetsOnRelease = false, -- CHANGED: keep assets so serializers can see them
-    -- Also clear the player's neutral slime subfolder (if it exists)
-    ClearNeutralFolderOnRelease = false, -- avoid premature deletion
-    -- Neutral folder naming (mirrors PlayerDataService conventions if used)
-    NeutralFolderName = "Slimes",
-    NeutralPerPlayerSubfolders = true,
+	-- Clear dynamic owned assets (slimes, eggs, decor with OwnerUserId) on player leave
+	ClearOwnedAssetsOnRelease = false, -- CHANGED: keep assets so serializers can see them
+	-- Also clear the player's neutral slime subfolder (if it exists)
+	ClearNeutralFolderOnRelease = false, -- avoid premature deletion
+	-- Neutral folder naming (mirrors PlayerDataService conventions if used)
+	NeutralFolderName = "Slimes",
+	NeutralPerPlayerSubfolders = true,
 
-    -- Debug printing
-    Debug = false,
+	-- Debug printing
+	Debug = false,
 }
 
 -- Internal placement storage:
@@ -131,42 +131,42 @@ end
 
 -- Initialization ------------------------------------------------------------
 function PlotManager:Init()
-    self.Plots = {}
-    for i = 1, self.MaxPlayers do
-        local plot = workspace:FindFirstChild("Player" .. i)
-        if plot and plot:IsA("Model") then
-            tagPlot(plot, i)
-            table.insert(self.Plots, plot)
-        end
-    end
+	self.Plots = {}
+	for i = 1, self.MaxPlayers do
+		local plot = workspace:FindFirstChild("Player" .. i)
+		if plot and plot:IsA("Model") then
+			tagPlot(plot, i)
+			table.insert(self.Plots, plot)
+		end
+	end
 
-    -- REPLACED broken PlayerRemoving logic (was referencing undefined playerPlots & destroying too early)
-    Players.PlayerRemoving:Connect(function(player)
-        -- Leave plot + assets intact for final serializers; release after delay.
-        task.delay(8, function()
-            -- Only release if player truly gone
-            if Players:GetPlayerByUserId(player.UserId) then return end
-            -- Do NOT clear assets (config disabled); just free metadata.
-            self:ReleasePlayer(player)
-        end)
-    end)
+	-- REPLACED broken PlayerRemoving logic (was referencing undefined playerPlots & destroying too early)
+	Players.PlayerRemoving:Connect(function(player)
+		-- Leave plot + assets intact for final serializers; release after delay.
+		task.delay(8, function()
+			-- Only release if player truly gone
+			if Players:GetPlayerByUserId(player.UserId) then return end
+			-- Do NOT clear assets (config disabled); just free metadata.
+			self:ReleasePlayer(player)
+		end)
+	end)
 end
 
 -- Plot / Player Mapping -----------------------------------------------------
 local function debugPlotAssignment(player, plot)
-    if plot then
-        print(string.format("[PlotManager][DEBUG] Assigned plot '%s' (Index=%s) to player '%s' (UserId=%d)",
-            plot.Name,
-            tostring(plot:GetAttribute(PlotManager.IndexAttribute)),
-            player.Name,
-            player.UserId
-        ))
-    else
-        warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)",
-            player.Name,
-            player.UserId
-        ))
-    end
+	if plot then
+		print(string.format("[PlotManager][DEBUG] Assigned plot '%s' (Index=%s) to player '%s' (UserId=%d)",
+			plot.Name,
+			tostring(plot:GetAttribute(PlotManager.IndexAttribute)),
+			player.Name,
+			player.UserId
+			))
+	else
+		warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)",
+			player.Name,
+			player.UserId
+			))
+	end
 end
 
 function PlotManager:AssignPlayer(player)

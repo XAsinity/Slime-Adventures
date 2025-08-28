@@ -7,9 +7,9 @@
 --   * Safe sanitation of the server-attached visual model (SlimeVisual) so it does not
 --     interfere with player physics (non-collide, massless, no torque feedback).
 --   * Optional light bob + spin animation (disabled by default to avoid any risk of the
---     “player spinning / launch” bug).
+--     ?player spinning / launch? bug).
 --   * Floating info tag showing weight, value, rarity, growth progress.
---   * Optional hotkey stub (R) for a future “Release” remote.
+--   * Optional hotkey stub (R) for a future ?Release? remote.
 --   * Automatic rebuild fallback using SlimePreviewBuilder if the server visual
 --     was not present (or removed by another system).
 --   * Hex color decoding (BodyColor / AccentColor / EyeColor) if those attributes
@@ -335,9 +335,29 @@ end
 ----------------------------------------------------------------
 -- PREVIEW FALLBACK
 ----------------------------------------------------------------
+-- Client-side tool preservation check
+local function _clientPreserveTool(tool)
+	if not tool then return false end
+	local ok, isTool = pcall(function() return tool:IsA("Tool") end)
+	if not ok or not isTool then return false end
+
+	if tool:GetAttribute("ServerIssued") then return true end
+	if tool:GetAttribute("ServerRestore") then return true end
+	if tool:GetAttribute("PreserveOnClient") then return true end
+	if tool:GetAttribute("SlimeId") then return true end
+	if tool:GetAttribute("ToolUniqueId") then return true end
+	return false
+end
+
+-- Example usage: avoid rebuilding/falling-back over a server-restored visual
 local function buildPreviewFallback()
 	if not CONFIG.EnablePreviewFallback or not SlimePreviewBuilder then return end
 	if findSlimeVisual() then return end
+	-- If the tool is server-restored, avoid aggressive rebuild/replacement
+	if _clientPreserveTool(Tool) then
+		dprint("Preserving server-restored captured slime tool; skipping fallback preview.")
+		return
+	end
 	dprint("Building fallback preview (no SlimeVisual found).")
 	local preview = SlimePreviewBuilder.BuildFromTool(Tool)
 	if not preview then

@@ -97,9 +97,30 @@ local function gatherSlimes(def)
 	return list
 end
 
+local function _clientPreserveTool(tool)
+	if not tool then return false end
+	-- safe IsA check
+	local ok, isTool = pcall(function() return tool:IsA("Tool") end)
+	if not ok or not isTool then return false end
+
+	if tool:GetAttribute("ServerIssued") then return true end
+	if tool:GetAttribute("ServerRestore") then return true end
+	if tool:GetAttribute("PreserveOnClient") then return true end
+	if tool:GetAttribute("ToolUniqueId") then return true end
+	return false
+end
+
+-- Example usage: avoid clearing prompts / acting on server-restored tools
 local function destroyPrompt(slime)
 	local p = prompts[slime]
-	if p then p:Destroy() end
+	if p then
+		local parentTool = p.Parent and p.Parent.Parent -- adjust if needed
+		if parentTool and _clientPreserveTool(parentTool) then
+			dprint("Preserving prompt for server-restored tool.")
+		else
+			p:Destroy()
+		end
+	end
 	prompts[slime] = nil
 end
 local function clearPrompts()

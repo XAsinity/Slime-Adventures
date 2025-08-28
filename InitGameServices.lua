@@ -115,10 +115,46 @@ local PlayerProfileService = safeRequire("PlayerProfileService", true)
 local GrandInventorySerializer = safeRequire("GrandInventorySerializer", true)
 local InventoryService = safeRequire("InventoryService", true)
 
--- Register GrandInventorySerializer BEFORE InventoryService.Init!
-InventoryService.RegisterSerializer(GrandInventorySerializer)
-InventoryService.Init()
-log("Registered GrandInventorySerializer and initialized InventoryService.")
+-- Ensure PlotManager is initialized before InventoryService so restores find plots.
+local PlotManager = safeRequire("PlotManager")
+local plotInitOk = false
+if PlotManager and PlotManager.Init then
+	local ok, err = pcall(function() PlotManager:Init() end)
+	if ok then
+		plotInitOk = true
+		log("PlotManager initialized early for persistence ordering.")
+	else
+		warnf("PlotManager Init error: "..tostring(err))
+	end
+end
+
+-- Register GrandInventorySerializer AFTER plot manager init and BEFORE InventoryService.Init
+if InventoryService and GrandInventorySerializer then
+	InventoryService.RegisterSerializer(GrandInventorySerializer)
+	-- Defer InventoryService.Init until core feature modules (and PreExitInventorySync)
+	-- are loaded so restore runs with the full environment available.
+	log("Registered GrandInventorySerializer (InventoryService.Init deferred).")
+else
+	warnf("InventoryService or GrandInventorySerializer missing at init.")
+end
+
+-- Ensure PreExitInventorySync is required and initialized EARLY so it can install
+-- its PlayerRemoving/PreExit capture hook before any final serialize happens.
+local PreExitInventorySync = safeRequire("PreExitInventorySync")
+if PreExitInventorySync then
+	if type(PreExitInventorySync.Init) == "function" then
+		local ok, err = pcall(PreExitInventorySync.Init)
+		if ok then
+			log("PreExitInventorySync.Init() run early (pre-inventory).")
+		else
+			warnf("PreExitInventorySync.Init error (early): "..tostring(err))
+		end
+	else
+		log("PreExitInventorySync required (no Init()); module loaded early.")
+	end
+else
+	log("PreExitInventorySync not present; proceeding without early pre-exit hook.")
+end
 
 -- Register factions before Init (so profile blank creation seeds correct standings)
 for faction, initStanding in pairs(CONFIG.RegisterFactions) do
@@ -130,18 +166,6 @@ end
 ----------------------------------------------------------------
 -- 3. PlotManager + assignment
 ----------------------------------------------------------------
-local PlotManager = safeRequire("PlotManager")
-local plotInitOk = false
-if PlotManager and PlotManager.Init then
-	local ok, err = pcall(function() PlotManager:Init() end)
-	if ok then
-		plotInitOk = true
-		log("PlotManager initialized.")
-	else
-		warnf("PlotManager Init error: "..tostring(err))
-	end
-end
-
 local function assignPlayerPlot(player)
 	if not plotInitOk or not PlotManager or not PlotManager.AssignPlayer then return end
 	local plot = PlotManager:AssignPlayer(player)
@@ -190,7 +214,10 @@ local EggHatchService          = safeRequire("EggHatchService")
 local WorldAssetCleanup        = safeRequire("WorldAssetCleanup")
 local ShopService              = safeRequire("ShopService")
 local CoreStatsService         = safeRequire("CoreStatsService")
-local PreExitInventorySync     = safeRequire("PreExitInventorySync")
+if PreExitInventorySync then
+	log("PreExitInventorySync loaded to capture final inventory on leave (prevents accidental wipe).")
+end
+-- PreExitInventorySync removed intentionally; final saves handled via GrandInventorySerializer PlayerRemoving hook below.
 
 if GrowthPersistenceService and GrowthPersistenceService.Init then
 	local ok, err = pcall(GrowthPersistenceService.Init)
@@ -226,6 +253,23 @@ if ShopService and ShopService.Init then
 	else
 		warnf("ShopService.Init error: "..tostring(err))
 	end
+end
+
+----------------------------------------------------------------
+-- 4b. Ensure deterministic final-save on player leave
+----------------------------------------------------------------
+-- If GrandInventorySerializer provides PreExitSync, prefer that. Otherwise use Serialize(..., true).
+if GrandInventorySerializer then
+	Players.PlayerRemoving:Connect(function(player)
+		pcall(function()
+			log("Pre-exit persistence triggered for", player.Name)
+			if type(GrandInventorySerializer.PreExitSync) == "function" then
+				GrandInventorySerializer:PreExitSync(player)
+			else
+				GrandInventorySerializer:Serialize(player, true)
+			end
+		end)
+	end)
 end
 
 ----------------------------------------------------------------
@@ -305,5 +349,15 @@ task.spawn(function()
 		end
 	end
 end)
+
+-- AFTER loading feature/domain modules, initialize InventoryService now that environment is ready.
+if InventoryService and InventoryService.Init then
+	local ok, err = pcall(function() InventoryService.Init() end)
+	if ok then
+		log("InventoryService initialized (deferred init).")
+	else
+		warnf("InventoryService.Init error (deferred): "..tostring(err))
+	end
+end
 
 log("Initialization sequence complete.")
