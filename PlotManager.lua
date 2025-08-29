@@ -1,103 +1,47 @@
--- PlotManager (Robust Placement & Local Coordinate System + Plot Asset Clearing)
--- Version: 2.1 (Aug 2025)
---
--- Changes in 2.1:
---   * Added automatic server-side clearing of player-owned dynamic assets (slimes, eggs, decor, any
---     model or part with attribute OwnerUserId == player.UserId) from their plot when they leave.
---   * Added optional clearing of the player's neutral slime subfolder (if enabled).
---   * Added public APIs:
---       PlotManager:ClearPlayerPlot(player [, options])
---       PlotManager:ClearPlot(plot, userId [, options])
---     (options.neutral=true to also clear neutral folder; default uses internal config.)
---   * Players.PlayerRemoving connection added in :Init() to perform ReleasePlayer + Clear.
---   * ReleasePlayer now calls internal _ClearOwnedAssets before freeing the plot.
---
--- Goals (original):
---   * Preserve simple plot assignment API (AssignPlayer, GetPlayerPlot, etc.).
---   * Per-player placement registry storing LOCAL transforms for re-anchoring.
---   * Origin chosen by SlimeZone part or fallback base part.
---
--- NOTE:
---   This module does NOT persist placements; PlayerDataService handles persistence externally.
---   Clearing assets occurs AFTER PlayerDataService saves (it listens to PlayerRemoving too).
---   If you rely on offline persistence of world objects, disable clearing via
---     PlotManager.Config.ClearOwnedAssetsOnRelease = false
---   before initialization.
---
--- Public API Recap:
---   PlotManager:Init()
---   PlotManager:AssignPlayer(player)
---   PlotManager:ReleasePlayer(player)              -- Frees plot + clears owned assets (if enabled)
---   PlotManager:GetPlayerPlot(player)
---   PlotManager:GetSlimeZone(plot)
---   PlotManager:GetPlotOrigin(plot)
---   PlotManager:WorldToLocal(plot, worldCF)
---   PlotManager:LocalToWorld(plot, localCF)
---   PlotManager:RegisterPlacement(player, modelOrCF, kind, extra?)
---   PlotManager:UpdatePlacementCF(player, placementId, newWorldCF)
---   PlotManager:UpdatePlacementLocalCF(player, placementId, newLocalCF)
---   PlotManager:RemovePlacement(player, placementId)
---   PlotManager:GetPlacements(player)
---   PlotManager:FindPlacement(player, predicateFn)
---   PlotManager:FindPlacementById(player, id)
---   PlotManager:FindPlacementByModel(model)
---   PlotManager:ReanchorAll(player)
---   PlotManager:ClearPlayerPlot(player [, options])
---   PlotManager:ClearPlot(plot, userId [, options])
---
--- Internal record structure (placements):
---   { id, kind, time, localCF, worldCF, extra, model }
+-- PlotManager (Robust, auto-initializing)
+-- Version: 2.3
+-- Behaviors:
+--  - Automatically Init()s on require (defensive)
+--  - Recursively discovers plot Models in Workspace by:
+--      - name pattern Player%d+ OR
+--      - attribute IsPlot=true OR
+--      - attributes Index/PlotIndex/PlayerIndex
+--  - Sorts discovered plots by Index (number parsed from name or Index attribute) for deterministic assignment
+--  - Assigns already-connected players immediately and hooks PlayerAdded/CharacterAdded/PlayerRemoving
+--  - Defensive/idempotent: safe to call Init repeatedly or to call Init without a bound self
+--  - Provides placement API (RegisterPlacement, RemovePlacement, etc.) similar to the prior module
 
 local Players     = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local Workspace   = game:GetService("Workspace")
+local RunService  = game:GetService("RunService")
 
 local PlotManager = {}
 
--- Configuration -------------------------------------------------------------
-PlotManager.Plots = {}
-PlotManager.PlayerToPlot = {}
-PlotManager.IndexAttribute = "Index"
-PlotManager.MaxPlayers = 6
-PlotManager.PlotNamePattern = "^Player(%d+)$"
-
-PlotManager.Config = {
-	-- Clear dynamic owned assets (slimes, eggs, decor with OwnerUserId) on player leave
-	ClearOwnedAssetsOnRelease = false, -- CHANGED: keep assets so serializers can see them
-	-- Also clear the player's neutral slime subfolder (if it exists)
-	ClearNeutralFolderOnRelease = false, -- avoid premature deletion
-	-- Neutral folder naming (mirrors PlayerDataService conventions if used)
+-- Config --------------------------------------------------------------------
+PlotManager.IndexAttribute = PlotManager.IndexAttribute or "Index"
+PlotManager.MaxPlayers = PlotManager.MaxPlayers or 6
+PlotManager.PlotNamePattern = PlotManager.PlotNamePattern or "^Player(%d+)$"
+PlotManager.Config = PlotManager.Config or {
+	ClearOwnedAssetsOnRelease = false,
+	ClearNeutralFolderOnRelease = false,
 	NeutralFolderName = "Slimes",
 	NeutralPerPlayerSubfolders = true,
-
-	-- Debug printing
 	Debug = false,
 }
 
--- Internal placement storage:
--- placements[userId] = { list = {record,...}, index = { [id]=record } }
+-- Public state (guarantee existence)
+PlotManager.Plots = PlotManager.Plots or {}        -- array of Model
+PlotManager.PlayerToPlot = PlotManager.PlayerToPlot or {} -- map userId -> Model
+
+-- Internal placement storage
 local placements = {}
 
--- Utilities ----------------------------------------------------------------
+-- Utilities -----------------------------------------------------------------
 local function dprint(...)
-	if PlotManager.Config.Debug then
+	if PlotManager.Config and PlotManager.Config.Debug then
 		print("[PlotManager]", ...)
 	end
-end
-
-local function tagPlot(plotModel, index)
-	plotModel:SetAttribute("Occupied", false)
-	plotModel:SetAttribute("UserId", 0)
-	plotModel:SetAttribute(PlotManager.IndexAttribute, index)
-end
-
-local function ensureBucket(userId)
-	local bucket = placements[userId]
-	if not bucket then
-		bucket = { list = {}, index = {} }
-		placements[userId] = bucket
-	end
-	return bucket
 end
 
 local function generateGuid()
@@ -109,9 +53,10 @@ local function generateGuid()
 		math.random(0,0xFFFF), math.random(0,0xFFFFFFFF))
 end
 
-local function isModel(x) return typeof(x)=="Instance" and x:IsA("Model") end
+local function isModel(x) return typeof(x) == "Instance" and x:IsA("Model") end
 
 local function safePrimary(model)
+	if not model then return nil end
 	if model.PrimaryPart then return model.PrimaryPart end
 	for _,d in ipairs(model:GetDescendants()) do
 		if d:IsA("BasePart") then
@@ -129,172 +74,116 @@ local function cloneShallow(tbl)
 	return t
 end
 
--- Initialization ------------------------------------------------------------
-function PlotManager:Init()
-	self.Plots = {}
-	for i = 1, self.MaxPlayers do
-		local plot = workspace:FindFirstChild("Player" .. i)
-		if plot and plot:IsA("Model") then
-			tagPlot(plot, i)
-			table.insert(self.Plots, plot)
-		end
+local function tagPlot(plotModel, index)
+	if not plotModel or not plotModel:IsA("Model") then return end
+	if plotModel:GetAttribute("Occupied") == nil then
+		plotModel:SetAttribute("Occupied", false)
 	end
-
-	-- REPLACED broken PlayerRemoving logic (was referencing undefined playerPlots & destroying too early)
-	Players.PlayerRemoving:Connect(function(player)
-		-- Leave plot + assets intact for final serializers; release after delay.
-		task.delay(8, function()
-			-- Only release if player truly gone
-			if Players:GetPlayerByUserId(player.UserId) then return end
-			-- Do NOT clear assets (config disabled); just free metadata.
-			self:ReleasePlayer(player)
-		end)
-	end)
-end
-
--- Plot / Player Mapping -----------------------------------------------------
-local function debugPlotAssignment(player, plot)
-	if plot then
-		print(string.format("[PlotManager][DEBUG] Assigned plot '%s' (Index=%s) to player '%s' (UserId=%d)",
-			plot.Name,
-			tostring(plot:GetAttribute(PlotManager.IndexAttribute)),
-			player.Name,
-			player.UserId
-			))
-	else
-		warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)",
-			player.Name,
-			player.UserId
-			))
+	if plotModel:GetAttribute("UserId") == nil then
+		plotModel:SetAttribute("UserId", 0)
+	end
+	if index then
+		plotModel:SetAttribute(PlotManager.IndexAttribute, index)
 	end
 end
 
-function PlotManager:AssignPlayer(player)
-	if self.PlayerToPlot[player.UserId] then
-		debugPlotAssignment(player, self.PlayerToPlot[player.UserId])
-		return self.PlayerToPlot[player.UserId]
-	end
-	for _, plot in ipairs(self.Plots) do
-		if not plot:GetAttribute("Occupied") then
-			plot:SetAttribute("Occupied", true)
-			plot:SetAttribute("UserId", player.UserId)
-			self.PlayerToPlot[player.UserId] = plot
-			player:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute))
-			dprint(("Assigned %s to plot %s"):format(player.Name, plot.Name))
-			debugPlotAssignment(player, plot)
-			return plot
-		end
-	end
-	debugPlotAssignment(player, nil)
-	return nil
-end
+-- Recursively discover plots anywhere in Workspace
+local function discoverPlotsRecursive()
+	local found = {}
 
--- Internal clearing helper
-local function clearOwnedAssetsInContainer(container, userId)
-	for _,desc in ipairs(container:GetDescendants()) do
-		-- We target Models (slimes, eggs, decor) and optionally loose parts
-		if desc:IsA("Model") then
-			local owner = desc:GetAttribute("OwnerUserId")
-			if owner == userId then
-				-- Heuristic: dynamic asset if it has OwnerUserId OR SlimeId/EggId/Placed
-				if desc:GetAttribute("SlimeId") or desc:GetAttribute("EggId")
-					or desc.Name == "Slime" or desc.Name == "Egg"
-					or desc:GetAttribute("Placed") then
-					pcall(function() desc:Destroy() end)
+	local function rec(parent)
+		for _,child in ipairs(parent:GetChildren()) do
+			if child:IsA("Model") then
+				local nameMatch = nil
+				if type(child.Name) == "string" then
+					nameMatch = child.Name:match(PlotManager.PlotNamePattern)
 				end
-			end
-		elseif desc:IsA("BasePart") then
-			local owner = desc:GetAttribute("OwnerUserId")
-			if owner == userId then
-				-- A stray owned part (maybe decor)
-				pcall(function() desc:Destroy() end)
-			end
-		end
-	end
-end
+				local isPlotAttr = child:GetAttribute("IsPlot")
+				local idxAttr = child:GetAttribute(PlotManager.IndexAttribute) or child:GetAttribute("PlotIndex") or child:GetAttribute("PlayerIndex")
 
--- Public clear for a given plot/userId
-function PlotManager:ClearPlot(plot, userId, options)
-	if not plot or not plot.Parent or not userId then return end
-	if not PlotManager.Config.ClearOwnedAssetsOnRelease then return end
-	clearOwnedAssetsInContainer(plot, userId)
-
-	-- Neutral folder clearing (if configured)
-	local opts = options or {}
-	local doNeutral = opts.neutral
-	if doNeutral == nil then
-		doNeutral = PlotManager.Config.ClearNeutralFolderOnRelease
-	end
-	if doNeutral then
-		local root = Workspace:FindFirstChild(PlotManager.Config.NeutralFolderName)
-		if root then
-			if PlotManager.Config.NeutralPerPlayerSubfolders then
-				-- Scan only subfolder named after player if exists
-				for _,sub in ipairs(root:GetChildren()) do
-					if sub:IsA("Folder") then
-						clearOwnedAssetsInContainer(sub, userId)
+				if nameMatch or isPlotAttr or idxAttr then
+					-- determine index
+					local idxNum = nil
+					if tonumber(idxAttr) then
+						idxNum = tonumber(idxAttr)
+					elseif nameMatch and tonumber(nameMatch) then
+						idxNum = tonumber(nameMatch)
+					else
+						-- fallback: use next available index (will be sorted later)
+						idxNum = nil
 					end
+					table.insert(found, { model = child, index = idxNum })
 				end
-			else
-				clearOwnedAssetsInContainer(root, userId)
+			end
+			if #child:GetChildren() > 0 then rec(child) end
+		end
+	end
+
+	rec(Workspace)
+
+	-- If none found by attributes/pattern, consider direct children PlayerN names as last resort
+	if #found == 0 then
+		for _,child in ipairs(Workspace:GetChildren()) do
+			if child:IsA("Model") and type(child.Name) == "string" then
+				local m = child.Name:match(PlotManager.PlotNamePattern)
+				if m then
+					table.insert(found, { model = child, index = tonumber(m) })
+				end
 			end
 		end
 	end
-	dprint(("[ClearPlot] Cleared owned assets for userId=%d on plot=%s"):format(userId, plot.Name))
-end
 
--- Public convenience: clear for player
-function PlotManager:ClearPlayerPlot(player, options)
-	if not player or not player:IsA("Player") then return end
-	local plot = self.PlayerToPlot[player.UserId]
-	if plot then
-		self:ClearPlot(plot, player.UserId, options)
-	end
-end
-
-function PlotManager:ReleasePlayer(player)
-	local plot = self.PlayerToPlot[player.UserId]
-	if plot then
-		-- Clear assets first so if some other system scans the now unowned plot, it's clean.
-		self:ClearPlot(plot, player.UserId)
-		if plot.Parent then
-			plot:SetAttribute("Occupied", false)
-			plot:SetAttribute("UserId", 0)
+	-- Assign indexes where missing: use order of discovery and fill gaps
+	local nextIdx = 1
+	for _,rec in ipairs(found) do
+		if not rec.index then
+			while true do
+				local taken = false
+				for _,r2 in ipairs(found) do
+					if r2.index == nextIdx then taken = true; break end
+				end
+				if not taken then break end
+				nextIdx = nextIdx + 1
+			end
+			rec.index = nextIdx
+			nextIdx = nextIdx + 1
 		end
 	end
-	self.PlayerToPlot[player.UserId] = nil
-	placements[player.UserId] = nil -- Clear placement records
-	dprint(("Released plot for %s"):format(player.Name))
+
+	-- Sort by index ascending
+	table.sort(found, function(a,b) return (a.index or 0) < (b.index or 0) end)
+
+	-- Build plots array
+	local plots = {}
+	for _,rec in ipairs(found) do
+		tagPlot(rec.model, rec.index)
+		table.insert(plots, rec.model)
+	end
+
+	return plots
 end
 
-function PlotManager:GetPlayerPlot(player)
-	return self.PlayerToPlot[player.UserId]
+-- Internal helpers for placement bookkeeping
+local function ensureBucket(userId)
+	local bucket = placements[userId]
+	if not bucket then
+		bucket = { list = {}, index = {} }
+		placements[userId] = bucket
+	end
+	return bucket
 end
 
--- Origin Part & Zone --------------------------------------------------------
-function PlotManager:GetSlimeZone(plot)
+-- Public API ---------------------------------------------------------------
+function PlotManager:GetPlotOrigin(plot)
 	if not plot then return nil end
 	local direct = plot:FindFirstChild("SlimeZone")
 	if direct and direct:IsA("BasePart") then return direct end
-	for _,desc in ipairs(plot:GetDescendants()) do
-		if desc:IsA("BasePart") and desc.Name == "SlimeZone" then
-			return desc
-		end
-	end
-	return nil
-end
-
-function PlotManager:GetPlotOrigin(plot)
-	if not plot then return nil end
-	local origin = self:GetSlimeZone(plot)
-	if origin then return origin end
 	for _,d in ipairs(plot:GetDescendants()) do
 		if d:IsA("BasePart") then return d end
 	end
 	return nil
 end
 
--- World<->Local Transform Helpers ------------------------------------------
 function PlotManager:WorldToLocal(plot, worldCF)
 	local origin = self:GetPlotOrigin(plot)
 	if not origin then return worldCF end
@@ -307,7 +196,6 @@ function PlotManager:LocalToWorld(plot, localCF)
 	return origin.CFrame * localCF
 end
 
--- Placement Registration ----------------------------------------------------
 function PlotManager:RegisterPlacement(player, modelOrCF, kind, extra)
 	if not player or not player:IsA("Player") then
 		return nil, nil, "InvalidPlayer"
@@ -381,20 +269,6 @@ function PlotManager:UpdatePlacementCF(player, placementId, newWorldCF)
 	return true
 end
 
-function PlotManager:UpdatePlacementLocalCF(player, placementId, newLocalCF)
-	local plot = self:GetPlayerPlot(player)
-	if not plot then return false end
-	local bucket = placements[player.UserId]; if not bucket then return false end
-	local rec = bucket.index[placementId]; if not rec then return false end
-	if typeof(newLocalCF) ~= "CFrame" then return false end
-	rec.localCF = newLocalCF
-	rec.worldCF = self:LocalToWorld(plot, newLocalCF)
-	if rec.model and rec.model.Parent then
-		pcall(function() rec.model:PivotTo(rec.worldCF) end)
-	end
-	return true
-end
-
 function PlotManager:RemovePlacement(player, placementId)
 	local bucket = placements[player.UserId]; if not bucket then return false end
 	local rec = bucket.index[placementId]; if not rec then return false end
@@ -429,20 +303,6 @@ function PlotManager:GetPlacements(player)
 	return out
 end
 
-function PlotManager:FindPlacement(player, predicate)
-	if type(predicate) ~= "function" then return nil end
-	local bucket = placements[player.UserId]; if not bucket then return nil end
-	for _,rec in ipairs(bucket.list) do
-		if predicate(rec) then return rec end
-	end
-	return nil
-end
-
-function PlotManager:FindPlacementById(player, placementId)
-	local bucket = placements[player.UserId]; if not bucket then return nil end
-	return bucket.index[placementId]
-end
-
 function PlotManager:FindPlacementByModel(model)
 	if not isModel(model) then return nil end
 	local pid = model:GetAttribute("PlacementId")
@@ -471,6 +331,133 @@ function PlotManager:ReanchorAll(player)
 	end
 end
 
+-- Plot assignment -----------------------------------------------------------
+local function debugPlotAssignment(player, plot)
+	if plot then
+		print(string.format("[PlotManager][DEBUG] Assigned plot '%s' (Index=%s) to player '%s' (UserId=%d)",
+			plot.Name,
+			tostring(plot:GetAttribute(PlotManager.IndexAttribute)),
+			player.Name,
+			player.UserId
+			))
+	else
+		warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)",
+			player.Name,
+			player.UserId
+			))
+	end
+end
+
+function PlotManager:GetPlayerPlot(player)
+	if not player then return nil end
+	return self.PlayerToPlot[player.UserId]
+end
+
+function PlotManager:AssignPlayer(player)
+	if not player or not player.UserId then return nil end
+
+	-- If already assigned and plot still valid, return it
+	local existing = self.PlayerToPlot[player.UserId]
+	if existing and existing.Parent and existing:GetAttribute("Occupied") then
+		debugPlotAssignment(player, existing)
+		return existing
+	end
+
+	-- Try to find an unoccupied plot
+	for _, plot in ipairs(self.Plots) do
+		if plot and plot.Parent and not plot:GetAttribute("Occupied") then
+			plot:SetAttribute("Occupied", true)
+			plot:SetAttribute("UserId", player.UserId)
+			self.PlayerToPlot[player.UserId] = plot
+			if player.SetAttribute and plot:GetAttribute(self.IndexAttribute) then
+				pcall(function() player:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute)) end)
+			end
+			dprint(("Assigned %s to plot %s"):format(player.Name, plot.Name))
+			debugPlotAssignment(player, plot)
+			return plot
+		end
+	end
+
+	-- No plot available
+	debugPlotAssignment(player, nil)
+	return nil
+end
+
+function PlotManager:ClearPlot(plot, userId, options)
+	if not plot or not plot.Parent or not userId then return end
+	if not PlotManager.Config.ClearOwnedAssetsOnRelease then
+		dprint(("ClearPlot skipped (config disabled) for userId=%d on plot=%s"):format(userId, plot.Name))
+		return
+	end
+	local function clearOwnedAssetsInContainer(container)
+		if not container then return end
+		for _,desc in ipairs(container:GetDescendants()) do
+			if desc:IsA("Model") then
+				local owner = desc:GetAttribute("OwnerUserId")
+				if owner == userId then
+					if desc:GetAttribute("SlimeId") or desc:GetAttribute("EggId")
+						or desc.Name == "Slime" or desc.Name == "Egg"
+						or desc:GetAttribute("Placed") then
+						pcall(function() desc:Destroy() end)
+					end
+				end
+			elseif desc:IsA("BasePart") then
+				local owner = desc:GetAttribute("OwnerUserId")
+				if owner == userId then
+					pcall(function() desc:Destroy() end)
+				end
+			end
+		end
+	end
+
+	clearOwnedAssetsInContainer(plot)
+
+	local opts = options or {}
+	local doNeutral = opts.neutral
+	if doNeutral == nil then
+		doNeutral = PlotManager.Config.ClearNeutralFolderOnRelease
+	end
+	if doNeutral then
+		local root = Workspace:FindFirstChild(PlotManager.Config.NeutralFolderName)
+		if root then
+			if PlotManager.Config.NeutralPerPlayerSubfolders then
+				for _,sub in ipairs(root:GetChildren()) do
+					if sub:IsA("Folder") then
+						clearOwnedAssetsInContainer(sub)
+					end
+				end
+			else
+				clearOwnedAssetsInContainer(root)
+			end
+		end
+	end
+	dprint(("[ClearPlot] Cleared owned assets for userId=%d on plot=%s"):format(userId, plot.Name))
+end
+
+function PlotManager:ClearPlayerPlot(player, options)
+	if not player or not player:IsA("Player") then return end
+	local plot = self.PlayerToPlot[player.UserId]
+	if plot then
+		self:ClearPlot(plot, player.UserId, options)
+	end
+end
+
+function PlotManager:ReleasePlayer(player)
+	if not player or not player.UserId then return end
+	local plot = self.PlayerToPlot[player.UserId]
+	if plot then
+		-- Clear assets first (respects config inside ClearPlot)
+		self:ClearPlot(plot, player.UserId)
+		if plot.Parent then
+			plot:SetAttribute("Occupied", false)
+			plot:SetAttribute("UserId", 0)
+		end
+	end
+	self.PlayerToPlot[player.UserId] = nil
+	placements[player.UserId] = nil -- Clear placement records
+	dprint(("Released plot for %s"):format(player.Name))
+end
+
 -- Character spawn -----------------------------------------------------------
 function PlotManager:FindSpawnPart(plotModel)
 	if not plotModel then return nil end
@@ -486,14 +473,111 @@ end
 
 function PlotManager:OnCharacterAdded(player, character)
 	local plot = self:GetPlayerPlot(player)
-	if not plot then return end
+	if not plot then
+		pcall(function() self:AssignPlayer(player) end)
+		plot = self:GetPlayerPlot(player)
+		if not plot then
+			dprint(("OnCharacterAdded: no plot for %s; spawn will use default spawn"):format(player.Name))
+			return
+		end
+	end
 	local spawnPart = self:FindSpawnPart(plot)
 	if spawnPart then
-		local hrp = character:WaitForChild("HumanoidRootPart", 5)
+		local hrp = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
 		if hrp then
-			hrp.CFrame = spawnPart.CFrame + Vector3.new(0, 3, 0)
+			pcall(function() hrp.CFrame = spawnPart.CFrame + Vector3.new(0, 3, 0) end)
 		end
 	end
 end
+
+-- Initialization ------------------------------------------------------------
+function PlotManager:Init()
+	-- Make safe if invoked without colon (self == nil)
+	if not self then self = PlotManager end
+
+	if self._initialized then
+		dprint("Init() already called; skipping.")
+		return self
+	end
+	self._initialized = true
+
+	-- Ensure tables exist
+	self.Plots = self.Plots or {}
+	self.PlayerToPlot = self.PlayerToPlot or {}
+
+	-- Discover plots (recursive)
+	local ok, plots = pcall(discoverPlotsRecursive)
+	if not ok then
+		warn("[PlotManager] discoverPlotsRecursive failed:", plots)
+		plots = {}
+	end
+	self.Plots = plots or {}
+
+	dprint(("PlotManager initialized. Plots discovered: %d"):format(#self.Plots))
+
+	-- Hook PlayerAdded and PlayerRemoving
+	Players.PlayerAdded:Connect(function(player)
+		pcall(function()
+			if not self.PlayerToPlot[player.UserId] then
+				local assigned = self:AssignPlayer(player)
+				if not assigned then
+					if player.SetAttribute then
+						pcall(function() player:SetAttribute("PlotIndex", 0) end)
+					end
+				end
+			else
+				local plot = self.PlayerToPlot[player.UserId]
+				if plot and plot:GetAttribute(self.IndexAttribute) and player.SetAttribute then
+					pcall(function() player:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute)) end)
+				end
+			end
+
+			player.CharacterAdded:Connect(function(character)
+				task.defer(function()
+					pcall(function() self:OnCharacterAdded(player, character) end)
+				end)
+			end)
+		end)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		task.delay(8, function()
+			if Players:GetPlayerByUserId(player.UserId) then return end
+			pcall(function() self:ReleasePlayer(player) end)
+		end)
+	end)
+
+	-- Assign plots for players already connected
+	for _,pl in ipairs(Players:GetPlayers()) do
+		pcall(function()
+			if not self.PlayerToPlot[pl.UserId] then
+				local assigned = self:AssignPlayer(pl)
+				if assigned and pl.Character then
+					pcall(function() self:OnCharacterAdded(pl, pl.Character) end)
+				end
+			else
+				local plot = self.PlayerToPlot[pl.UserId]
+				if plot and plot:GetAttribute(self.IndexAttribute) and pl.SetAttribute then
+					pcall(function() pl:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute)) end)
+				end
+			end
+		end)
+	end
+
+	return self
+end
+
+-- Auto-init on require (server-side). This ensures module self-initializes even if loader didn't call Init.
+-- Only auto-init when running on server (ServerScriptService); avoid running in client contexts.
+local function autoInitIfServer()
+	if RunService:IsServer() then
+		-- Defer slightly to allow other modules that run immediately on require to finish (helps ordering races)
+		task.defer(function()
+			pcall(function() PlotManager:Init() end)
+		end)
+	end
+end
+
+autoInitIfServer()
 
 return PlotManager
