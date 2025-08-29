@@ -1,8 +1,5 @@
--- ShopService v3.3 (generic naming) - updated
+-- ShopService v3.3 (generic naming)
 -- Now routes all coin changes and persistence through PlayerProfileService
--- Ensures purchased tools are treated as live items (clears server-restore flags),
--- records purchases into InventoryService runtime state to prevent serializer races,
--- and requests immediate persistence.
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -102,7 +99,7 @@ local function buildInventorySnapshot(player)
 end
 
 local function sendInventory(player)
-	pcall(function() InventoryUpdateEvent:FireClient(player, buildInventorySnapshot(player)) end)
+	InventoryUpdateEvent:FireClient(player, buildInventorySnapshot(player))
 end
 
 function ShopService.GetInventory(player)
@@ -133,10 +130,6 @@ local function createEggTool(player, purchaseKey)
 	for k,v in pairs(stats) do
 		tool:SetAttribute(k, v)
 	end
-	-- Ensure a unique ToolUniqueId for persistence/dedupe
-	if not tool:GetAttribute("ToolUniqueId") then
-		tool:SetAttribute("ToolUniqueId", HttpService:GenerateGUID(false))
-	end
 	return tool
 end
 
@@ -144,38 +137,24 @@ end
 -- Purchase responses
 ----------------------------------------------------------------
 local function fail(player, msg)
-	pcall(function()
-		PurchaseResultEvent:FireClient(player, {
-			success = false,
-			message = msg,
-			remainingCoins = getCoins(player)
-		})
-	end)
+	PurchaseResultEvent:FireClient(player, {
+		success = false,
+		message = msg,
+		remainingCoins = getCoins(player)
+	})
 end
 
 local function ok(player, msg)
-	pcall(function()
-		PurchaseResultEvent:FireClient(player, {
-			success = true,
-			message = msg,
-			remainingCoins = getCoins(player)
-		})
-	end)
+	PurchaseResultEvent:FireClient(player, {
+		success = true,
+		message = msg,
+		remainingCoins = getCoins(player)
+	})
 end
 
 ----------------------------------------------------------------
 -- Purchase handler (PlayerProfileService persistence)
 ----------------------------------------------------------------
-local function clearRestoreFlags(tool)
-	if not tool or not tool.SetAttribute then return end
-	pcall(function()
-		tool:SetAttribute("ServerIssued", false)
-		tool:SetAttribute("ServerRestore", false)
-		tool:SetAttribute("PreserveOnServer", false)
-		tool:SetAttribute("PreserveOnClient", false)
-	end)
-end
-
 local function onPurchase(player, purchaseType, itemKey)
 	if purchaseGuard[player] then
 		return fail(player, "Purchase in progress")
@@ -208,14 +187,10 @@ local function onPurchase(player, purchaseType, itemKey)
 			return fail(player, "No backpack")
 		end
 
-		-- Parent to backpack
 		tool.Parent = bp
 
-		-- Purchased items should be considered live items: clear any server-restore/preserve flags
-		clearRestoreFlags(tool)
-
-		-- Add to PlayerProfileService inventory
-		local itemData = {
+		-- Build profile-friendly egg data
+		local eggItemData = {
 			EggId         = tool:GetAttribute("EggId"),
 			Rarity        = tool:GetAttribute("Rarity"),
 			HatchTime     = tool:GetAttribute("HatchTime"),
@@ -224,22 +199,31 @@ local function onPurchase(player, purchaseType, itemKey)
 			ValueBase     = tool:GetAttribute("ValueBase"),
 			ValuePerGrowth= tool:GetAttribute("ValuePerGrowth"),
 			ToolName      = tool.Name,
-			ServerIssued  = false, -- purchased, not a server-restored clone
+			ServerIssued  = true,
 			OwnerUserId   = player.UserId,
-			ToolUniqueId  = tool:GetAttribute("ToolUniqueId"),
 			StatsVersion  = STATS_VERSION,
 		}
-		PlayerProfileService.AddInventoryItem(player, "eggTools", itemData)
 
-		-- Also record it into InventoryService runtime state so serializer won't overwrite it later:
+		-- Persist to profile (some flows expect this)
+		PlayerProfileService.AddInventoryItem(player, "eggTools", eggItemData)
+
+		-- Also update InventoryService runtime state/folder so serializer won't overwrite later
 		local okAdd, addErr = pcall(function()
-			return InventoryService.AddInventoryItem(player, "eggTools", itemData)
+			return InventoryService.AddInventoryItem(player, "eggTools", eggItemData)
 		end)
 		if not okAdd then
 			warn("[ShopService] InventoryService.AddInventoryItem failed:", addErr)
 		end
 
-		-- Persist & notify player
+		-- Ensure profileCache reflects runtime inventory before forcing a save
+		local okSync, syncErr = pcall(function()
+			InventoryService.UpdateProfileInventory(player)
+		end)
+		if not okSync then
+			warn("[ShopService] InventoryService.UpdateProfileInventory failed:", syncErr)
+		end
+
+		-- Immediate persistence
 		PlayerProfileService.SaveNow(player, "PostEggPurchase")
 		PlayerProfileService.ForceFullSaveNow(player, "PostEggPurchaseImmediate")
 
@@ -254,9 +238,6 @@ local function onPurchase(player, purchaseType, itemKey)
 
 		addCoins(player, -opt.cost)
 
-		-- Give food using FoodService. Many FoodService implementations will already
-		-- record into PlayerProfileService and InventoryService; still attempt to clear flags
-		-- and ensure the profile/runtime state recorded here matches expectations.
 		local tool = FoodService.GiveFood(player, itemKey, true)
 		if not tool then
 			addCoins(player, opt.cost)
@@ -264,30 +245,35 @@ local function onPurchase(player, purchaseType, itemKey)
 			return fail(player, "Food creation failed")
 		end
 
-		-- If FoodService returned a tool instance, clear any server-restore flags (defensive)
-		if tool and typeof(tool) == "Instance" and tool.SetAttribute then
-			clearRestoreFlags(tool)
-			-- ensure ToolUniqueId present in profile data
-			local foodItemData = {
-				FoodId      = tool:GetAttribute("FoodId") or tool.Name,
-				Name        = tool.Name,
-				Restore     = tool:GetAttribute("RestoreFraction"),
-				BufferBonus = tool:GetAttribute("FeedBufferBonus"),
-				Charges     = tool:GetAttribute("Charges"),
-				Consumable  = tool:GetAttribute("Consumable"),
-				ServerIssued= false,
-				OwnerUserId = player.UserId,
-				ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
-			}
-			-- Persist to profile (some FoodService implementations already do this)
-			PlayerProfileService.AddInventoryItem(player, "foodTools", foodItemData)
-			-- Also add to InventoryService runtime state as defensive measure
-			local okAdd2, addErr2 = pcall(function()
-				return InventoryService.AddInventoryItem(player, "foodTools", foodItemData)
-			end)
-			if not okAdd2 then
-				warn("[ShopService] InventoryService.AddInventoryItem failed:", addErr2)
-			end
+		-- Build profile-friendly food data
+		local foodItemData = {
+			FoodId      = tool:GetAttribute("FoodId") or tool.Name,
+			Name        = tool.Name,
+			Restore     = tool:GetAttribute("RestoreFraction"),
+			BufferBonus = tool:GetAttribute("FeedBufferBonus"),
+			Charges     = tool:GetAttribute("Charges"),
+			Consumable  = tool:GetAttribute("Consumable"),
+			ServerIssued= true,
+			OwnerUserId = player.UserId,
+		}
+
+		-- Persist to profile (some FoodService implementations already do this)
+		PlayerProfileService.AddInventoryItem(player, "foodTools", foodItemData)
+
+		-- Also add to InventoryService runtime state as defensive measure
+		local okAdd2, addErr2 = pcall(function()
+			return InventoryService.AddInventoryItem(player, "foodTools", foodItemData)
+		end)
+		if not okAdd2 then
+			warn("[ShopService] InventoryService.AddInventoryItem failed:", addErr2)
+		end
+
+		-- Ensure profileCache reflects runtime inventory before forcing a save
+		local okSync2, syncErr2 = pcall(function()
+			InventoryService.UpdateProfileInventory(player)
+		end)
+		if not okSync2 then
+			warn("[ShopService] InventoryService.UpdateProfileInventory failed:", syncErr2)
 		end
 
 		PlayerProfileService.SaveNow(player, "PostFoodPurchase")
@@ -332,8 +318,8 @@ function ShopService.Init()
 	_inited = true
 	Players.PlayerAdded:Connect(onPlayerAdded)
 	for _,p in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded,p) end
-	RequestInventoryEvent.OnServerEvent:Connect(function(player) pcall(sendInventory, player) end)
-	PurchaseEggEvent.OnServerEvent:Connect(function(player, purchaseType, itemKey) pcall(onPurchase, player, purchaseType, itemKey) end)
+	RequestInventoryEvent.OnServerEvent:Connect(sendInventory)
+	PurchaseEggEvent.OnServerEvent:Connect(onPurchase)
 	hookPersistenceRestore()
 	log("Initialized OK (Module).")
 end

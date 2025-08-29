@@ -1,7 +1,6 @@
--- FoodService v3.2.1-persist-flag (updated)
+-- FoodService v3.2.1-persist-flag
 -- Now uses PlayerProfileService for persistence and dirty marking
--- Plus: ensures granted/purchased food tools are considered live items (clears server-restore flags)
--- and records them in both PlayerProfileService and InventoryService runtime state.
+-- Updated to sync runtime InventoryService state with PlayerProfileService before forced saves
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -11,11 +10,11 @@ local HttpService         = game:GetService("HttpService")
 
 local Modules             = ServerScriptService:WaitForChild("Modules")
 local PlayerProfileService = require(Modules:WaitForChild("PlayerProfileService"))
+local InventoryService     = require(Modules:WaitForChild("InventoryService"))
 
 local ModulesRS      = ReplicatedStorage:WaitForChild("Modules")
 local FoodDefinitions= require(ModulesRS:WaitForChild("FoodDefinitions"))
 local FoodEffects    = require(ModulesRS:WaitForChild("FoodEffects"))
-local InventoryService = require(script.Parent:WaitForChild("InventoryService"))
 
 local hungerModule = Modules:FindFirstChild("SlimeHungerService")
 local SlimeHungerService = hungerModule and require(hungerModule)
@@ -216,45 +215,32 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 	local granted = {}
 	for i=1, amount do
 		local tool = createFoodTool(player, foodId, def)
-
-		-- Parent to backpack before clearing/setting owner attributes so replication works
 		tool.Parent = backpack
-
-		-- Clear server-restore/preserve flags for purchased/granted tools so serializer includes them
-		pcall(function()
-			tool:SetAttribute("ServerIssued", false)
-			tool:SetAttribute("ServerRestore", false)
-			tool:SetAttribute("PreserveOnServer", false)
-			tool:SetAttribute("PreserveOnClient", false)
-		end)
-
 		if CONFIG.BackfillOwnerAfterParent and not tool:GetAttribute("OwnerUserId") then
 			tool:SetAttribute("OwnerUserId", player.UserId)
 		end
-
 		if throttled(grantLogLast, CONFIG.GrantLogThrottle, player.UserId.."|"..foodId) then
 			log(("Granted %s foodId=%s Charges=%s (x%d)")
 				:format(player.Name, foodId, tostring(tool:GetAttribute("Charges")), amount))
 		end
 		verifyReplication(player, tool)
 		table.insert(granted, tool)
-
-		-- Add to PlayerProfileService inventory (persist)
+		-- Add to PlayerProfileService inventory
 		local foodItemData = {
 			FoodId = foodId,
 			ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
 			Charges = tool:GetAttribute("Charges"),
-			ServerIssued = false, -- purchased/granted, not a server-restored clone
+			ServerIssued = true,
 			GrantedAt = os.time(),
 		}
 		PlayerProfileService.AddInventoryItem(player, "foodTools", foodItemData)
 
 		-- Also add to InventoryService runtime state so serializer won't later overwrite
-		local ok, err = pcall(function()
+		local okInvAdd, invAddErr = pcall(function()
 			return InventoryService.AddInventoryItem(player, "foodTools", foodItemData)
 		end)
-		if not ok then
-			warn("[FoodService] InventoryService.AddInventoryItem failed:", err)
+		if not okInvAdd then
+			warnf("[FoodService] InventoryService.AddInventoryItem failed: %s", tostring(invAddErr))
 		end
 	end
 
@@ -263,6 +249,14 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 			markDirty(player, amount>1 and "FoodBatchGrant" or "FoodGrant")
 		end
 		if CONFIG.SaveImmediatelyOnGrant or options.immediateOverride then
+			-- Ensure profileCache reflects runtime inventory before forcing a save
+			local okSync, syncErr = pcall(function()
+				InventoryService.UpdateProfileInventory(player)
+			end)
+			if not okSync then
+				warnf("[FoodService] InventoryService.UpdateProfileInventory failed: %s", tostring(syncErr))
+			end
+
 			saveImmediate(player, amount>1 and "FoodBatchGrantImmediate" or "FoodGrantImmediate")
 			if CONFIG.DeferredSaveAfterGrantSeconds > 0 then
 				task.delay(CONFIG.DeferredSaveAfterGrantSeconds, function()
@@ -286,6 +280,8 @@ function FoodService.GiveFoods(player, foodIdList, opts)
 	if not options.skipPersist then
 		if CONFIG.MarkDirtyOnGrant then markDirty(player, "FoodBatchGrant") end
 		if CONFIG.SaveImmediatelyOnGrant or options.immediateOverride then
+			-- Ensure profileCache reflects runtime inventory before forcing a save
+			pcall(function() InventoryService.UpdateProfileInventory(player) end)
 			saveImmediate(player, "FoodBatchGrantImmediate")
 		end
 	end
@@ -380,12 +376,14 @@ function FoodService.HandleFeed(player, slime, tool)
 		consumed = consumeCharge(tool)
 		-- Remove from PlayerProfileService inventory
 		PlayerProfileService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", tool:GetAttribute("ToolUniqueId"))
-		-- Also remove from InventoryService runtime state (best-effort)
-		pcall(function()
-			if InventoryService.RemoveInventoryItem then
-				InventoryService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", tool:GetAttribute("ToolUniqueId"))
-			end
+
+		-- Sync profile with runtime InventoryService state so subsequent saves reflect the current live backpack
+		local okSync, syncErr = pcall(function()
+			InventoryService.UpdateProfileInventory(player)
 		end)
+		if not okSync then
+			warnf("[FoodService] InventoryService.UpdateProfileInventory failed after consume: %s", tostring(syncErr))
+		end
 	end
 
 	if throttled(feedLogLast, CONFIG.FeedLogThrottle, player.UserId.."|"..tostring(slime:GetAttribute("SlimeId") or "")) then
@@ -394,7 +392,12 @@ function FoodService.HandleFeed(player, slime, tool)
 	end
 
 	if CONFIG.MarkDirtyOnConsume then markDirty(player, "FoodConsume") end
-	if CONFIG.SaveImmediatelyOnConsume then saveImmediate(player, "FoodConsumeImmediate") end
+
+	if CONFIG.SaveImmediatelyOnConsume then
+		-- Ensure profileCache reflects runtime inventory before forcing save
+		pcall(function() InventoryService.UpdateProfileInventory(player) end)
+		saveImmediate(player, "FoodConsumeImmediate")
+	end
 
 	return true
 end

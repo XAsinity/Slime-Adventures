@@ -1,34 +1,7 @@
 -- EggService.lua
 -- Version: v4.0.0-placement-cap-snapshot-purge-stable
---
--- COMPLETE UPDATED EGG SERVICE
--- Combines:
---   * Strict placement cap (counts ONLY currently placed / unhatched eggs)
---   * Safe hatching (egg model always destroyed, slot freed immediately)
---   * Optional manual hatch (remote) or automatic hatch loop
---   * Residual duplicate / orphan egg purge
---   * Optional snapshot export (for final serializer flushes)
---   * Robust dedupe by EggId (earliest wins)
---   * Adoption (after server start) without exceeding cap
---   * Clean, minimal logging (toggle DEBUG)
---   * Defensive against double hatch & re-registration races
---
--- NOTE:
---   Your client PlaceEgg remote must call:
---      PlaceEgg:FireServer(hitCFrame, tool)
---   Where hitCFrame is a CFrame of desired placement and tool is the egg Tool instance
---   (If you only pass hitCFrame, this script will attempt to auto-detect a tool held/equipped.)
---
---   Manual hatch remote (if enabled) is HatchEggRequest, passing (worldEggModel)
---
--- SAFETY CHECKLIST:
---   - On hatch: placed count decremented BEFORE heavy work
---   - HatchInProgress prevents double-execution
---   - worldEgg is moved to graveyard folder prior to destruction to avoid adopt events
---   - Residual purge (immediate + delayed passes) cleans stray copies
---   - Adoption skips models flagged Hatched/Hatching
---
--- If you need a trimmed version (no snapshots/purge), ask for "minimal".
+-- (updated to keep PlayerProfileService / InventoryService in sync for worldEgg lifecycle)
+-- See conversation for rationale.
 
 local EggService = {}
 EggService.__Version = "v4.0.0-placement-cap-snapshot-purge-stable"
@@ -51,12 +24,26 @@ local SlimeConfig         = require(ModulesRoot:WaitForChild("SlimeConfig"))
 local SizeRNG             = require(ModulesRoot:WaitForChild("SizeRNG"))
 local GrowthScaling       = require(ModulesRoot:WaitForChild("GrowthScaling"))
 local SlimeMutation       = require(ModulesRoot:WaitForChild("SlimeMutation"))
+
+-- Persistence / inventory services (added)
 local PlayerDataService
 do
 	local ok, res = pcall(function()
 		return require(ModulesRoot:FindFirstChild("PlayerDataService"))
 	end)
 	if ok then PlayerDataService = res end
+end
+local PlayerProfileService = nil
+local InventoryService = nil
+do
+	-- PlayerProfileService/InventoryService may be in the same Modules folder
+	-- Use pcall so file doesn't hard-fail if not present during tests
+	pcall(function()
+		PlayerProfileService = require(ModulesRoot:WaitForChild("PlayerProfileService"))
+	end)
+	pcall(function()
+		InventoryService = require(ModulesRoot:WaitForChild("InventoryService"))
+	end)
 end
 
 -- Remotes
@@ -171,7 +158,7 @@ EggService.GetPlacedEggCount    = function(player) return GetPlacedCount(player.
 local function updatePlayerAttr(userId)
 	for _,plr in ipairs(Players:GetPlayers()) do
 		if plr.UserId == userId then
-			plr:SetAttribute("ActiveEggs", GetPlacedCount(userId))
+			pcall(function() plr:SetAttribute("ActiveEggs", GetPlacedCount(userId)) end)
 			break
 		end
 	end
@@ -435,6 +422,7 @@ end
 
 ----------------------------------------------------------
 -- DESTROY / PURGE HELPERS
+-- Note: this now attempts to keep PlayerProfileService + InventoryService in sync
 ----------------------------------------------------------
 local function destroyEggModel(model, reason)
 	if not model then return end
@@ -450,6 +438,42 @@ local function destroyEggModel(model, reason)
 		dprint(("[Purge] Destroy egg EggId=%s reason=%s path=%s")
 			:format(tostring(model:GetAttribute("EggId")), tostring(reason), model:GetFullName()))
 	end
+
+	-- Sync inventory / profile: remove any worldEgg entries referencing this egg
+	local owner = model:GetAttribute("OwnerUserId")
+	local eggId = model:GetAttribute("EggId")
+	if owner and eggId then
+		-- Attempt to remove from PlayerProfileService inventory (accepts player or userId)
+		if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
+			local okP, errP = pcall(function()
+				-- Try both possible key names (lowercase eggId or capital EggId) defensively
+				PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "eggId", eggId)
+				PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "EggId", eggId)
+			end)
+			if not okP then
+				warn("[EggService] PlayerProfileService.RemoveInventoryItem failed:", tostring(errP))
+			end
+		end
+
+		-- InventoryService.RemoveInventoryItem expects a live player object. Remove if player present.
+		if InventoryService and InventoryService.RemoveInventoryItem then
+			local ply = Players:GetPlayerByUserId(owner)
+			if ply then
+				local okI, errI = pcall(function()
+					InventoryService.RemoveInventoryItem(ply, "worldEggs", "eggId", eggId)
+					InventoryService.RemoveInventoryItem(ply, "worldEggs", "EggId", eggId)
+					-- Also remove from eggTools in case the tool was destroyed/placed without proper removal
+					InventoryService.RemoveInventoryItem(ply, "eggTools", "EggId", eggId)
+				end)
+				if not okI then
+					warn("[EggService] InventoryService.RemoveInventoryItem failed:", tostring(errI))
+				end
+				-- Update profile copy of runtime state
+				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+			end
+		end
+	end
+
 	pcall(function() model:Destroy() end)
 end
 
@@ -514,6 +538,24 @@ local function hatchEgg(worldEgg)
 
 	ensureGraveyard()
 	worldEgg.Parent = GraveyardFolder
+
+	-- Remove worldEgg entry from profile/inventory now that hatch will consume it
+	if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
+		pcall(function()
+			PlayerProfileService.RemoveInventoryItem(ownerUserId, "worldEggs", "eggId", eggId)
+			PlayerProfileService.RemoveInventoryItem(ownerUserId, "worldEggs", "EggId", eggId)
+		end)
+	end
+	if InventoryService and InventoryService.RemoveInventoryItem then
+		if ownerPlayer then
+			pcall(function()
+				InventoryService.RemoveInventoryItem(ownerPlayer, "worldEggs", "eggId", eggId)
+				InventoryService.RemoveInventoryItem(ownerPlayer, "worldEggs", "EggId", eggId)
+				-- update profile cache to reflect removal
+				InventoryService.UpdateProfileInventory(ownerPlayer)
+			end)
+		end
+	end
 
 	local markEggPersistSucceeded = false
 	if EGG_HATCH_INPLACE_PERSIST and PlayerDataService and ownerPlayer and PlayerDataService.MarkEggHatched then
@@ -632,6 +674,7 @@ local function hatchEgg(worldEgg)
 	end
 
 	visibilitySummary(slime)
+	-- worldEgg has already been moved to graveyard; destroy it and continue
 	destroyEggModel(worldEgg, "HatchComplete")
 
 	if PlayerDataService and ownerPlayer then
@@ -665,7 +708,7 @@ local function hatchEgg(worldEgg)
 		end
 	end)
 
-	dprint(("[EggService] Hatched egg -> slime (owner=%s persisted=%s")
+	dprint(("[EggService] Hatched egg -> slime (owner=%s persisted=%s)")
 		:format(tostring(ownerUserId), tostring(markEggPersistSucceeded)))
 
 	if RESIDUAL_PURGE_ENABLED then
@@ -723,6 +766,25 @@ local function registerEggModel(worldEgg)
 	IncrementPlaced(owner)
 	updatePlayerAttr(owner)
 	pushSnapshot(worldEgg)
+
+	-- Ensure runtime inventory has an entry for this world egg (defensive)
+	if InventoryService and InventoryService.AddInventoryItem then
+		local ply = Players:GetPlayerByUserId(owner)
+		if ply then
+			pcall(function()
+				InventoryService.AddInventoryItem(ply, "worldEggs", {
+					eggId = eggId,
+					hatchAt = worldEgg:GetAttribute("HatchAt"),
+					hatchTime = worldEgg:GetAttribute("HatchTime"),
+					placedAt = worldEgg:GetAttribute("PlacedAt"),
+					rarity = worldEgg:GetAttribute("Rarity"),
+					valueBase = worldEgg:GetAttribute("ValueBase"),
+					valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
+				})
+				InventoryService.UpdateProfileInventory(ply)
+			end)
+		end
+	end
 
 	if DEBUG then
 		dprint(("RegisterEgg eggId=%s owner=%s placed=%d/%d hatchIn=%.1fs")
@@ -792,6 +854,7 @@ end
 
 ----------------------------------------------------------
 -- PLACEMENT
+-- When placing we remove eggTools entry and add a worldEggs entry in InventoryService
 ----------------------------------------------------------
 local function uniformHatchTime()
 	return math.random(HATCH_TIME_RANGE[1], HATCH_TIME_RANGE[2])
@@ -876,6 +939,41 @@ local function placeEgg(player, hitCFrame, tool)
 	pushSnapshot(worldEgg)
 
 	player:SetAttribute("LastEggPlace", os.clock())
+
+	-- Remove the tool's egg entry from saved/runtime inventory and add a worldEggs entry
+	-- PlayerProfileService.RemoveInventoryItem accepts player or userId; InventoryService needs player object
+	local function tryRemoveEggToolFromInventory()
+		if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
+			pcall(function()
+				PlayerProfileService.RemoveInventoryItem(player, "eggTools", "EggId", eggId)
+				PlayerProfileService.RemoveInventoryItem(player, "eggTools", "eggId", eggId)
+			end)
+		end
+		if InventoryService and InventoryService.RemoveInventoryItem then
+			pcall(function()
+				InventoryService.RemoveInventoryItem(player, "eggTools", "EggId", eggId)
+				InventoryService.RemoveInventoryItem(player, "eggTools", "eggId", eggId)
+			end)
+		end
+	end
+	tryRemoveEggToolFromInventory()
+
+	-- Add runtime worldEggs entry so serializer knows about placed egg
+	if InventoryService and InventoryService.AddInventoryItem then
+		pcall(function()
+			InventoryService.AddInventoryItem(player, "worldEggs", {
+				eggId = eggId,
+				hatchAt = worldEgg:GetAttribute("HatchAt"),
+				hatchTime = worldEgg:GetAttribute("HatchTime"),
+				placedAt = worldEgg:GetAttribute("PlacedAt"),
+				rarity = worldEgg:GetAttribute("Rarity"),
+				valueBase = worldEgg:GetAttribute("ValueBase"),
+				valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
+			})
+			-- keep profile cache aligned with runtime immediately
+			pcall(function() InventoryService.UpdateProfileInventory(player) end)
+		end)
+	end
 
 	if tool.Parent then
 		print("[EggService][Debug] Destroying egg tool after placement:", tool.Name, "EggId:", tool:GetAttribute("EggId"), "Parent:", tostring(tool.Parent))

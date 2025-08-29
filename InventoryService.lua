@@ -1,7 +1,7 @@
 -- InventoryService.lua
--- Version: v3.1.0-grand-unified-support (updated)
---
--- See header in original for full feature summary.
+-- Version: v3.1.0-grand-unified-support
+-- (patched: AddInventoryItem/RemoveInventoryItem now sync profile immediately and request ForceFullSaveNow
+--  to improve persistence reliability for purchases/consumes)
 
 local InventoryService = {}
 InventoryService.__Version = "v3.1.0-grand-unified-support"
@@ -62,6 +62,7 @@ local function warnLog(...) warn("[InvWarn]", ...) end
 local PlayerState = {}
 
 local function ensureState(player)
+	-- expects a player Instance (this service keys state by player Instance)
 	local st = PlayerState[player]
 	if st then return st end
 	st = {
@@ -78,8 +79,31 @@ local function ensureState(player)
 end
 
 local function markDirty(player, reason)
+	-- player must be Instance
 	local st = ensureState(player)
 	st.dirtyReasons[reason or "Unknown"] = true
+end
+
+--------------------------------------------------
+-- HELPER: resolve player object from player or userId
+--------------------------------------------------
+local function resolvePlayer(playerOrId)
+	if not playerOrId then return nil end
+	-- Prefer Roblox typeof check for Instance when available
+	if typeof and typeof(playerOrId) == "Instance" and playerOrId:IsA("Player") then
+		return playerOrId
+	end
+	-- Fallback: table-like with UserId (roblox userdata)
+	if type(playerOrId) == "table" and playerOrId.UserId then
+		return playerOrId
+	end
+	if type(playerOrId) == "number" then
+		return Players:GetPlayerByUserId(playerOrId)
+	end
+	if type(playerOrId) == "string" then
+		return Players:FindFirstChild(playerOrId)
+	end
+	return nil
 end
 
 --------------------------------------------------
@@ -139,7 +163,6 @@ local function updateInventoryFolder(player, fieldName, list)
 	if countVal then
 		countVal.Value = #list
 	end
-	-- remove previous Entry_* folders
 	for _,child in ipairs(fld:GetChildren()) do
 		if child:IsA("Folder") and child.Name:match("^"..ENTRY_FOLDER_PREFIX) then
 			child:Destroy()
@@ -336,7 +359,7 @@ local function serializePlayer(player, reason, finalFlag)
 				local count = #list
 				local old = oldCounts[nm] or 0
 				local guardR = (count ~= old) and guardEval(player, st, nm, old, count) or {accept=true, code="noChange"}
-				local fld = st.fields[nm] or { list={}, lastCount=0, version=0, meta=nil }
+				local fld = st.fields[nm] or { list={}, lastCount = 0, version=0, meta=nil }
 				fld.list = list
 				fld.lastCount = count
 				fld.version = (fld.version or 0) + 1
@@ -526,55 +549,112 @@ function InventoryService.RestorePlayer(player, savedData)
 end
 
 --------------------------------------------------
--- PUBLIC APIS
+-- PUBLIC APIS (Add/Remove runtime items)
+--
+-- Important change: AddInventoryItem and RemoveInventoryItem now attempt to
+-- sync the PlayerProfileService profile immediately and force a full save
+-- (best-effort, wrapped in pcall). This reduces the chance of "runtime state
+-- changed but profile saved without the inventory entries" races that caused
+-- items to be missing on next join.
 --------------------------------------------------
-function InventoryService.MarkDirty(player, reason) markDirty(player, reason or "ManualDirty") end
-function InventoryService.ForceSave(player, reason)
-	-- Implement save logic here
-	print("[InventoryService] ForceSave called for", player.Name, "reason:", reason)
-end
-function InventoryService.PlayerSnapshot(player)
-	local st = PlayerState[player]; if not st then return nil end
-	local function buildBlob(player, st)
-		local blob = { v=st.snapshotVersion, fields={} }
-		for name,f in pairs(st.fields) do
-			blob.fields[name] = { v=f.version, list=f.list, meta=f.meta }
-		end
-		return blob
+
+-- AddInventoryItem: accepts player Instance or userId (number). Returns true on success.
+function InventoryService.AddInventoryItem(playerOrId, fieldName, itemData)
+	local ply = resolvePlayer(playerOrId)
+	if not ply then
+		warn("[InvSvc] AddInventoryItem: player not found for", tostring(playerOrId))
+		return false, "no player"
 	end
-	return buildBlob(player, st)
-end
-
--- Adds an item to the runtime InventoryService state and updates the Inventory folder immediately.
--- This ensures that purchases / grants recorded by ShopService / FoodService are visible to the
--- GrandInventorySerializer and prevents a later serializer-run from overwriting the profile with empties.
-function InventoryService.AddInventoryItem(player, fieldName, itemData)
-	if not player or not fieldName then return false, "invalid args" end
-	local st = ensureState(player) -- initializes state if absent
-	if not st then return false, "no player state" end
-
-	st.fields[fieldName] = st.fields[fieldName] or { list = {}, version = 0, meta = {} }
+	local st = ensureState(ply)
+	st.fields[fieldName] = st.fields[fieldName] or { list = {}, lastCount = 0, version = 0, meta = nil }
 	table.insert(st.fields[fieldName].list, itemData)
-
-	-- Mark as dirty so it'll be serialized on the next periodic/forced serialize.
-	st.dirtyReasons["AddInventoryItem"] = true
-
-	-- bump version / lastCount so debug prints show the updated state
-	st.fields[fieldName].version = (st.fields[fieldName].version or 0) + 1
 	st.fields[fieldName].lastCount = #st.fields[fieldName].list
+	st.fields[fieldName].version = (st.fields[fieldName].version or 0) + 1
+	-- mark dirty & record reason
+	st.dirtyReasons["AddInventoryItem"] = true
+	-- update per-player folder for runtime visibility
+	updateInventoryFolder(ply, fieldName, st.fields[fieldName].list)
+	if DEBUG then
+		print(("[InvSvc] Added item to %s.%s (now %d)"):format(ply.Name, fieldName, #st.fields[fieldName].list))
+	end
 
-	-- Immediately update the per-player Inventory folder so the runtime and persisted view align.
-	updateInventoryFolder(player, fieldName, st.fields[fieldName].list)
-
-	-- Optionally trigger a serialize soon (we don't force a save here; callers may call SaveNow)
-	-- markDirty(player, "AddInventoryItem") -- already marked via dirtyReasons above
+	-- Immediately sync runtime inventory into profile cache and request a persisted save.
+	-- Best-effort; wrap in pcall so failures do not block game flow.
+	pcall(function()
+		InventoryService.UpdateProfileInventory(ply)
+	end)
+	pcall(function()
+		-- ForceFullSaveNow is synchronous to reduce last-write race windows.
+		PlayerProfileService.ForceFullSaveNow(ply, "InventoryAddImmediate")
+	end)
 
 	return true
 end
 
+-- RemoveInventoryItem: accepts player Instance or userId (number), category, idField, idValue
+-- Returns true if item removed (first matching)
+function InventoryService.RemoveInventoryItem(playerOrId, category, idField, idValue)
+	local ply = resolvePlayer(playerOrId)
+	if not ply then
+		warn("[InvSvc] RemoveInventoryItem: player not found for", tostring(playerOrId))
+		return false, "no player"
+	end
+	local st = ensureState(ply)
+	local fld = st.fields[category]
+	if not fld or not fld.list then
+		-- nothing to remove
+		return false, "no field"
+	end
+	for i = #fld.list, 1, -1 do
+		local entry = fld.list[i]
+		if type(entry) == "table" and entry[idField] == idValue then
+			table.remove(fld.list, i)
+			fld.lastCount = #fld.list
+			fld.version = (fld.version or 0) + 1
+			st.dirtyReasons["RemoveInventoryItem"] = true
+			-- update runtime folder representation
+			updateInventoryFolder(ply, category, fld.list)
+			if DEBUG then
+				print(("[InvSvc] Removed item from %s.%s idField=%s id=%s (now %d)"):format(ply.Name, category, tostring(idField), tostring(idValue), #fld.list))
+			end
+
+			-- Immediately sync runtime inventory into profile cache and request a persisted save.
+			pcall(function()
+				InventoryService.UpdateProfileInventory(ply)
+			end)
+			pcall(function()
+				PlayerProfileService.ForceFullSaveNow(ply, "InventoryRemoveImmediate")
+			end)
+
+			return true
+		end
+	end
+	return false, "not found"
+end
+
+--------------------------------------------------
+-- SERIALIZE / SAVE HELPERS (exposed functions kept)
+--------------------------------------------------
+function InventoryService.MarkDirty(playerOrId, reason)
+	local ply = resolvePlayer(playerOrId)
+	if not ply then return end
+	markDirty(ply, reason or "ManualDirty")
+end
+
+function InventoryService.ForceSave(playerOrId, reason)
+	local ply = resolvePlayer(playerOrId)
+	if not ply then return end
+	serializePlayer(ply, reason or "ForceSave", false)
+end
+
+function InventoryService.ExportPlayerSnapshot(player)
+	local st = PlayerState[player]; if not st then return nil end
+	return buildBlob(player, st)
+end
+
 function InventoryService.DebugPrintPlayer(player)
 	local st = PlayerState[player]
-	if not st then print("[InvSvc] No state for", player.Name) return end
+	if not st then print("[InvSvc] No state for", player and player.Name or tostring(player)) return end
 	print(("[InvSvc][Debug] %s restored=%s version=%d")
 		:format(player.Name, tostring(st.restoreCompleted), st.snapshotVersion))
 	for nm,f in pairs(st.fields) do
@@ -584,17 +664,20 @@ function InventoryService.DebugPrintPlayer(player)
 				f.meta and tostring(f.meta.mergeApplied) or "false"))
 	end
 end
+
 function InventoryService.FlushAll(reason)
 	for _,plr in ipairs(Players:GetPlayers()) do
 		serializePlayer(plr, reason or "FlushAll", false)
 	end
 end
+
 function InventoryService.FinalizePlayer(player, reason)
 	serializePlayer(player, reason or "Final", true)
 end
 
 -- Helper: Update PlayerProfileService inventory from current InventoryService state
 function InventoryService.UpdateProfileInventory(player)
+	-- expects a player Instance (we key PlayerState by Instance)
 	local st = PlayerState[player]
 	if not st then return end
 	local profile = PlayerProfileService.GetProfile(player)
@@ -604,7 +687,7 @@ function InventoryService.UpdateProfileInventory(player)
 		-- Only copy the list, not meta/version
 		profile.inventory[field] = data.list or {}
 	end
-	-- Optionally, mark profile dirty or save immediately
+	-- Save a snapshot asynchronously; callers may call ForceFullSaveNow if they need sync
 	PlayerProfileService.SaveNow(player, "InventorySync")
 end
 
@@ -682,13 +765,12 @@ function InventoryService.Init()
 		task.spawn(periodicLoop)
 	end
 
-	-- compute serializer count
-	local serializerCount = 0
-	for _ in pairs(Serializers) do serializerCount += 1 end
-
+	-- Count serializers for informational print
+	local sCount = 0
+	for _,_ in pairs(Serializers) do sCount += 1 end
 	print(("[InvSvc] InventoryService %s initialized AutoPeriodic=%s Interval=%ds Serializers=%d")
 		:format(InventoryService.__Version, tostring(AUTO_PERIODIC_SERIALIZE),
-			SERIALIZE_INTERVAL_SECONDS, serializerCount))
+			SERIALIZE_INTERVAL_SECONDS, sCount))
 	return InventoryService
 end
 

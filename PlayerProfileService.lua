@@ -1,5 +1,6 @@
 -- PlayerProfileService.lua
 -- Unified profile/persistence module (compatible with PlayerProfileOrchestrator)
+-- Temporary debug prints: logs coins on load/save for diagnosis. Remove these prints after debugging.
 
 local DataStoreService = game:GetService("DataStoreService")
 local Players          = game:GetService("Players")
@@ -67,23 +68,34 @@ end
 
 -- helper: resolve various inputs to a numeric userId (player object, userId, or player name)
 local function resolveUserId(playerOrId, shortWait)
-	-- numeric id passed directly
+	-- numeric id passed
 	if type(playerOrId) == "number" then
 		return playerOrId
 	end
 
-	-- Accept Roblox Player Instance (typeof returns "Instance" in Luau) or userdata/table with .UserId
-	-- Using typeof if available keeps it robust in Studio/Server environments.
-	local okType, t = pcall(function() return typeof and typeof(playerOrId) end)
-	if okType and t == "Instance" and playerOrId and playerOrId.UserId then
-		return playerOrId.UserId
+	-- Roblox Instance / Player detection (use typeof when available)
+	local okTypeFunc = (typeof ~= nil)
+	if okTypeFunc then
+		-- If it's an Instance and a Player, return its UserId
+		if typeof(playerOrId) == "Instance" then
+			local success, isPlayer = pcall(function() return playerOrId:IsA("Player") end)
+			if success and isPlayer and playerOrId.UserId then
+				return playerOrId.UserId
+			end
+		end
+	else
+		-- Older fallback: LuaStudio environment might show players as userdata/table with UserId
+		if type(playerOrId) == "table" and playerOrId.UserId then
+			return playerOrId.UserId
+		end
 	end
-	-- some runtimes may return "userdata" for Player objects; accept any value that has UserId
-	if (type(playerOrId) == "userdata" or type(playerOrId) == "table") and playerOrId and playerOrId.UserId then
+
+	-- Also accept table-like objects with UserId (defensive pcall)
+	if type(playerOrId) == "table" and playerOrId.UserId then
 		return playerOrId.UserId
 	end
 
-	-- string: try to coerce to number first, then try to match by name
+	-- string: maybe numeric string
 	if type(playerOrId) == "string" then
 		local n = tonumber(playerOrId)
 		if n then return n end
@@ -98,7 +110,7 @@ local function resolveUserId(playerOrId, shortWait)
 			end
 		end
 
-		-- optional short wait for PlayerAdded (non-blocking-ish). shortWait true => wait ~2s, otherwise full fallback (~30s) kept by callers
+		-- optional short wait for PlayerAdded (non-blocking-ish). shortWait true => wait ~2s, otherwise full fallback (~30s)
 		local timeout = shortWait and 2 or 30
 		local found = nil
 		local conn
@@ -132,9 +144,10 @@ local function loadProfile(userId)
 	data = ensureKeys(data, userId)
 	profileCache[userId] = data
 
-	-- Debug: log inventory counts on load to help diagnose missing items
-	log(string.format("[PPS][DEBUG] loaded profile %s eggTools=%d foodTools=%d capturedSlimes=%d worldSlimes=%d worldEggs=%d dataVersion=%s",
+	-- Debug: log inventory counts and coins on load to help diagnose missing items/coins
+	log(string.format("[PPS][DEBUG] loaded profile %s coins=%s eggTools=%d foodTools=%d capturedSlimes=%d worldSlimes=%d worldEggs=%d dataVersion=%s",
 		tostring(userId),
+		tostring((data.core and data.core.coins) or 0),
 		#(data.inventory and data.inventory.eggTools or {}),
 		#(data.inventory and data.inventory.foodTools or {}),
 		#(data.inventory and data.inventory.capturedSlimes or {}),
@@ -152,6 +165,13 @@ local function saveProfile(userId, reason)
 	profile.updatedAt = os.time()
 	profile.dataVersion = (profile.dataVersion or 1) + 1
 	local key = keyFor(userId)
+	-- Debug: log coins being saved so we can confirm persistence of coin value
+	log(string.format("[PPS][DEBUG] saving profile userId=%s coins=%s reason=%s dataVersion=%s",
+		tostring(userId),
+		tostring((profile.core and profile.core.coins) or 0),
+		tostring(reason or "unspecified"),
+		tostring(profile.dataVersion or "?")
+		))
 	local ok, err = pcall(function()
 		store:SetAsync(key, profile)
 	end)
@@ -166,6 +186,7 @@ local function saveProfile(userId, reason)
 end
 
 local function markDirty(userId)
+	if not userId then return end
 	dirtyPlayers[userId] = true
 end
 
@@ -191,7 +212,8 @@ function PlayerProfileService.GetProfile(playerOrId)
 	end
 
 	if not userId then
-		log("GetProfile called with invalid playerOrId:", tostring(playerOrId), "type=", type(playerOrId))
+		local t = (typeof and typeof(playerOrId)) or type(playerOrId)
+		log("GetProfile called with invalid playerOrId:", tostring(playerOrId), "type=", tostring(t))
 		return nil
 	end
 
@@ -276,57 +298,82 @@ function PlayerProfileService.GetCoins(playerOrId)
 	return (profile.core and profile.core.coins) or 0
 end
 
-function PlayerProfileService.SetStanding(player, faction, value)
-	local profile = PlayerProfileService.GetProfile(player)
+function PlayerProfileService.SetStanding(playerOrId, faction, value)
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		log("SetStanding: invalid playerOrId:", tostring(playerOrId))
+		return
+	end
+	local profile = PlayerProfileService.GetProfile(userId)
 	profile.core = profile.core or {}
 	profile.core.standings = profile.core.standings or {}
 	profile.core.standings[faction] = value
-	markDirty(player.UserId)
+	markDirty(userId)
 end
 
-function PlayerProfileService.GetStanding(player, faction)
-	local profile = PlayerProfileService.GetProfile(player)
+function PlayerProfileService.GetStanding(playerOrId, faction)
+	local profile = PlayerProfileService.GetProfile(playerOrId)
 	profile.core = profile.core or {}
 	profile.core.standings = profile.core.standings or {}
 	return profile.core.standings[faction] or 0
 end
 
-function PlayerProfileService.AddInventoryItem(player, category, itemData)
-	local profile = PlayerProfileService.GetProfile(player)
-	profile.inventory = profile.inventory or defaultProfile(player.UserId).inventory
+function PlayerProfileService.AddInventoryItem(playerOrId, category, itemData)
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		log("AddInventoryItem: invalid playerOrId:", tostring(playerOrId))
+		return
+	end
+	local profile = PlayerProfileService.GetProfile(userId)
+	profile.inventory = profile.inventory or defaultProfile(userId).inventory
 	if profile.inventory[category] then
 		table.insert(profile.inventory[category], itemData)
-		markDirty(player.UserId)
+		markDirty(userId)
 	end
 end
 
-function PlayerProfileService.RemoveInventoryItem(player, category, itemIdField, itemId)
-	local profile = PlayerProfileService.GetProfile(player)
-	profile.inventory = profile.inventory or defaultProfile(player.UserId).inventory
+function PlayerProfileService.RemoveInventoryItem(playerOrId, category, itemIdField, itemId)
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		log("RemoveInventoryItem: invalid playerOrId:", tostring(playerOrId))
+		return
+	end
+	local profile = PlayerProfileService.GetProfile(userId)
+	profile.inventory = profile.inventory or defaultProfile(userId).inventory
 	local items = profile.inventory[category]
 	if items then
 		for i = #items, 1, -1 do
 			if items[i][itemIdField] == itemId then
 				table.remove(items, i)
-				markDirty(player.UserId)
+				markDirty(userId)
 				break
 			end
 		end
 	end
 end
 
-function PlayerProfileService.SaveNow(player, reason)
-	log("SaveNow requested for userId", player.UserId, "reason:", reason or "Manual (async)")
+function PlayerProfileService.SaveNow(playerOrId, reason)
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		log("SaveNow requested with invalid playerOrId:", tostring(playerOrId))
+		return
+	end
+	log("SaveNow requested for userId", userId, "reason:", reason or "Manual (async)")
 	-- best-effort async save so callers can stamp meta without blocking
 	task.spawn(function()
-		saveProfile(player.UserId, reason or "Manual")
+		saveProfile(userId, reason or "Manual")
 	end)
 end
 
-function PlayerProfileService.ForceFullSaveNow(player, reason)
-	log("ForceFullSaveNow invoked for userId", player.UserId, "reason:", reason or "ForceFullSave")
+function PlayerProfileService.ForceFullSaveNow(playerOrId, reason)
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		log("ForceFullSaveNow invoked with invalid playerOrId:", tostring(playerOrId))
+		return
+	end
+	log("ForceFullSaveNow invoked for userId", userId, "reason:", reason or "ForceFullSave")
 	-- synchronous save for callers that require immediate persistence
-	saveProfile(player.UserId, reason or "ForceFullSave")
+	saveProfile(userId, reason or "ForceFullSave")
 end
 
 local EXIT_SAVE_ATTEMPTS      = 3
