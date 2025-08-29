@@ -1,5 +1,7 @@
--- FoodService v3.2.1-persist-flag
+-- FoodService v3.2.1-persist-flag (updated)
 -- Now uses PlayerProfileService for persistence and dirty marking
+-- Plus: ensures granted/purchased food tools are considered live items (clears server-restore flags)
+-- and records them in both PlayerProfileService and InventoryService runtime state.
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -13,6 +15,7 @@ local PlayerProfileService = require(Modules:WaitForChild("PlayerProfileService"
 local ModulesRS      = ReplicatedStorage:WaitForChild("Modules")
 local FoodDefinitions= require(ModulesRS:WaitForChild("FoodDefinitions"))
 local FoodEffects    = require(ModulesRS:WaitForChild("FoodEffects"))
+local InventoryService = require(script.Parent:WaitForChild("InventoryService"))
 
 local hungerModule = Modules:FindFirstChild("SlimeHungerService")
 local SlimeHungerService = hungerModule and require(hungerModule)
@@ -213,24 +216,46 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 	local granted = {}
 	for i=1, amount do
 		local tool = createFoodTool(player, foodId, def)
+
+		-- Parent to backpack before clearing/setting owner attributes so replication works
 		tool.Parent = backpack
+
+		-- Clear server-restore/preserve flags for purchased/granted tools so serializer includes them
+		pcall(function()
+			tool:SetAttribute("ServerIssued", false)
+			tool:SetAttribute("ServerRestore", false)
+			tool:SetAttribute("PreserveOnServer", false)
+			tool:SetAttribute("PreserveOnClient", false)
+		end)
+
 		if CONFIG.BackfillOwnerAfterParent and not tool:GetAttribute("OwnerUserId") then
 			tool:SetAttribute("OwnerUserId", player.UserId)
 		end
+
 		if throttled(grantLogLast, CONFIG.GrantLogThrottle, player.UserId.."|"..foodId) then
 			log(("Granted %s foodId=%s Charges=%s (x%d)")
 				:format(player.Name, foodId, tostring(tool:GetAttribute("Charges")), amount))
 		end
 		verifyReplication(player, tool)
 		table.insert(granted, tool)
-		-- Add to PlayerProfileService inventory
-		PlayerProfileService.AddInventoryItem(player, "foodTools", {
+
+		-- Add to PlayerProfileService inventory (persist)
+		local foodItemData = {
 			FoodId = foodId,
 			ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
 			Charges = tool:GetAttribute("Charges"),
-			ServerIssued = true,
+			ServerIssued = false, -- purchased/granted, not a server-restored clone
 			GrantedAt = os.time(),
-		})
+		}
+		PlayerProfileService.AddInventoryItem(player, "foodTools", foodItemData)
+
+		-- Also add to InventoryService runtime state so serializer won't later overwrite
+		local ok, err = pcall(function()
+			return InventoryService.AddInventoryItem(player, "foodTools", foodItemData)
+		end)
+		if not ok then
+			warn("[FoodService] InventoryService.AddInventoryItem failed:", err)
+		end
 	end
 
 	if not options.skipPersist then
@@ -355,6 +380,12 @@ function FoodService.HandleFeed(player, slime, tool)
 		consumed = consumeCharge(tool)
 		-- Remove from PlayerProfileService inventory
 		PlayerProfileService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", tool:GetAttribute("ToolUniqueId"))
+		-- Also remove from InventoryService runtime state (best-effort)
+		pcall(function()
+			if InventoryService.RemoveInventoryItem then
+				InventoryService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", tool:GetAttribute("ToolUniqueId"))
+			end
+		end)
 	end
 
 	if throttled(feedLogLast, CONFIG.FeedLogThrottle, player.UserId.."|"..tostring(slime:GetAttribute("SlimeId") or "")) then

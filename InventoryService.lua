@@ -1,30 +1,7 @@
 -- InventoryService.lua
--- Version: v3.1.0-grand-unified-support
+-- Version: v3.1.0-grand-unified-support (updated)
 --
--- Features:
---  * Supports registration of a single GrandInventorySerializer (or any custom combined serializer).
---  * Auto-discovery will still find any ModuleScript ending in "Serializer", but you should register GrandInventorySerializer manually for best clarity.
---  * Immediate serialization (no gating).
---  * Per-player Inventory folder tree with per-field folders and JSON entry nodes.
---  * Merge on RestorePlayer (union by recognized id keys).
---  * SaveCallback hook for orchestrator persistence.
---  * Clear logging; easy to trim with DEBUG flag.
---
--- Folder Structure:
---   player.Inventory/
---       <fieldName>/ (each list field)
---          Count (IntValue)
---          Entry_<index or id>/Data (StringValue JSON per entry)
---       Meta/  (reserved for future global values)
---
--- Serializer Contract:
---   serializer:Serialize(player, isFinal:boolean) -> table mapping fieldName to array
---   serializer:Restore(player, dataTable) -- dataTable maps fieldName to array
---   serializer.Name = "grandInventory" (for clarity)
---
--- SaveCallback signature:
---   SaveCallback(player, blobTable, reasonString, finalFlag:boolean)
---
+-- See header in original for full feature summary.
 
 local InventoryService = {}
 InventoryService.__Version = "v3.1.0-grand-unified-support"
@@ -162,6 +139,7 @@ local function updateInventoryFolder(player, fieldName, list)
 	if countVal then
 		countVal.Value = #list
 	end
+	-- remove previous Entry_* folders
 	for _,child in ipairs(fld:GetChildren()) do
 		if child:IsA("Folder") and child.Name:match("^"..ENTRY_FOLDER_PREFIX) then
 			child:Destroy()
@@ -252,13 +230,6 @@ local function guardEval(player, st, field, oldC, newC)
 	end
 	return {accept=true, code="shrink", old=oldC,new=newC,drop=drop}
 end
-
---------------------------------------------------
--- SAVE CALLBACK
---------------------------------------------------
--- REMOVE SaveCallback logic
--- local SaveCallback = nil
--- function InventoryService.SetSaveCallback(cb) SaveCallback = cb end
 
 --------------------------------------------------
 -- UTIL
@@ -562,7 +533,7 @@ function InventoryService.ForceSave(player, reason)
 	-- Implement save logic here
 	print("[InventoryService] ForceSave called for", player.Name, "reason:", reason)
 end
-function InventoryService.ExportPlayerSnapshot(player)
+function InventoryService.PlayerSnapshot(player)
 	local st = PlayerState[player]; if not st then return nil end
 	local function buildBlob(player, st)
 		local blob = { v=st.snapshotVersion, fields={} }
@@ -573,6 +544,34 @@ function InventoryService.ExportPlayerSnapshot(player)
 	end
 	return buildBlob(player, st)
 end
+
+-- Adds an item to the runtime InventoryService state and updates the Inventory folder immediately.
+-- This ensures that purchases / grants recorded by ShopService / FoodService are visible to the
+-- GrandInventorySerializer and prevents a later serializer-run from overwriting the profile with empties.
+function InventoryService.AddInventoryItem(player, fieldName, itemData)
+	if not player or not fieldName then return false, "invalid args" end
+	local st = ensureState(player) -- initializes state if absent
+	if not st then return false, "no player state" end
+
+	st.fields[fieldName] = st.fields[fieldName] or { list = {}, version = 0, meta = {} }
+	table.insert(st.fields[fieldName].list, itemData)
+
+	-- Mark as dirty so it'll be serialized on the next periodic/forced serialize.
+	st.dirtyReasons["AddInventoryItem"] = true
+
+	-- bump version / lastCount so debug prints show the updated state
+	st.fields[fieldName].version = (st.fields[fieldName].version or 0) + 1
+	st.fields[fieldName].lastCount = #st.fields[fieldName].list
+
+	-- Immediately update the per-player Inventory folder so the runtime and persisted view align.
+	updateInventoryFolder(player, fieldName, st.fields[fieldName].list)
+
+	-- Optionally trigger a serialize soon (we don't force a save here; callers may call SaveNow)
+	-- markDirty(player, "AddInventoryItem") -- already marked via dirtyReasons above
+
+	return true
+end
+
 function InventoryService.DebugPrintPlayer(player)
 	local st = PlayerState[player]
 	if not st then print("[InvSvc] No state for", player.Name) return end
@@ -683,9 +682,13 @@ function InventoryService.Init()
 		task.spawn(periodicLoop)
 	end
 
+	-- compute serializer count
+	local serializerCount = 0
+	for _ in pairs(Serializers) do serializerCount += 1 end
+
 	print(("[InvSvc] InventoryService %s initialized AutoPeriodic=%s Interval=%ds Serializers=%d")
 		:format(InventoryService.__Version, tostring(AUTO_PERIODIC_SERIALIZE),
-			SERIALIZE_INTERVAL_SECONDS, #Serializers))
+			SERIALIZE_INTERVAL_SECONDS, serializerCount))
 	return InventoryService
 end
 

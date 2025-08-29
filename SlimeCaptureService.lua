@@ -1,5 +1,7 @@
 -- SlimeCaptureService.lua
 -- Now uses PlayerProfileService for persistence and dirty marking
+-- Updated: ensure captured tools are treated as live items and recorded in InventoryService
+-- so the GrandInventorySerializer won't later overwrite freshly-captured items.
 
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
@@ -7,6 +9,7 @@ local HttpService        = game:GetService("HttpService")
 local RunService         = game:GetService("RunService")
 local ServerModules      = game:GetService("ServerScriptService").Modules
 local PlayerProfileService = require(ServerModules:WaitForChild("PlayerProfileService"))
+local InventoryService     = require(ServerModules:WaitForChild("InventoryService"))
 
 local Remotes       = ReplicatedStorage:WaitForChild("Remotes")
 local PickupRequest = Remotes:WaitForChild("SlimePickupRequest")
@@ -267,8 +270,16 @@ local function perform(player, slime)
 	tool.Parent = backpack
 	slime:Destroy()
 
-	-- Add to PlayerProfileService inventory
-	PlayerProfileService.AddInventoryItem(player, "capturedSlimes", {
+	-- Ensure captured tool is considered a live/persistent item (not a server-restored/preserved clone)
+	pcall(function()
+		tool:SetAttribute("ServerIssued", false)
+		tool:SetAttribute("ServerRestore", false)
+		tool:SetAttribute("PreserveOnServer", false)
+		tool:SetAttribute("PreserveOnClient", false)
+	end)
+
+	-- Build profile-friendly captured data
+	local capturedData = {
 		SlimeId = tool:GetAttribute("SlimeId"),
 		ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
 		CapturedAt = tool:GetAttribute("CapturedAt"),
@@ -277,7 +288,18 @@ local function perform(player, slime)
 		WeightPounds = tool:GetAttribute("WeightPounds"),
 		CurrentValue = tool:GetAttribute("CurrentValue"),
 		GrowthProgress = tool:GetAttribute("GrowthProgress"),
-	})
+	}
+
+	-- Add to PlayerProfileService inventory
+	PlayerProfileService.AddInventoryItem(player, "capturedSlimes", capturedData)
+
+	-- Also record into InventoryService runtime state so serializer sees it and won't overwrite profile with empties
+	local okAdd, addErr = pcall(function()
+		return InventoryService.AddInventoryItem(player, "capturedSlimes", capturedData)
+	end)
+	if not okAdd then
+		warn("[SlimeCaptureService] InventoryService.AddInventoryItem failed:", addErr)
+	end
 
 	if CONFIG.ImmediateSave then
 		if CONFIG.WaitHeartbeatBeforeSave then

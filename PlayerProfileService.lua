@@ -67,12 +67,23 @@ end
 
 -- helper: resolve various inputs to a numeric userId (player object, userId, or player name)
 local function resolveUserId(playerOrId, shortWait)
+	-- numeric id passed directly
 	if type(playerOrId) == "number" then
 		return playerOrId
 	end
-	if type(playerOrId) == "table" and playerOrId.UserId then
+
+	-- Accept Roblox Player Instance (typeof returns "Instance" in Luau) or userdata/table with .UserId
+	-- Using typeof if available keeps it robust in Studio/Server environments.
+	local okType, t = pcall(function() return typeof and typeof(playerOrId) end)
+	if okType and t == "Instance" and playerOrId and playerOrId.UserId then
 		return playerOrId.UserId
 	end
+	-- some runtimes may return "userdata" for Player objects; accept any value that has UserId
+	if (type(playerOrId) == "userdata" or type(playerOrId) == "table") and playerOrId and playerOrId.UserId then
+		return playerOrId.UserId
+	end
+
+	-- string: try to coerce to number first, then try to match by name
 	if type(playerOrId) == "string" then
 		local n = tonumber(playerOrId)
 		if n then return n end
@@ -104,6 +115,7 @@ local function resolveUserId(playerOrId, shortWait)
 		if conn and conn.Connected then conn:Disconnect() end
 		if found then return found.UserId end
 	end
+
 	return nil
 end
 
