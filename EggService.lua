@@ -1,7 +1,8 @@
 -- EggService.lua
 -- Version: v4.0.0-placement-cap-snapshot-purge-stable
 -- (updated to keep PlayerProfileService / InventoryService in sync for worldEgg lifecycle)
--- See conversation for rationale.
+-- Includes safe immediate-persist logic: ensures runtime worldEgg inventory entries include the canonical id
+-- and requests an immediate save (best-effort) so the profile persists the egg id without waiting for later cycles.
 
 local EggService = {}
 EggService.__Version = "v4.0.0-placement-cap-snapshot-purge-stable"
@@ -421,6 +422,124 @@ local function visibilitySummary(slime)
 end
 
 ----------------------------------------------------------
+-- Ensure runtime inventory entry contains canonical id & immediate persist helper
+-- This is the "safe immediate persist" logic requested: when we add a worldEgg runtime entry,
+-- ensure the player's Inventory.worldEggs has an Entry_<eggId> with Data.Value JSON containing id,
+-- then request an immediate save (best-effort).
+----------------------------------------------------------
+local function ensureInventoryEntryHasId(player, eggId, payloadTable)
+	if not player or not eggId then return end
+	-- payloadTable is a table of fields to encode into the Data.Value (e.g. eggId, hatchAt, hatchTime, etc.)
+	local ok, inv = pcall(function() return player:FindFirstChild("Inventory") end)
+	if not ok or not inv then return end
+	local worldEggs = inv:FindFirstChild("worldEggs")
+	if not worldEggs then return end
+
+	local encoded = nil
+	local successEncode, enc = pcall(function() return HttpService:JSONEncode(payloadTable) end)
+	if successEncode then encoded = enc else encoded = nil end
+
+	-- Try match: if there already exists an entry whose Data.Value JSON contains this id, we're done.
+	for _,entry in ipairs(worldEggs:GetChildren()) do
+		if entry:IsA("Folder") then
+			local data = entry:FindFirstChild("Data")
+			if data and type(data.Value) == "string" and data.Value ~= "" then
+				local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
+				if ok2 and type(t) == "table" and (t.id == eggId or t.eggId == eggId) then
+					-- already canonical
+					if entry.Name ~= ("Entry_"..eggId) then
+						pcall(function() entry.Name = "Entry_"..eggId end)
+					end
+					return true
+				end
+			end
+		end
+	end
+
+	-- Otherwise, find a non-canonical entry (missing Data or empty Data) to attach id to.
+	for _,entry in ipairs(worldEggs:GetChildren()) do
+		if entry:IsA("Folder") then
+			local data = entry:FindFirstChild("Data")
+			local shouldSet = false
+			if not data then
+				shouldSet = true
+			elseif not data.Value or data.Value == "" then
+				shouldSet = true
+			else
+				-- try to decode and ensure it's not already another id
+				local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
+				if not ok2 or type(t) ~= "table" or (not t.id and not t.eggId) then
+					shouldSet = true
+				end
+			end
+			if shouldSet then
+				if not data then
+					data = Instance.new("StringValue")
+					data.Name = "Data"
+					data.Parent = entry
+				end
+				-- ensure payload includes canonical id key
+				local payload = payloadTable or {}
+				payload.id = tostring(eggId)
+				-- prefer 'id' and 'eggId' keys to be present for compatibility
+				payload.eggId = payload.eggId or payload.id
+				local ok3, enc2 = pcall(function() return HttpService:JSONEncode(payload) end)
+				if ok3 then
+					pcall(function() data.Value = enc2 end)
+					pcall(function() entry.Name = "Entry_"..eggId end)
+				else
+					pcall(function() data.Value = HttpService:JSONEncode({ id = tostring(eggId) }) end)
+					pcall(function() entry.Name = "Entry_"..eggId end)
+				end
+
+				-- try request immediate profile save/update
+				if InventoryService and InventoryService.UpdateProfileInventory then
+					pcall(function() InventoryService.UpdateProfileInventory(player) end)
+				end
+				if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+					-- attempt both player-object and userId forms safely
+					pcall(function() PlayerProfileService.SaveNow(player, "EggRegistered_ImmediatePersist") end)
+					pcall(function() PlayerProfileService.SaveNow(player.UserId, "EggRegistered_ImmediatePersist") end)
+				end
+				-- If PlayerDataService exists with SaveImmediately, also try that as backup
+				if PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" then
+					pcall(function() PlayerDataService.SaveImmediately(player, "EggRegistered_ImmediatePersist") end)
+				end
+				return true
+			end
+		end
+	end
+
+	-- If we got here, no candidate entry found; create a new Entry_<eggId> folder under worldEggs
+	local okC, newEntry = pcall(function()
+		local f = Instance.new("Folder")
+		f.Name = "Entry_"..eggId
+		local data = Instance.new("StringValue")
+		data.Name = "Data"
+		data.Value = encoded or HttpService:JSONEncode({ id = tostring(eggId) })
+		data.Parent = f
+		f.Parent = worldEggs
+		return f
+	end)
+	if okC and newEntry then
+		-- Request immediate update/save
+		if InventoryService and InventoryService.UpdateProfileInventory then
+			pcall(function() InventoryService.UpdateProfileInventory(player) end)
+		end
+		if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+			pcall(function() PlayerProfileService.SaveNow(player, "EggRegistered_ImmediatePersist") end)
+			pcall(function() PlayerProfileService.SaveNow(player.UserId, "EggRegistered_ImmediatePersist") end)
+		end
+		if PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" then
+			pcall(function() PlayerDataService.SaveImmediately(player, "EggRegistered_ImmediatePersist") end)
+		end
+		return true
+	end
+
+	return false
+end
+
+----------------------------------------------------------
 -- DESTROY / PURGE HELPERS
 -- Note: this now attempts to keep PlayerProfileService + InventoryService in sync
 ----------------------------------------------------------
@@ -626,7 +745,7 @@ local function hatchEgg(worldEgg)
 	if not zone and ownerPlayer then
 		local okPlot, playerPlot = pcall(function() return PlotManager:GetPlayerPlot(ownerPlayer) end)
 		if okPlot and playerPlot then
-			zone = PlotManager:GetSlimeZone(playerPlot)
+			zone = PlotManager:GetPlotOrigin(playerPlot)
 		end
 	end
 
@@ -781,7 +900,22 @@ local function registerEggModel(worldEgg)
 					valueBase = worldEgg:GetAttribute("ValueBase"),
 					valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
 				})
-				InventoryService.UpdateProfileInventory(ply)
+				-- keep profile cache aligned with runtime immediately
+				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+
+				-- SAFE IMMEDIATE PERSIST: ensure the runtime entry has proper Data.Value + canonical name,
+				-- then request an immediate save (best-effort).
+				local payload = {
+					id = tostring(eggId),
+					eggId = tostring(eggId),
+					hatchAt = worldEgg:GetAttribute("HatchAt"),
+					hatchTime = worldEgg:GetAttribute("HatchTime"),
+					placedAt = worldEgg:GetAttribute("PlacedAt"),
+					rarity = worldEgg:GetAttribute("Rarity"),
+					valueBase = worldEgg:GetAttribute("ValueBase"),
+					valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
+				}
+				ensureInventoryEntryHasId(ply, eggId, payload)
 			end)
 		end
 	end
@@ -972,6 +1106,19 @@ local function placeEgg(player, hitCFrame, tool)
 			})
 			-- keep profile cache aligned with runtime immediately
 			pcall(function() InventoryService.UpdateProfileInventory(player) end)
+
+			-- SAFE IMMEDIATE PERSIST: ensure inventory entry includes canonical id and persist quickly
+			local payload = {
+				id = tostring(eggId),
+				eggId = tostring(eggId),
+				hatchAt = worldEgg:GetAttribute("HatchAt"),
+				hatchTime = worldEgg:GetAttribute("HatchTime"),
+				placedAt = worldEgg:GetAttribute("PlacedAt"),
+				rarity = worldEgg:GetAttribute("Rarity"),
+				valueBase = worldEgg:GetAttribute("ValueBase"),
+				valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
+			}
+			ensureInventoryEntryHasId(player, eggId, payload)
 		end)
 	end
 

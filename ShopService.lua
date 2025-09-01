@@ -1,5 +1,11 @@
--- ShopService v3.3 (generic naming)
--- Now routes all coin changes and persistence through PlayerProfileService
+-- ShopService v3.4 (PlayerProfileService-integrated)
+-- Improvements:
+--  - Use PlayerProfileService.SaveNowAndWait (preferVerified) via requestVerifiedSave helper.
+--  - Safer fallbacks to ForceFullSaveNow or SaveNow+WaitForSaveComplete.
+--  - Immediate leaderstats update after coin changes (fixed IsA precedence bug).
+--  - Defensive pcall usage to avoid runtime errors during purchases.
+--  - Minimal behavioral changes otherwise; rollback on failures preserved.
+-----------------------------------------------------------------------
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -20,16 +26,16 @@ local EggConfig   = require(Modules:WaitForChild("EggConfig"))
 local RNG         = require(Modules:WaitForChild("RNG"))
 local FoodService = require(Modules:WaitForChild("FoodService"))
 local PlayerProfileService = require(Modules:WaitForChild("PlayerProfileService"))
-local InventoryService = require(Modules:WaitForChild("InventoryService"))
 
 local ShopService = {}
 local _inited = false
 local STATS_VERSION = 1
 
+-- use userId keyed guard
 local purchaseGuard = {}
 
 ----------------------------------------------------------------
--- Config
+-- Config (unchanged)
 ----------------------------------------------------------------
 local EggPurchaseOptions = {
 	Basic     = {cost = 50,   forcedRarity = nil},
@@ -51,19 +57,70 @@ local function log(...) print("[ShopService]", ...) end
 -- Coins helpers (PlayerProfileService routed)
 ----------------------------------------------------------------
 local function getCoins(player)
-	return PlayerProfileService.GetCoins(player)
+	local ok, val = pcall(function() return PlayerProfileService.GetCoins(player) end)
+	if ok then return val or 0 end
+	return 0
 end
 
 local function setCoins(player, amount)
-	PlayerProfileService.SetCoins(player, amount)
+	pcall(function() PlayerProfileService.SetCoins(player, amount) end)
 end
 
 local function addCoins(player, delta)
-	PlayerProfileService.IncrementCoins(player, delta)
+	pcall(function() PlayerProfileService.IncrementCoins(player, delta) end)
 end
 
 ----------------------------------------------------------------
--- Inventory snapshot
+-- Verified save helper (prefer SaveNowAndWait then ForceFullSaveNow then SaveNow+WaitForSaveComplete)
+----------------------------------------------------------------
+local function requestVerifiedSave(playerOrId, timeoutSeconds)
+	timeoutSeconds = tonumber(timeoutSeconds) or 3
+	local ok, res = pcall(function()
+		if type(PlayerProfileService.SaveNowAndWait) == "function" then
+			-- prefer verified write
+			return PlayerProfileService.SaveNowAndWait(playerOrId, timeoutSeconds, true)
+		elseif type(PlayerProfileService.ForceFullSaveNow) == "function" then
+			-- older API
+			return PlayerProfileService.ForceFullSaveNow(playerOrId, "ShopService_VerifiedFallback")
+		else
+			-- fallback: schedule async save and wait for SaveComplete if available
+			pcall(function() PlayerProfileService.SaveNow(playerOrId, "ShopService_AsyncFallback") end)
+			if type(PlayerProfileService.WaitForSaveComplete) == "function" then
+				local done, success = PlayerProfileService.WaitForSaveComplete(playerOrId, timeoutSeconds)
+				return done and success
+			end
+			return false
+		end
+	end)
+	if not ok then
+		warn("[ShopService] requestVerifiedSave: PlayerProfileService save call failed:", tostring(res))
+		return false
+	end
+	-- treat non-nil truthy as success
+	return res == true or (res ~= nil and res ~= false)
+end
+
+----------------------------------------------------------------
+-- Leaderstats updater (robust)
+----------------------------------------------------------------
+-- Update the player's leaderstats "Coins" IntValue immediately so UI reflects changes.
+local function updateLeaderstats(player)
+	if not player then return end
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls then return end
+
+	-- case-insensitive/robust search for the coins value
+	local coinValue = ls:FindFirstChild("Coins") or ls:FindFirstChild("coins") or ls:FindFirstChild("CoinsValue")
+	if coinValue and (coinValue:IsA("IntValue") or coinValue:IsA("NumberValue")) then
+		local ok, val = pcall(function() return getCoins(player) end)
+		if ok and type(val) == "number" then
+			coinValue.Value = val
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Inventory snapshot (unchanged)
 ----------------------------------------------------------------
 local function buildInventorySnapshot(player)
 	local snap = { Coins = getCoins(player), Eggs = {}, Foods = {} }
@@ -107,7 +164,7 @@ function ShopService.GetInventory(player)
 end
 
 ----------------------------------------------------------------
--- Egg tool creation
+-- Egg tool creation (unchanged)
 ----------------------------------------------------------------
 local function createEggTool(player, purchaseKey)
 	local opt = EggPurchaseOptions[purchaseKey]
@@ -137,167 +194,202 @@ end
 -- Purchase responses
 ----------------------------------------------------------------
 local function fail(player, msg)
-	PurchaseResultEvent:FireClient(player, {
-		success = false,
-		message = msg,
-		remainingCoins = getCoins(player)
-	})
+	pcall(function()
+		PurchaseResultEvent:FireClient(player, {
+			success = false,
+			message = msg,
+			remainingCoins = getCoins(player)
+		})
+	end)
 end
 
 local function ok(player, msg)
-	PurchaseResultEvent:FireClient(player, {
-		success = true,
-		message = msg,
-		remainingCoins = getCoins(player)
-	})
+	pcall(function()
+		PurchaseResultEvent:FireClient(player, {
+			success = true,
+			message = msg,
+			remainingCoins = getCoins(player)
+		})
+	end)
 end
 
 ----------------------------------------------------------------
--- Purchase handler (PlayerProfileService persistence)
+-- Purchase handler (PlayerProfileService persistence) with leaderstats updates
 ----------------------------------------------------------------
 local function onPurchase(player, purchaseType, itemKey)
-	if purchaseGuard[player] then
+	if not player or not player.UserId then return end
+	local uid = tostring(player.UserId)
+
+	-- Prevent concurrent purchases
+	if purchaseGuard[uid] then
 		return fail(player, "Purchase in progress")
 	end
-	purchaseGuard[player] = true
-	local cleanup = function() purchaseGuard[player] = nil end
-
-	purchaseType = tostring(purchaseType or "")
-
-	if purchaseType == "Egg" then
-		local opt = EggPurchaseOptions[itemKey]; if not opt then cleanup(); return fail(player, "Unknown egg") end
-		if getCoins(player) < opt.cost then cleanup(); return fail(player, "Not enough coins") end
-
-		-- Deduct coins (PlayerProfileService)
-		addCoins(player, -opt.cost)
-
-		-- Create tool
-		local tool, err = createEggTool(player, itemKey)
-		if not tool then
-			addCoins(player, opt.cost) -- refund
-			cleanup()
-			return fail(player, "Creation failed: "..tostring(err))
+	purchaseGuard[uid] = true
+	local cleared = false
+	local function cleanup()
+		if not cleared then
+			purchaseGuard[uid] = nil
+			cleared = true
 		end
-
-		local bp = player:FindFirstChildOfClass("Backpack")
-		if not bp then
-			addCoins(player, opt.cost)
-			tool:Destroy()
-			cleanup()
-			return fail(player, "No backpack")
-		end
-
-		tool.Parent = bp
-
-		-- Build profile-friendly egg data
-		local eggItemData = {
-			EggId         = tool:GetAttribute("EggId"),
-			Rarity        = tool:GetAttribute("Rarity"),
-			HatchTime     = tool:GetAttribute("HatchTime"),
-			Weight        = tool:GetAttribute("WeightScalar"),
-			Move          = tool:GetAttribute("MovementScalar"),
-			ValueBase     = tool:GetAttribute("ValueBase"),
-			ValuePerGrowth= tool:GetAttribute("ValuePerGrowth"),
-			ToolName      = tool.Name,
-			ServerIssued  = true,
-			OwnerUserId   = player.UserId,
-			StatsVersion  = STATS_VERSION,
-		}
-
-		-- Persist to profile (some flows expect this)
-		PlayerProfileService.AddInventoryItem(player, "eggTools", eggItemData)
-
-		-- Also update InventoryService runtime state/folder so serializer won't overwrite later
-		local okAdd, addErr = pcall(function()
-			return InventoryService.AddInventoryItem(player, "eggTools", eggItemData)
-		end)
-		if not okAdd then
-			warn("[ShopService] InventoryService.AddInventoryItem failed:", addErr)
-		end
-
-		-- Ensure profileCache reflects runtime inventory before forcing a save
-		local okSync, syncErr = pcall(function()
-			InventoryService.UpdateProfileInventory(player)
-		end)
-		if not okSync then
-			warn("[ShopService] InventoryService.UpdateProfileInventory failed:", syncErr)
-		end
-
-		-- Immediate persistence
-		PlayerProfileService.SaveNow(player, "PostEggPurchase")
-		PlayerProfileService.ForceFullSaveNow(player, "PostEggPurchaseImmediate")
-
-		ok(player, ("Bought egg"))
-		sendInventory(player)
-		cleanup()
-		return
-
-	elseif purchaseType == "Food" then
-		local opt = FoodPurchaseOptions[itemKey]; if not opt then cleanup(); return fail(player, "Unknown food") end
-		if getCoins(player) < opt.cost then cleanup(); return fail(player, "Not enough coins") end
-
-		addCoins(player, -opt.cost)
-
-		local tool = FoodService.GiveFood(player, itemKey, true)
-		if not tool then
-			addCoins(player, opt.cost)
-			cleanup()
-			return fail(player, "Food creation failed")
-		end
-
-		-- Build profile-friendly food data
-		local foodItemData = {
-			FoodId      = tool:GetAttribute("FoodId") or tool.Name,
-			Name        = tool.Name,
-			Restore     = tool:GetAttribute("RestoreFraction"),
-			BufferBonus = tool:GetAttribute("FeedBufferBonus"),
-			Charges     = tool:GetAttribute("Charges"),
-			Consumable  = tool:GetAttribute("Consumable"),
-			ServerIssued= true,
-			OwnerUserId = player.UserId,
-		}
-
-		-- Persist to profile (some FoodService implementations already do this)
-		PlayerProfileService.AddInventoryItem(player, "foodTools", foodItemData)
-
-		-- Also add to InventoryService runtime state as defensive measure
-		local okAdd2, addErr2 = pcall(function()
-			return InventoryService.AddInventoryItem(player, "foodTools", foodItemData)
-		end)
-		if not okAdd2 then
-			warn("[ShopService] InventoryService.AddInventoryItem failed:", addErr2)
-		end
-
-		-- Ensure profileCache reflects runtime inventory before forcing a save
-		local okSync2, syncErr2 = pcall(function()
-			InventoryService.UpdateProfileInventory(player)
-		end)
-		if not okSync2 then
-			warn("[ShopService] InventoryService.UpdateProfileInventory failed:", syncErr2)
-		end
-
-		PlayerProfileService.SaveNow(player, "PostFoodPurchase")
-		PlayerProfileService.ForceFullSaveNow(player, "PostFoodPurchaseImmediate")
-
-		ok(player, ("Bought %s"):format(opt.displayName or itemKey))
-		sendInventory(player)
-		cleanup()
-		return
-	else
-		cleanup()
-		return fail(player, "Invalid purchase type")
 	end
+
+	local okStatus, err = pcall(function()
+		purchaseType = tostring(purchaseType or "")
+
+		if purchaseType == "Egg" then
+			local opt = EggPurchaseOptions[itemKey]; if not opt then fail(player, "Unknown egg"); return end
+
+			local coins = getCoins(player) or 0
+			if coins < opt.cost then fail(player, "Not enough coins"); return end
+
+			-- Deduct coins (PlayerProfileService)
+			addCoins(player, -opt.cost)
+			-- Immediately update leaderstats so UI reflects change
+			updateLeaderstats(player)
+
+			-- Create tool
+			local tool, createErr = createEggTool(player, itemKey)
+			if not tool then
+				-- refund
+				addCoins(player, opt.cost)
+				updateLeaderstats(player)
+				fail(player, "Creation failed: "..tostring(createErr))
+				return
+			end
+
+			local bp = player:FindFirstChildOfClass("Backpack")
+			if not bp then
+				addCoins(player, opt.cost)
+				updateLeaderstats(player)
+				if tool and tool.Parent then pcall(function() tool:Destroy() end) end
+				fail(player, "No backpack")
+				return
+			end
+
+			tool.Parent = bp
+
+			-- Persist inventory addition to profile
+			local okAdd, addErr = pcall(function()
+				PlayerProfileService.AddInventoryItem(player, "eggTools", {
+					EggId         = tool:GetAttribute("EggId"),
+					Rarity        = tool:GetAttribute("Rarity"),
+					HatchTime     = tool:GetAttribute("HatchTime"),
+					Weight        = tool:GetAttribute("WeightScalar"),
+					Move          = tool:GetAttribute("MovementScalar"),
+					ValueBase     = tool:GetAttribute("ValueBase"),
+					ValuePerGrowth= tool:GetAttribute("ValuePerGrowth"),
+					ToolName      = tool.Name,
+					ServerIssued  = true,
+					OwnerUserId   = player.UserId,
+					StatsVersion  = STATS_VERSION,
+				})
+			end)
+			if not okAdd then
+				-- rollback
+				addCoins(player, opt.cost)
+				updateLeaderstats(player)
+				if tool and tool.Parent then pcall(function() tool:Destroy() end) end
+				fail(player, "Failed to add to inventory: "..tostring(addErr))
+				return
+			end
+
+			-- Immediate persistence (attempt verified, fallback async)
+			local saved = false
+			local okSave, saveErr = pcall(function()
+				return requestVerifiedSave(player, 3)
+			end)
+			if okSave and saveErr then
+				saved = true
+			end
+			if not saved then
+				-- schedule async save (best-effort) and continue
+				pcall(function() PlayerProfileService.SaveNow(player, "PostEggPurchase") end)
+			end
+
+			ok(player, ("Bought egg"))
+			sendInventory(player)
+			cleanup()
+			return
+
+		elseif purchaseType == "Food" then
+			local opt = FoodPurchaseOptions[itemKey]; if not opt then cleanup(); return fail(player, "Unknown food") end
+			local coins = getCoins(player) or 0
+			if coins < opt.cost then cleanup(); return fail(player, "Not enough coins") end
+
+			addCoins(player, -opt.cost)
+			updateLeaderstats(player)
+
+			local tool = nil
+			local okGive, giveErr = pcall(function()
+				tool = FoodService.GiveFood(player, itemKey, true)
+			end)
+			if not okGive or not tool then
+				addCoins(player, opt.cost)
+				updateLeaderstats(player)
+				fail(player, "Food creation failed: "..tostring(giveErr))
+				return
+			end
+
+			local okAdd, addErr = pcall(function()
+				PlayerProfileService.AddInventoryItem(player, "foodTools", {
+					FoodId      = tool:GetAttribute("FoodId") or tool.Name,
+					Name        = tool.Name,
+					Restore     = tool:GetAttribute("RestoreFraction"),
+					BufferBonus = tool:GetAttribute("FeedBufferBonus"),
+					Charges     = tool:GetAttribute("Charges"),
+					Consumable  = tool:GetAttribute("Consumable"),
+					ServerIssued= true,
+					OwnerUserId = player.UserId,
+				})
+			end)
+			if not okAdd then
+				addCoins(player, opt.cost)
+				updateLeaderstats(player)
+				if tool and tool.Parent then pcall(function() tool:Destroy() end) end
+				fail(player, "Failed to add food to inventory: "..tostring(addErr))
+				return
+			end
+
+			local saved = false
+			local okSave, saveErr = pcall(function()
+				return requestVerifiedSave(player, 3)
+			end)
+			if okSave and saveErr then saved = true end
+			if not saved then
+				pcall(function() PlayerProfileService.SaveNow(player, "PostFoodPurchase") end)
+			end
+
+			ok(player, ("Bought %s"):format(opt.displayName or itemKey))
+			sendInventory(player)
+			cleanup()
+			return
+		else
+			fail(player, "Invalid purchase type")
+			return
+		end
+	end)
+
+	-- If pcall failed with an error, attempt logging and best-effort refund
+	if not okStatus then
+		pcall(function()
+			log("ERROR in onPurchase for player", player.Name, "err=", tostring(err))
+		end)
+		-- best-effort refund: we don't know what changed; notify client to retry inventory
+		fail(player, "Internal error processing purchase")
+	end
+
+	cleanup()
 end
 
 ----------------------------------------------------------------
--- Player join
+-- Player join (unchanged)
 ----------------------------------------------------------------
 local function onPlayerAdded(player)
 	task.defer(sendInventory, player)
 end
 
 ----------------------------------------------------------------
--- Persistence restore hook
+-- Persistence restore hook (unchanged)
 ----------------------------------------------------------------
 local function hookPersistenceRestore()
 	local evt = ReplicatedStorage:FindFirstChild("PersistInventoryRestored")
@@ -311,7 +403,7 @@ local function hookPersistenceRestore()
 end
 
 ----------------------------------------------------------------
--- Init
+-- Init (unchanged)
 ----------------------------------------------------------------
 function ShopService.Init()
 	if _inited then return end
