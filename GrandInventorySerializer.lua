@@ -1601,7 +1601,7 @@ end
 -- tryCreateUsingFactoryModules already defined above; ws_restore uses it
 
 
--- Replacement finalizeRestoreModel with visual graft attempt
+-- Replacement finalizeRestoreModel
 -- Paste this function in GrandInventorySerializer.lua replacing the prior finalizeRestoreModel definition.
 
 local function dprintf(...)
@@ -1730,120 +1730,6 @@ local function apply_colors_and_scale_to_visual(clone, sourceAttrs)
 	end
 end
 
-local function graft_template_visuals_to_model(targetModel, entry, originCF)
-	if not targetModel or not targetModel.Parent then
-		dprintf("graft: bad targetModel")
-		return false
-	end
-
-	local eggId = nil
-
-
-	dprintf("graft: attempting for model=", targetModel:GetFullName(), "SlimeId=", tostring(eggId))
-
-	local tpl = try_find_slime_template()
-	if not tpl then
-		dprintf("graft: template not found")
-		return false
-	end
-
-	local clone, err = sanitize_and_clone_visual(tpl)
-	if not clone then
-		dprintf("graft: sanitize/clone failed:", tostring(err))
-		return false
-	end
-	clone.Name = "SlimeVisual"
-
-	-- ensure primaries
-	local visualPrim = clone.PrimaryPart
-	local modelPrim = ensure_model_primary(targetModel)
-	if not modelPrim then
-		dprintf("graft: target model has no PrimaryPart:", targetModel:GetFullName())
-		-- still parent clone so dev can inspect
-		clone.Parent = targetModel
-		return false
-	end
-
-	-- determine final target CFrame
-	local targetCF = originCF
-	if not targetCF and modelPrim then targetCF = modelPrim.CFrame end
-	if not targetCF and visualPrim then targetCF = visualPrim.CFrame end
-
-	-- set clone position BEFORE unanchoring/parenting to avoid falling
-	if targetCF then
-		pcall(function()
-			if clone.PrimaryPart then
-				clone:SetPrimaryPartCFrame(targetCF)
-			else
-				for _,p in ipairs(clone:GetDescendants()) do
-					if p:IsA("BasePart") then p.CFrame = targetCF end
-				end
-			end
-		end)
-	end
-
-	-- parent the visual to the target model
-	clone.Parent = targetModel
-
-	-- re-resolve prims after parenting
-	visualPrim = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart")
-	modelPrim  = targetModel.PrimaryPart or ensure_model_primary(targetModel)
-
-	if not visualPrim or not modelPrim then
-		dprintf("graft: missing prims after parenting. visualPrim=", tostring(visualPrim), " modelPrim=", tostring(modelPrim))
-		return false
-	end
-
-	-- un-anchor parts and disable collisions then weld using WeldConstraint
-	for _,p in ipairs(clone:GetDescendants()) do
-		if p:IsA("BasePart") then
-			p.Anchored = false
-			p.CanCollide = false
-			p.CanTouch = false
-			p.CanQuery = false
-		end
-	end
-
-	-- Ensure both parts are non-anchored before creating constraint
-	pcall(function() modelPrim.Anchored = false end)
-	pcall(function() visualPrim.Anchored = false end)
-
-	local ok, errW = pcall(function()
-		local wc = Instance.new("WeldConstraint")
-		wc.Part0 = modelPrim
-		wc.Part1 = visualPrim
-		wc.Parent = modelPrim
-	end)
-	if not ok then
-		dprintf("graft: WeldConstraint creation failed:", tostring(errW))
-		-- leave clone parented for inspection
-		return false
-	end
-
-	-- apply appearance/scale if provided by entry or model attributes
-	local attrs = {}
-	if type(entry) == "table" then
-		for k,v in pairs(entry) do attrs[k] = v end
-	end
-	-- prefer model attributes if present
-	pcall(function()
-		local bc = targetModel:GetAttribute("BodyColor"); if bc then attrs.BodyColor = attrs.BodyColor or bc end
-		local ac = targetModel:GetAttribute("AccentColor"); if ac then attrs.AccentColor = attrs.AccentColor or ac end
-		local ec = targetModel:GetAttribute("EyeColor"); if ec then attrs.EyeColor = attrs.EyeColor or ec end
-		local cs = targetModel:GetAttribute("CurrentSizeScale"); if cs then attrs.CurrentSizeScale = attrs.CurrentSizeScale or cs end
-	end)
-
-	pcall(function() apply_colors_and_scale_to_visual(clone, attrs) end)
-
-	-- mark clone so other flows can detect it
-	pcall(function() clone:SetAttribute("ServerRestoreVisual", true) end)
-	pcall(function() clone:SetAttribute("RestoreStamp", tick()) end)
-
-	dprintf("graft: success for SlimeId=", tostring(eggId), "visualParent=", clone.Parent and clone.Parent:GetFullName())
-
-	return true
-end
-
 
 
 local function finalizeRestoreModel(model, entry, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local)
@@ -1882,18 +1768,7 @@ local function finalizeRestoreModel(model, entry, origin, plotInst, targetCF, Sl
 	if try_names(SlimeFactory) then return end
 	if try_names(SlimeCoreMod) then return end
 
-	-- Attempt to graft template visuals before minimal fallback
-	-- graft attempt disabled to avoid welding template visuals during server restore
-	local graftOk = false -- (disabled)
-	-- pcall(function() graftOk = graft_template_visuals_to_model(model, entry, targetCF) end)
-	if graftOk then
-		pcall(function()
-			model:SetAttribute("_RestoreInProgress", nil)
-			model:SetAttribute("RestoreStamp", tick())
-			model:SetAttribute("ServerRestore", true)
-		end)
-		return
-	end
+	-- Template visual attachment disabled here: proceed to minimal fallback. Visuals should be applied by the project's factory/core modules when available.
 
 	-- Minimal fallback: safe placement/pivot/anchor/scale handling
 
@@ -4057,8 +3932,8 @@ local function ft_attachLocalScriptFromContainer(templateContainer, tool)
 	return false
 end
 
--- Build/restore tool from entry; if template missing create visible fallback and schedule retries to graft template visuals if/when template appears
--- ft_buildTool: updated tool builder with graft retry schedule
+-- Build/restore tool from entry; if template missing create visible fallback. Late visual-attachment retries removed.
+-- ft_buildTool: updated tool builder; late retry schedule removed
 local function ft_buildTool(entry, player)
 	local template, templateContainer = nil, nil
 	local ok, spec, cont = pcall(function() return ft_findTemplate(entry and (entry.fid or entry.FoodId or entry.nm)) end)
@@ -4135,9 +4010,7 @@ local function ft_buildTool(entry, player)
 	-- Attach LocalScript from template container if available
 	pcall(function() ft_attachLocalScriptFromContainer(templateContainer, tool) end)
 
-	-- Graft retries: attempt to graft visuals later if template wasn't available at creation time
-	-- Retry grafting of template visuals has been disabled.
-	-- Reason: avoid late graft/weld of fallback tool visuals that causes duplicate/grafted models on restore.
+	-- Late retries removed: visuals should be created by templates/factory at restore time and fallbacks avoided.
 
 	return tool
 end
@@ -4748,10 +4621,25 @@ end
 
 -- EnsureToolVisual: build visual if missing; fallback to single part so tool isn't invisible
 local function EnsureToolVisual(tool)
-	-- Disabled: prevent automatic creation/grafting of SlimeVisual into captured-slime Tools during restore.
-	-- Returning false indicates no visual was added.
-	return false
-end
+	if not tool or not tool:IsA("Tool") then return false end
+	local ok, isItem = pcall(function() return tool:GetAttribute("SlimeItem") end)
+	if not ok or not isItem then return false end
+	if tool:FindFirstChild("SlimeVisual") then return true end
+
+	local built = nil
+	pcall(function() built = BuildVisualFromTool(tool) end)
+	if built then return true end
+
+	local handle = tool:FindFirstChild("Handle")
+	if not handle then
+		handle = Instance.new("Part")
+		handle.Name = "Handle"
+		handle.Size = Vector3.new(1,1,1)
+		handle.CanCollide = false
+		handle.Parent = tool
+		tool.RequiresHandle = true
+	end
+	local marker = Instance.new("Part")
 	marker.Name = "SlimeVisual"
 	marker.Size = Vector3.new(0.6,0.6,0.6)
 	marker.CanCollide = false
@@ -7003,7 +6891,6 @@ GrandInventorySerializer._internal = {
 	plotByPersistentId = plotByPersistentId,
 	ws_liveIndex = ws_liveIndex,
 	try_find_slime_template = try_find_slime_template,
-	graft_template_visuals_to_model = graft_template_visuals_to_model,
 	sanitize_and_clone_visual = sanitize_and_clone_visual,
 	
 }
