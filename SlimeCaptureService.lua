@@ -547,17 +547,10 @@ local function BuildVisualFromTool(tool)
 end
 
 local function EnsureToolVisual(tool)
-	if not tool or not tool:IsA("Tool") then return false end
-	local okAttr, isSlime = pcall(function() return tool:GetAttribute("SlimeItem") end)
-	if not okAttr or not isSlime then return false end
-	if tool:FindFirstChild("SlimeVisual") then return true end
-
-	local model = BuildVisualFromTool(tool)
-	if not model then
-		local handle = tool:FindFirstChild("Handle")
-		if not handle then
-			handle = Instance.new("Part")
-			handle.Name = "Handle"
+	-- Disabled: prevent automatic creation/grafting of SlimeVisual into captured-slime Tools during restore.
+	-- Returning false indicates no visual was added.
+	return false
+end
 			handle.Size = Vector3.new(1,1,1)
 			handle.CanCollide = false
 			handle.Parent = tool
