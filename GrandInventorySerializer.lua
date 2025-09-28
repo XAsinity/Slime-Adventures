@@ -139,7 +139,7 @@ local function dedupe_by_id(entries)
 					table.insert(out, e)
 				end
 			else
-				-- no id available — keep entry (can't dedupe reliably)
+				-- no id available ï¿½ keep entry (can't dedupe reliably)
 				table.insert(out, e)
 			end
 		end
@@ -1882,9 +1882,9 @@ local function finalizeRestoreModel(model, entry, origin, plotInst, targetCF, Sl
 	if try_names(SlimeFactory) then return end
 	if try_names(SlimeCoreMod) then return end
 
-	-- Attempt to graft template visuals before minimal fallback
-	local graftOk = false
-	pcall(function() graftOk = graft_template_visuals_to_model(model, entry, targetCF) end)
+	-- graft attempt disabled to avoid welding template visuals during server restore
+	local graftOk = false -- (disabled) 
+	-- pcall(function() graftOk = graft_template_visuals_to_model(model, entry, targetCF) end)
 	if graftOk then
 		-- mark restore attributes and return
 		pcall(function()
@@ -3069,7 +3069,7 @@ end
 -- We'll call sanitizeInventoryOnProfile before SaveNow in PreExitSync and after merges in Restore
 
 -- Replace the existing we_restore(...) and we_restore_by_userid(...) functions in GrandInventorySerializer.lua
--- with the versions below. These are complete function bodies — copy & paste them to replace the originals.
+-- with the versions below. These are complete function bodies ï¿½ copy & paste them to replace the originals.
 -- Key fix: no top-level "if ... player ... restoredModels" checks remain. All deferred logic runs inside task.spawn closures
 -- that capture locals inside the closure so static analysis (UnknownGlobal) won't flag 'player', 'restoredModels', etc.
 
@@ -4135,50 +4135,8 @@ local function ft_buildTool(entry, player)
 	-- Attach LocalScript from template container if available
 	pcall(function() ft_attachLocalScriptFromContainer(templateContainer, tool) end)
 
-	-- Graft retries: attempt to graft visuals later if template wasn't available at creation time
-	task.spawn(function()
-		local attempts = {0.15, 0.5, 1.5}
-		for i = 1, #attempts do
-			task.wait(attempts[i])
-			if not tool or not tool.Parent then
-				ft_dprint(("ft_buildTool: aborting retry #%d (tool missing/parented=%s) uid=%s"):format(i, tostring(tool and tool.Parent), tostring(assignUid)))
-				return
-			end
-
-			local tpl2, tplCont2 = nil, nil
-			local ok2, spec2, cont2 = pcall(function() return ft_findTemplate(entry and (entry.fid or entry.FoodId or entry.nm)) end)
-			if ok2 then tpl2, tplCont2 = spec2, cont2 end
-
-			if tpl2 then
-				local grafted = false
-				pcall(function()
-					grafted = ft_cloneVisualsFromTemplateIntoTool(tpl2, tool)
-					if not grafted and tplCont2 then
-						grafted = ft_cloneVisualsFromTemplateIntoTool(tplCont2, tool)
-					end
-					if grafted then
-						for _, child in ipairs(tool:GetChildren()) do
-							if child and type(child.IsA) == "function" and child:IsA("BasePart") then
-								local okc, col = pcall(function() return child.BrickColor end)
-								if okc and tostring(col) == "Bright yellow" and child.Name == "Handle" then
-									pcall(function() child:Destroy() end)
-									ft_dprint(("ft_buildTool: removed fallback handle after graft on retry #%d uid=%s"):format(i, tostring(assignUid)))
-								end
-							end
-						end
-						local h = tool:FindFirstChild("Handle")
-						if h and h:IsA("BasePart") then pcall(function() tool.PrimaryPart = h end) end
-						pcall(function() if tpl2.Name then tool.Name = tpl2.Name end end)
-						ft_dprint(("ft_buildTool: grafted template visuals on retry #%d uid=%s name=%s (fid=%s FoodId=%s)"):format(i, tostring(assignUid), tostring(tool.Name), tostring(entry and entry.fid), tostring(entry and entry.FoodId)))
-						return
-					end
-				end)
-			else
-				ft_dprint(("ft_buildTool: retry #%d no template found for fid=%s FoodId=%s uid=%s"):format(i, tostring(entry and entry.fid), tostring(entry and entry.FoodId), tostring(assignUid)))
-			end
-		end
-		ft_dprint(("ft_buildTool: retries exhausted for uid=%s name=%s; left as fallback (fid=%s FoodId=%s)"):format(tostring(assignUid), tostring(tool and tool.Name), tostring(entry and entry.fid), tostring(entry and entry.FoodId)))
-	end)
+	-- Retry grafting of template visuals has been disabled.
+	-- Reason: avoid late graft/weld of fallback tool visuals that causes duplicate/grafted models on restore.
 
 	return tool
 end
@@ -4789,43 +4747,9 @@ end
 
 -- EnsureToolVisual: build visual if missing; fallback to single part so tool isn't invisible
 local function EnsureToolVisual(tool)
-	if not tool or not tool:IsA("Tool") then return false end
-	local ok, isItem = pcall(function() return tool:GetAttribute("SlimeItem") end)
-	if not ok or not isItem then return false end
-	if tool:FindFirstChild("SlimeVisual") then return true end
-
-	local built = nil
-	pcall(function() built = BuildVisualFromTool(tool) end)
-	if built then return true end
-
-	local handle = tool:FindFirstChild("Handle")
-	if not handle then
-		handle = Instance.new("Part")
-		handle.Name = "Handle"
-		handle.Size = Vector3.new(1,1,1)
-		handle.CanCollide = false
-		handle.Parent = tool
-		tool.RequiresHandle = true
-	end
-	local marker = Instance.new("Part")
-	marker.Name = "SlimeVisual"
-	marker.Size = Vector3.new(0.6,0.6,0.6)
-	marker.CanCollide = false
-	marker.Anchored = false
-	pcall(function() marker.Massless = true end)
-	local bodyCol = decodeColorString(tool:GetAttribute("BodyColor")) or Color3.fromRGB(150,200,150)
-	marker.Color = bodyCol
-	marker.Parent = tool
-
-	pcall(function()
-		local w = Instance.new("WeldConstraint")
-		w.Part0 = handle
-		w.Part1 = marker
-		w.Parent = handle
-	end)
-
-	cs_dprint("Created fallback SlimeVisual for tool:", tool.Name)
-	return true
+	-- Disabled: prevent automatic creation/grafting of SlimeVisual into captured-slime Tools during restore.
+	-- Returning false indicates no visual was added.
+	return false
 end
 
 -- ----------------------------
