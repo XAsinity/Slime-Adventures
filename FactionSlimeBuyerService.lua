@@ -1,9 +1,18 @@
 -- FactionSlimeBuyerService
--- Now relays all coin payouts and standing changes through PlayerProfileService for persistence
+-- Relays coin payouts and standing changes through PlayerProfileService for persistence.
+-- Improvements:
+--  - More robust inventory-removal after sales (handles both ToolUniqueId and ToolUid attribute names).
+--  - Always attempts to remove captured/world slime entries from the PlayerProfileService profile
+--    even if PlayerProfileService.ApplySale reports success (defensive / idempotent).
+--  - Verifies removal from the profile (best-effort) and retries once with a ForceFullSaveNow if necessary.
+--  - All PlayerProfileService calls wrapped in pcall to avoid runtime errors when optional functions are absent.
+--  - Keeps existing behavior: prefer atomic ApplySale if available; fallback to IncrementCoins + RemoveInventoryItem.
 
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local ServerScriptService= game:GetService("ServerScriptService")
+local RunService         = game:GetService("RunService")
+
 local InventoryService = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("InventoryService"))
 local GrandInventorySerializer = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("GrandInventorySerializer"))
 
@@ -157,7 +166,8 @@ local function setStanding(player, faction, value)
 	profile.stats = profile.stats or {}
 	profile.stats.standing = profile.stats.standing or {}
 	profile.stats.standing[faction] = value
-	PlayerProfileService.SaveNow(player, "StandingUpdate")
+	-- Persist standing update immediately (best-effort)
+	pcall(function() if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then PlayerProfileService.SaveNow(player, "StandingUpdate") end end)
 	return value
 end
 
@@ -220,6 +230,9 @@ local function priceTool(tool, cfg, standMult)
 		finalPayout    = final,
 		bodyColor      = body,
 		growthProgress = tool:GetAttribute("GrowthProgress"),
+		toolUid        = tool:GetAttribute("ToolUniqueId") or tool:GetAttribute("ToolUid"),
+		toolUidRaw1    = tool:GetAttribute("ToolUniqueId"),
+		toolUidRaw2    = tool:GetAttribute("ToolUid"),
 	}
 end
 
@@ -268,6 +281,111 @@ local function formatSaleMessage(cfg, soldCount, totalPayout)
 	return string.format("Sold %d for %d.", soldCount, totalPayout)
 end
 
+local function attemptVerifiedSave(player, reason)
+	-- Try ForceFullSaveNow if available, fall back to SaveNow
+	local ok, res = pcall(function()
+		if PlayerProfileService and type(PlayerProfileService.ForceFullSaveNow) == "function" then
+			return PlayerProfileService.ForceFullSaveNow(player, reason)
+		elseif PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+			return PlayerProfileService.SaveNow(player, reason)
+		end
+		return false
+	end)
+	if not ok or not res then
+		warn("[FactionSlimeBuyerService] Verified save attempt failed:", tostring(res))
+		-- best-effort async fallback
+		pcall(function() if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then PlayerProfileService.SaveNow(player, reason .. "_AsyncFallback") end end)
+		return false
+	end
+	return true
+end
+
+local function removeProfileEntries(player, soldToolUids, soldSlimeIds)
+	-- Defensive removal function that tries multiple likely key names.
+	-- Returns true if we performed any attempts (not a guarantee of removal in the data store).
+	local didSomething = false
+	if not PlayerProfileService then return false end
+
+	-- Ensure uniqueness
+	local uidSet = {}
+	for _,u in ipairs(soldToolUids or {}) do
+		if u and u ~= "" then uidSet[tostring(u)] = true end
+	end
+	local uidList = {}
+	for k,_ in pairs(uidSet) do table.insert(uidList, k) end
+
+	for _, uid in ipairs(uidList) do
+		didSomething = true
+		pcall(function()
+			-- common variations used: ToolUniqueId, ToolUid, uid
+			PlayerProfileService.RemoveInventoryItem(player, "capturedSlimes", "ToolUniqueId", uid)
+		end)
+		pcall(function()
+			PlayerProfileService.RemoveInventoryItem(player, "capturedSlimes", "ToolUid", uid)
+		end)
+		pcall(function()
+			PlayerProfileService.RemoveInventoryItem(player, "capturedSlimes", "uid", uid)
+		end)
+		-- Some systems might keep a captured summary elsewhere; try capturedSlimes.id too
+		pcall(function()
+			PlayerProfileService.RemoveInventoryItem(player, "capturedSlimes", "id", uid)
+		end)
+	end
+
+	for _, sid in ipairs(soldSlimeIds or {}) do
+		if sid and sid ~= "" then
+			didSomething = true
+			pcall(function()
+				PlayerProfileService.RemoveInventoryItem(player, "worldSlimes", "SlimeId", sid)
+			end)
+			pcall(function()
+				PlayerProfileService.RemoveInventoryItem(player, "worldSlimes", "id", sid)
+			end)
+		end
+	end
+
+	return didSomething
+end
+
+local function profileHasEntries(player, soldToolUids, soldSlimeIds)
+	local ok, profile = pcall(function() return PlayerProfileService.GetProfile(player) end)
+	if not ok or not profile then
+		return false -- can't verify
+	end
+	-- Guard for possible fields; try profile.inventory.* and profile.* forms
+	local inventory = profile.inventory or profile.Inventory or profile
+	local found = false
+	-- check capturedSlimes
+	if type(inventory) == "table" and inventory.capturedSlimes then
+		for _,entry in ipairs(inventory.capturedSlimes) do
+			if type(entry) == "table" then
+				local tid = tostring(entry.ToolUniqueId or entry.ToolUid or entry.uid or entry.id or entry.ToolId or "")
+				for _,u in ipairs(soldToolUids) do
+					if tid ~= "" and tid == tostring(u) then
+						found = true; break
+					end
+				end
+				if found then break end
+			end
+		end
+	end
+	-- check worldSlimes
+	if not found and type(inventory) == "table" and inventory.worldSlimes then
+		for _,entry in ipairs(inventory.worldSlimes) do
+			if type(entry) == "table" then
+				local sid = tostring(entry.SlimeId or entry.id or "")
+				for _,s in ipairs(soldSlimeIds) do
+					if sid ~= "" and sid == tostring(s) then
+						found = true; break
+					end
+				end
+				if found then break end
+			end
+		end
+	end
+	return found
+end
+
 local function processSale(player, faction, toolList)
 	local cfg = FACTIONS[faction]
 	if not cfg then
@@ -285,57 +403,149 @@ local function processSale(player, faction, toolList)
 	local totalBase   = 0
 	local details     = {}
 	local soldSlimeIds = {}
+	local soldToolUids = {}
 
+	-- First pass: compute payouts, collect ids and uids (do NOT destroy yet)
 	for _,tool in ipairs(tools) do
 		if tool.Parent then
 			local payout, detail = priceTool(tool, cfg, standMult)
 			totalPayout += payout
 			totalBase   += (detail.baseGross or 0)
 			table.insert(details, detail)
-			tool:Destroy()
 			if detail.slimeId then
 				table.insert(soldSlimeIds, detail.slimeId)
 			end
+			if detail.toolUid then
+				table.insert(soldToolUids, detail.toolUid)
+			end
+			-- also include raw attr variants for extra safety
+			if detail.toolUidRaw1 then table.insert(soldToolUids, detail.toolUidRaw1) end
+			if detail.toolUidRaw2 then table.insert(soldToolUids, detail.toolUidRaw2) end
 		end
 	end
+
+	-- normalize unique lists
+	local function uniq(list)
+		local s = {}
+		local out = {}
+		for _,v in ipairs(list) do
+			if v and v ~= "" and not s[tostring(v)] then
+				s[tostring(v)] = true
+				table.insert(out, v)
+			end
+		end
+		return out
+	end
+	soldSlimeIds = uniq(soldSlimeIds)
+	soldToolUids = uniq(soldToolUids)
 
 	if totalPayout <= 0 then
 		return false, "Nothing valuable."
 	end
 
-	-- Relay payout to FactionTotalsService if available
+	-- Relay payout to FactionTotalsService if available (best-effort)
 	if FactionTotalsService and FactionTotalsService.AddPayout then
 		pcall(function()
 			FactionTotalsService.AddPayout(faction, totalPayout, player)
 		end)
 	end
 
-	-- Award coins via PlayerProfileService
-	PlayerProfileService.IncrementCoins(player, totalPayout)
-	PlayerProfileService.SaveNow(player, "FactionSale")
-	PlayerProfileService.ForceFullSaveNow(player, "FactionSaleImmediate")
+	-- === Prefer atomic ApplySale in PlayerProfileService ===
+	local applied = false
+	local applyErr = nil
+	if PlayerProfileService and type(PlayerProfileService.ApplySale) == "function" then
+		local ok, res = pcall(function()
+			return PlayerProfileService.ApplySale(player, soldSlimeIds, soldToolUids, totalPayout, "FactionSaleImmediate")
+		end)
+		if ok and res then
+			applied = true
+		else
+			applyErr = res
+			warn("[FactionSlimeBuyerService] PlayerProfileService.ApplySale failed:", tostring(res))
+		end
+	end
 
-	-- Update standing via PlayerProfileService
-	local standingGain  = computeStandingGain(cfg, standingBefore, totalBase, totalPayout)
-	local standingAfter = setStanding(player, faction, standingBefore + standingGain)
+	-- Defensive removal: even if ApplySale succeeded, try to remove persisted entries by common keys.
+	-- This handles cases where ApplySale might not have removed items in some storage variants.
+	local didAttemptRemoval = false
+	pcall(function()
+		didAttemptRemoval = removeProfileEntries(player, soldToolUids, soldSlimeIds) or didAttemptRemoval
+	end)
 
-	local message = formatSaleMessage(cfg, #details, totalPayout)
+	-- Try a verified save in all cases (atomic or fallback)
+	local saved = false
+	pcall(function()
+		saved = attemptVerifiedSave(player, "FactionSaleImmediate_Verified")
+	end)
 
-	-- Destroy sold slime models in the player's plot
-	local plot = workspace:FindFirstChild("Player1") -- or however you get the player's plot
+	-- If profile still contains sold entries, retry removal + ForceFullSaveNow once more (best-effort).
+	local stillThere = false
+	pcall(function()
+		stillThere = profileHasEntries(player, soldToolUids, soldSlimeIds)
+	end)
+	if stillThere then
+		warn("[FactionSlimeBuyerService] Post-sale verification: entries still present in profile, retrying removal+save for player:", player.Name)
+		pcall(function() removeProfileEntries(player, soldToolUids, soldSlimeIds) end)
+		pcall(function() attemptVerifiedSave(player, "FactionSaleImmediate_Verified_Retry") end)
+		-- re-check
+		pcall(function() stillThere = profileHasEntries(player, soldToolUids, soldSlimeIds) end)
+		if stillThere then
+			warn("[FactionSlimeBuyerService] Post-sale verification still found entries for player:", player.Name, " consider investigating PlayerProfileService.ApplySale/RemoveInventoryItem behavior.")
+		end
+	end
+
+	-- Fallback: if ApplySale missing or failed and we haven't incremented coins yet, increment coins now
+	if not applied then
+		local okInc, newCoins = pcall(function() return PlayerProfileService.IncrementCoins(player, totalPayout) end)
+		if not okInc then
+			-- If IncrementCoins fails that's concerning, but we keep going (we attempted profile removals already)
+			warn("[FactionSlimeBuyerService] IncrementCoins failed:", tostring(newCoins))
+		end
+	end
+
+	-- Now safely destroy tool instances and world models in the world
+	-- Small delay (frame) to let internal ancestry/save handlers settle (best-effort).
+	-- This can reduce race conditions where the tool destruction triggers profile mutations while saves are in-flight.
+	if RunService and RunService.Heartbeat then
+		RunService.Heartbeat:Wait()
+	end
+
+	for _,tool in ipairs(tools) do
+		if tool.Parent then
+			pcall(function() tool:Destroy() end)
+		end
+	end
+
+	-- Destroy sold slime models in the player's plot (best-effort)
+	local plot = nil
+	for _,m in ipairs(workspace:GetChildren()) do
+		if m:IsA("Model") and m.Name:match("^Player%d+$") and m:GetAttribute("UserId") == player.UserId then
+			plot = m
+			break
+		end
+	end
 	if plot then
 		for _, obj in ipairs(plot:GetChildren()) do
 			if obj.Name == "Slime" and obj:FindFirstChild("SlimeId") then
 				local slimeId = obj.SlimeId.Value
 				for _, soldId in ipairs(soldSlimeIds) do
 					if slimeId == soldId then
-						obj:Destroy()
+						pcall(function()
+							obj:SetAttribute("Retired", true)
+							obj:Destroy()
+						end)
 						break
 					end
 				end
 			end
 		end
 	end
+
+	-- Update standing via PlayerProfileService (persisted via SaveNow inside setStanding)
+	local standingGain  = computeStandingGain(cfg, standingBefore, totalBase, totalPayout)
+	local standingAfter = setStanding(player, faction, standingBefore + standingGain)
+
+	local message = formatSaleMessage(cfg, #details, totalPayout)
 
 	return true, {
 		faction        = faction,
@@ -345,11 +555,16 @@ local function processSale(player, faction, toolList)
 		standingBefore = standingBefore,
 		standingAfter  = standingAfter,
 		message        = message,
+		appliedAtomic  = applied,
+		applyError     = applyErr,
+		saveVerified   = saved,
+		removalAttempted = didAttemptRemoval,
+		removalVerifiedStillPresent = stillThere,
 	}
 end
 
 ----------------------------------------------------------------
--- PAYLOAD BUILDING (fixed 'player' global usage)
+-- PAYLOAD BUILDING
 ----------------------------------------------------------------
 local function buildPayload(requestingPlayer, success, factionName, dataOrMessage, requestToken)
 	if success then
@@ -363,6 +578,11 @@ local function buildPayload(requestingPlayer, success, factionName, dataOrMessag
 			standingBefore = dataOrMessage.standingBefore,
 			standingAfter  = dataOrMessage.standingAfter,
 			requestToken   = requestToken or dataOrMessage.requestToken,
+			appliedAtomic  = dataOrMessage.appliedAtomic,
+			applyError     = dataOrMessage.applyError,
+			saveVerified   = dataOrMessage.saveVerified,
+			removalAttempted = dataOrMessage.removalAttempted,
+			removalVerifiedStillPresent = dataOrMessage.removalVerifiedStillPresent,
 		}
 	else
 		local standingNow = 0
@@ -384,6 +604,7 @@ local function buildPayload(requestingPlayer, success, factionName, dataOrMessag
 end
 
 local function fireCompatibility(player, payload)
+	-- Backwards-compatible interface (two forms)
 	SellResult:FireClient(player, payload)
 	SellResult:FireClient(
 		player,
@@ -444,30 +665,6 @@ end
 
 function Service.GetFactionConfig(faction)
 	return FACTIONS[faction]
-end
-
-local function sellSlime(player, slimeId)
-	-- Remove slime model from player's plot
-	local plot = nil
-	for _,m in ipairs(workspace:GetChildren()) do
-		if m:IsA("Model") and m.Name:match("^Player%d+$") and m:GetAttribute("UserId") == player.UserId then
-			plot = m
-			break
-		end
-	end
-	if plot then
-		for _,obj in ipairs(plot:GetChildren()) do
-			if obj:IsA("Model") and obj.Name == "Slime" and obj:GetAttribute("SlimeId") == slimeId then
-				obj:SetAttribute("Retired", true) -- Mark as retired for serialization
-				obj:Destroy()
-				break
-			end
-		end
-	end
-
-	-- No need to clear snapshots or call ClearWorldSlimeCache.
-	-- Just force a save so the next scan reflects the change.
-	InventoryService.ForceSave(player, "PostSaleCleanup")
 end
 
 return Service

@@ -1,25 +1,23 @@
--- SlimeCaptureUI (v1.2 robust-ray)
--- Click a slime -> show pickup billboard with Pickup / Close buttons.
--- Improvements:
---   * Robust raycast with exclusion filters.
---   * Descendant base part discovery (not just direct PrimaryPart).
---   * Optional auto-assign PrimaryPart if missing.
---   * Skip retired/capturing slimes (configurable).
---   * Detailed debug instrumentation.
---   * Re-selection when UI already open on a different slime.
---   * Optional screen-gui overlap check to avoid UI clicks misfiring.
---   * Safe fallback if camera not ready on first frame.
+-- SlimeCaptureUI (v1.4 Feed Button Integration + robust remote handling)
+-- Adds "Feed" button to slime click UI: feeds equipped food to slime, consumes item via server.
+-- This version:
+--  - Sends both the Tool instance and its ToolUniqueId (if present) to the server (covers either server expectation).
+--  - Detects RemoteEvent vs RemoteFunction and calls FireServer or InvokeServer accordingly.
+--  - Adds client-side diagnostics (prints) to help debug clicks not firing.
+--  - Adds a safety timeout so BUSY won't get stuck if the server never responds via FeedResult.
+--  - Keeps existing Pickup/Close logic unchanged.
 
 local Players            = game:GetService("Players")
 local UserInputService   = game:GetService("UserInputService")
 local RunService         = game:GetService("RunService")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local StarterGui         = game:GetService("StarterGui")
 
 local LP       = Players.LocalPlayer
 local Remotes  = ReplicatedStorage:WaitForChild("Remotes")
 local PickupRequest = Remotes:WaitForChild("SlimePickupRequest")
 local PickupResult  = Remotes:WaitForChild("SlimePickupResult")
+local FeedRemote    = Remotes:FindFirstChild("FeedSlime") -- may be nil if not present
+local FeedResultEvt = Remotes:FindFirstChild("FeedResult") -- optional server feedback event
 
 local CAMERA
 local ACTIVE_SLIME
@@ -30,7 +28,7 @@ local SETTINGS = {
 	SelectionInput              = Enum.UserInputType.MouseButton1,
 	MaxSelectDistance           = 120,
 	BillboardYOffset            = 4.5,
-	BillboardSize               = Vector2.new(160, 80),
+	BillboardSize               = Vector2.new(160, 108),
 	Debug                       = false,
 
 	IgnoreRetired               = true,
@@ -38,12 +36,12 @@ local SETTINGS = {
 	AutoAssignPrimaryPart       = true,
 	ExcludeCharacterInRay       = true,
 	ExcludeLocalToolsInRay      = true,
-	SkipIfOverGui               = false, -- set true if you have clickable GUI overlays
+	SkipIfOverGui               = false,
 
 	MaxAncestorDepth            = 30,
 	RaycastDistance             = 500,
 
-	-- Accept parts even if transparent > this threshold
+	FeedServerResponseTimeout   = 6, -- seconds before client gives up waiting for FeedResult (safety)
 	TransparencyRejectThreshold = 0.995,
 }
 
@@ -57,12 +55,26 @@ local function dprint(...)
 end
 
 ----------------------------------------------------------------
+-- SAFE ATTRIBUTE HELPERS
+----------------------------------------------------------------
+local function safeGetAttribute(obj, name)
+	if not obj or type(obj.GetAttribute) ~= "function" then return nil end
+	local ok, v = pcall(function() return obj:GetAttribute(name) end)
+	if ok then return v end
+	return nil
+end
+
+local function safeSetAttribute(obj, name, value)
+	if not obj or type(obj.SetAttribute) ~= "function" then return end
+	pcall(function() obj:SetAttribute(name, value) end)
+end
+
+----------------------------------------------------------------
 -- CAMERA
 ----------------------------------------------------------------
 local function ensureCamera()
 	CAMERA = workspace.CurrentCamera
 	if not CAMERA then
-		-- Yield a frame
 		RunService.RenderStepped:Wait()
 		CAMERA = workspace.CurrentCamera
 	end
@@ -173,8 +185,136 @@ local function ensureUI()
 	messageLabel.Parent = frame
 
 	local pickupBtn = makeButton("Pickup", "PickupButton", 1)
-	local closeBtn  = makeButton("Close",  "CloseButton", 2)
+	local feedBtn   = makeButton("Feed", "FeedButton", 2)
+	local closeBtn  = makeButton("Close",  "CloseButton", 3)
 
+	-- FEED BUTTON logic (robust + diagnostics)
+	feedBtn.MouseButton1Click:Connect(function()
+		if BUSY then
+			dprint("Ignored feed click: BUSY")
+			return
+		end
+		if not ACTIVE_SLIME or not ACTIVE_SLIME.Parent then
+			dprint("Ignored feed click: no active slime")
+			return
+		end
+
+		-- Find equipped food tool
+		local tool = nil
+		if LP.Character then
+			for _,child in ipairs(LP.Character:GetChildren()) do
+				if child:IsA("Tool") and (safeGetAttribute(child, "FoodItem") or safeGetAttribute(child, "FoodId")) then
+					tool = child
+					break
+				end
+			end
+		end
+
+		if not tool then
+			dprint("Feed click: no food tool equipped")
+			local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+			if msgLabel then
+				msgLabel.Text = "Equip a food item to feed!"
+				msgLabel.Visible = true
+			end
+			return
+		end
+
+		-- Ensure FeedRemote exists
+		if not FeedRemote then
+			dprint("FeedRemote not found in ReplicatedStorage.Remotes")
+			local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+			if msgLabel then
+				msgLabel.Text = "Feed action unavailable"
+				msgLabel.Visible = true
+			end
+			return
+		end
+
+		-- Diagnostics
+		local uid = safeGetAttribute(tool, "ToolUniqueId") or safeGetAttribute(tool, "ToolUid")
+		dprint("Firing feed:", "FeedRemoteClass=", FeedRemote.ClassName, "ACTIVE_SLIME=", tostring(ACTIVE_SLIME), "tool=", tostring(tool), "toolUid=", tostring(uid))
+
+		-- Fire or invoke depending on remote type
+		BUSY = true
+		local responded = false
+
+		-- Safety watchdog: clear BUSY after timeout if server doesn't respond
+		local timeoutTask = task.delay(SETTINGS.FeedServerResponseTimeout, function()
+			if BUSY and not responded then
+				dprint("Feed timeout expired; clearing BUSY")
+				BUSY = false
+				local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+				if msgLabel then
+					msgLabel.Text = "No response from server"
+					msgLabel.Visible = true
+				end
+			end
+		end)
+
+		if FeedRemote.ClassName == "RemoteFunction" then
+			-- synchronous invoke, handle response if any
+			local ok, res = pcall(function()
+				-- pass both instance and uid (uid may be nil)
+				return FeedRemote:InvokeServer(ACTIVE_SLIME, tool, uid)
+			end)
+			responded = true
+			BUSY = false
+			if not ok then
+				dprint("Feed InvokeServer error:", tostring(res))
+				local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+				if msgLabel then
+					msgLabel.Text = "Feed failed (server error)"
+					msgLabel.Visible = true
+				end
+			else
+				-- If server returned a table { success = bool, message = str } handle it
+				if type(res) == "table" and res.success ~= nil then
+					if res.success then
+						if UI then UI.Enabled = false end
+						ACTIVE_SLIME = nil
+					else
+						local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+						if msgLabel then
+							msgLabel.Text = "Error: " .. tostring(res.message or "unknown")
+							msgLabel.Visible = true
+						end
+					end
+				else
+					-- No structured response: assume success and close UI
+					if UI then UI.Enabled = false end
+					ACTIVE_SLIME = nil
+				end
+			end
+		else
+			-- RemoteEvent path: FireServer and expect server to reply via FeedResult (optional).
+			-- We send both the tool instance and uid (if present).
+			local successFire, err = pcall(function()
+				FeedRemote:FireServer(ACTIVE_SLIME, tool, uid)
+			end)
+			if not successFire then
+				dprint("Feed FireServer failed:", tostring(err))
+				BUSY = false
+				responded = true
+				local msgLabel = UI and UI:FindFirstChild("Container") and UI.Container:FindFirstChild("MsgLabel")
+				if msgLabel then
+					msgLabel.Text = "Feed failed (client send)"
+					msgLabel.Visible = true
+				end
+			else
+				-- Wait for FeedResult event to clear BUSY; FeedResult handler below does that.
+				-- If FeedResult isn't present on the server, the timeoutTask above will clear BUSY after timeout.
+				dprint("Feed event fired; awaiting FeedResult (if any)")
+			end
+		end
+
+		-- ensure timeoutTask won't leak reference if responded quickly
+		if responded and timeoutTask then
+			-- no-op; the delayed task will still run but checks BUSY/responded
+		end
+	end)
+
+	-- Pickup button (unchanged)
 	pickupBtn.MouseButton1Click:Connect(function()
 		if BUSY then return end
 		if not ACTIVE_SLIME or not ACTIVE_SLIME.Parent then
@@ -185,6 +325,7 @@ local function ensureUI()
 		PickupRequest:FireServer(ACTIVE_SLIME)
 	end)
 
+	-- Close button (unchanged)
 	closeBtn.MouseButton1Click:Connect(function()
 		billboard.Enabled = false
 		ACTIVE_SLIME = nil
@@ -227,12 +368,30 @@ local function setBillboard(slime)
 	ui.Enabled = true
 	ACTIVE_SLIME = slime
 	BUSY = false
-	dprint(("UI shown on slime %s (part %s)"):format(slime:GetAttribute("SlimeId") or slime:GetDebugId(), prim.Name))
+
+	-- Update feedBtn enabled state based on equipped food
+	local frame = ui:FindFirstChild("Container")
+	local feedBtn = frame and frame:FindFirstChild("FeedButton")
+	if feedBtn then
+		local tool = nil
+		if LP.Character then
+			for _,child in ipairs(LP.Character:GetChildren()) do
+				if child:IsA("Tool") and (safeGetAttribute(child, "FoodItem") or safeGetAttribute(child, "FoodId")) then
+					tool = child
+					break
+				end
+			end
+		end
+		feedBtn.Active = (tool ~= nil)
+		feedBtn.TextTransparency = (tool ~= nil) and 0 or 0.6
+		feedBtn.BackgroundColor3 = (tool ~= nil) and Color3.fromRGB(60,60,60) or Color3.fromRGB(40,40,40)
+	end
+
+	dprint(("UI shown on slime %s (part %s)"):format(slime:GetAttribute("SlimeId") or "<unknown>", prim.Name))
 end
 
 local function showUI(slime)
 	if ACTIVE_SLIME and ACTIVE_SLIME ~= slime then
-		-- Switch target
 		dprint("Switching selection to new slime.")
 	end
 	setBillboard(slime)
@@ -274,14 +433,12 @@ end
 ----------------------------------------------------------------
 local function isPointerOverGui()
 	if not SETTINGS.SkipIfOverGui then return false end
-	-- Simple heuristic: Test UserInputService:GetFocusedTextBox() or later add GuiService:GetGuiInset
 	if UserInputService:GetFocusedTextBox() then return true end
-	-- Could expand to ScreenGui hit test if needed.
 	return false
 end
 
 ----------------------------------------------------------------
--- REMOTE RESULT
+-- REMOTE RESULT HANDLERS
 ----------------------------------------------------------------
 PickupResult.OnClientEvent:Connect(function(result)
 	BUSY = false
@@ -303,6 +460,29 @@ PickupResult.OnClientEvent:Connect(function(result)
 		end
 	end
 end)
+
+if FeedResultEvt then
+	FeedResultEvt.OnClientEvent:Connect(function(result)
+		BUSY = false
+		if not result then return end
+		local ui = UI
+		if result.success then
+			if ui then ui.Enabled = false end
+			ACTIVE_SLIME = nil
+		else
+			if ui and ui.Enabled then
+				local frame = ui:FindFirstChild("Container")
+				if frame then
+					local msgLabel = frame:FindFirstChild("MsgLabel")
+					if msgLabel then
+						msgLabel.Text = "Error: " .. tostring(result.message)
+						msgLabel.Visible = true
+					end
+				end
+			end
+		end
+	end)
+end
 
 ----------------------------------------------------------------
 -- INPUT HANDLER
@@ -330,7 +510,6 @@ UserInputService.InputBegan:Connect(function(input, gpe)
 		return
 	end
 
-	-- Distance check
 	local char = LP.Character
 	if not char then return end
 	local hrp = char:FindFirstChild("HumanoidRootPart")

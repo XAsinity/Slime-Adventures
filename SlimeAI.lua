@@ -167,7 +167,7 @@ local CONFIG = {
 	},
 
 	Debug                = false,
-	HopDebug             = true,
+	HopDebug             = false,
 	InstrumentGrounded   = true,
 
 	ForceFirstHopAfterSeconds = nil, -- set to nil when satisfied hops work

@@ -1,8 +1,7 @@
 -- EggService.lua
--- Version: v4.0.0-placement-cap-snapshot-purge-stable
--- (updated to keep PlayerProfileService / InventoryService in sync for worldEgg lifecycle)
--- Includes safe immediate-persist logic: ensures runtime worldEgg inventory entries include the canonical id
--- and requests an immediate save (best-effort) so the profile persists the egg id without waiting for later cycles.
+-- Version: v4.0.0-placement-cap-snapshot-purge-stable (updated to persist hatched slimes with canonical id)
+-- (updated to keep PlayerProfileService / InventoryService in sync for worldEgg -> worldSlime lifecycle)
+-- Uses consolidated SlimeCore when available to obtain ModelUtils, Appearance, RNG, Config, etc.
 
 local EggService = {}
 EggService.__Version = "v4.0.0-placement-cap-snapshot-purge-stable"
@@ -15,22 +14,79 @@ local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local Workspace           = game:GetService("Workspace")
 local HttpService         = game:GetService("HttpService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local ModulesRoot         = script.Parent
-local PlotManager         = require(ModulesRoot:WaitForChild("PlotManager"))
-local SlimeAI             = require(ModulesRoot:WaitForChild("SlimeAI"))
-local SlimeAppearance     = require(ModulesRoot:WaitForChild("SlimeAppearance"))
-local ModelUtils          = require(ModulesRoot:WaitForChild("ModelUtils"))
-local RNG                 = require(ModulesRoot:WaitForChild("RNG"))
-local SlimeConfig         = require(ModulesRoot:WaitForChild("SlimeConfig"))
-local SizeRNG             = require(ModulesRoot:WaitForChild("SizeRNG"))
-local GrowthScaling       = require(ModulesRoot:WaitForChild("GrowthScaling"))
-local SlimeMutation       = require(ModulesRoot:WaitForChild("SlimeMutation"))
+
+-- Prefer the consolidated SlimeCore module (non-blocking). If present, use its submodules.
+-- Fall back to existing standalone modules only if SlimeCore is not available or the submodule missing.
+local SlimeCore = nil
+do
+	local inst = ModulesRoot:FindFirstChild("SlimeCore")
+	if inst and inst:IsA("ModuleScript") then
+		local ok, sc = pcall(require, inst)
+		if ok and type(sc) == "table" then
+			SlimeCore = sc
+		end
+	end
+end
+
+local function safeRequire(name)
+	-- non-blocking require for a module next to this script
+	local inst = ModulesRoot:FindFirstChild(name)
+	if inst and inst:IsA("ModuleScript") then
+		local ok, mod = pcall(require, inst)
+		if ok then return mod end
+	end
+	return nil
+end
+
+-- Acquire implementations (prefer SlimeCore submodules)
+local ModelUtils    = (SlimeCore and SlimeCore.ModelUtils)    or safeRequire("ModelUtils")    or {}
+local SlimeAI       = (SlimeCore and SlimeCore.SlimeAI)       or safeRequire("SlimeAI")       or {}
+local RNG           = (SlimeCore and SlimeCore.RNG)           or safeRequire("RNG")           or {}
+local SlimeConfig   = (SlimeCore and SlimeCore.SlimeConfig)   or safeRequire("SlimeConfig")   or {}
+local SizeRNG       = (SlimeCore and SlimeCore.SizeRNG)       or safeRequire("SizeRNG")       or {}
+local GrowthScaling = (SlimeCore and SlimeCore.GrowthScaling) or safeRequire("GrowthScaling") or {}
+local SlimeMutation = (SlimeCore and SlimeCore.SlimeMutation) or safeRequire("SlimeMutation") or {}
+local SlimeAppearance = (SlimeCore and (SlimeCore.SlimeAppearance or SlimeCore.Appearance)) or safeRequire("SlimeAppearance") or {}
+
+-- Ensure minimal helpers exist on fallbacks to avoid runtime nil errors
+if not ModelUtils.CleanPhysics then ModelUtils.CleanPhysics = function() end end
+if not ModelUtils.AutoWeld then ModelUtils.AutoWeld = function() end end
+
+-- If Appearance is a very small table or missing Generate, provide a safe stub that returns nil
+if type(SlimeAppearance) ~= "table" then SlimeAppearance = {} end
+if type(SlimeAppearance.Generate) ~= "function" then
+	SlimeAppearance.Generate = function() return nil end
+end
+-- Provide a ColorToHex helper fallback (RNG.ColorToHex if available or simple hex)
+if type(SlimeAppearance.ColorToHex) ~= "function" then
+	if RNG and type(RNG.ColorToHex) == "function" then
+		SlimeAppearance.ColorToHex = RNG.ColorToHex
+	else
+		SlimeAppearance.ColorToHex = function(_) return "#FFFFFF" end
+	end
+end
+
+-- If SlimeConfig lacks GetTierConfig, provide a safe default
+if type(SlimeConfig.GetTierConfig) ~= "function" then
+	SlimeConfig.GetTierConfig = function(_) return {
+		BaseMaxSizeRange = {0.85, 1.10},
+		StartScaleFractionRange = {0.010, 0.020},
+		AbsoluteMaxScaleCap = 200,
+		SizeJackpot = {},
+		UnfedGrowthDurationRange = {540,900},
+		FedGrowthDurationRange = {120,480},
+		FeedBufferMax = 120,
+		AverageScaleBasic = 1,
+		} end
+end
 
 -- Persistence / inventory services (added)
 local PlayerDataService
 do
 	local ok, res = pcall(function()
-		return require(ModulesRoot:FindFirstChild("PlayerDataService"))
+		return safeRequire("PlayerDataService")
 	end)
 	if ok then PlayerDataService = res end
 end
@@ -39,12 +95,14 @@ local InventoryService = nil
 do
 	-- PlayerProfileService/InventoryService may be in the same Modules folder
 	-- Use pcall so file doesn't hard-fail if not present during tests
-	pcall(function()
-		PlayerProfileService = require(ModulesRoot:WaitForChild("PlayerProfileService"))
-	end)
-	pcall(function()
-		InventoryService = require(ModulesRoot:WaitForChild("InventoryService"))
-	end)
+	local inst = ModulesRoot:FindFirstChild("PlayerProfileService")
+	if inst then
+		pcall(function() PlayerProfileService = require(inst) end)
+	end
+	inst = ModulesRoot:FindFirstChild("InventoryService")
+	if inst then
+		pcall(function() InventoryService = require(inst) end)
+	end
 end
 
 -- Remotes
@@ -183,7 +241,11 @@ end
 ----------------------------------------------------------
 -- SNAPSHOT HELPERS
 ----------------------------------------------------------
+
+
+
 local function pushSnapshot(model)
+
 	if not SNAPSHOT_EXPORT_ENABLED then return end
 	if not model or not model.Parent then return end
 	local owner = model:GetAttribute("OwnerUserId")
@@ -347,22 +409,22 @@ local function initializeGrowthAttributes(slime, rng)
 	slime:SetAttribute("Tier", tier)
 	local cfg = SlimeConfig.GetTierConfig(tier)
 
-	local maxScale, luckLevels = SizeRNG.GenerateMaxSize(tier, rng)
+	local maxScale, luckLevels = (SizeRNG and SizeRNG.GenerateMaxSize) and SizeRNG.GenerateMaxSize(tier, rng) or 1, 0
 	local sizeNorm  = maxScale / (SlimeConfig.AverageScaleBasic or 1)
 	local startFraction =
-		(SizeRNG.GenerateStartFraction and SizeRNG.GenerateStartFraction(tier, rng))
-		or rng:NextNumber(cfg.StartScaleFractionRange[1], cfg.StartScaleFractionRange[2])
+		(SizeRNG and SizeRNG.GenerateStartFraction and SizeRNG.GenerateStartFraction(tier, rng))
+		or (rng and rng.NextNumber and rng:NextNumber(cfg.StartScaleFractionRange[1], cfg.StartScaleFractionRange[2])) or (cfg.StartScaleFractionRange[1] or 0.01)
 
 	local startScaleDesired = maxScale * startFraction
 	local startScale = computeSafeStartScale(slime, startScaleDesired)
 
-	local sFactor   = GrowthScaling.SizeDurationFactor(tier, sizeNorm)
-	local baseUnfed = rng:NextNumber(cfg.UnfedGrowthDurationRange[1], cfg.UnfedGrowthDurationRange[2])
-	local baseFed   = rng:NextNumber(cfg.FedGrowthDurationRange[1], cfg.FedGrowthDurationRange[2])
+	local sFactor   = (GrowthScaling and GrowthScaling.SizeDurationFactor) and GrowthScaling.SizeDurationFactor(tier, sizeNorm) or 1
+	local baseUnfed = (rng and rng.NextNumber) and rng:NextNumber(cfg.UnfedGrowthDurationRange[1], cfg.UnfedGrowthDurationRange[2]) or (cfg.UnfedGrowthDurationRange[1] or 600)
+	local baseFed   = (rng and rng.NextNumber) and rng:NextNumber(cfg.FedGrowthDurationRange[1], cfg.FedGrowthDurationRange[2]) or (cfg.FedGrowthDurationRange[1] or 120)
 	local unfedDur  = baseUnfed * sFactor
 	local fedDur    = baseFed   * sFactor
-	local feedMult  = unfedDur / fedDur
-	local initialProgress = startScale / maxScale
+	local feedMult  = (fedDur ~= 0) and (unfedDur / fedDur) or 1
+	local initialProgress = (maxScale ~= 0) and (startScale / maxScale) or 0
 
 	slime:SetAttribute("MaxSizeScale",     maxScale)
 	slime:SetAttribute("StartSizeScale",   startScale)
@@ -376,8 +438,12 @@ local function initializeGrowthAttributes(slime, rng)
 	slime:SetAttribute("SizeLuckRolls",       luckLevels)
 	slime:SetAttribute("SizeNorm",            sizeNorm)
 
-	SlimeMutation.InitSlime(slime)
-	SlimeMutation.RecomputeValueFull(slime)
+	if SlimeMutation and type(SlimeMutation.InitSlime) == "function" then
+		SlimeMutation.InitSlime(slime)
+	end
+	if SlimeMutation and type(SlimeMutation.RecomputeValueFull) == "function" then
+		SlimeMutation.RecomputeValueFull(slime)
+	end
 end
 
 local function applyAppearance(slime, primary, rng)
@@ -389,9 +455,17 @@ local function applyAppearance(slime, primary, rng)
 	if not ok then warn("[EggService] SlimeAppearance.Generate failed:", err) end
 	if not app then return end
 
-	slime:SetAttribute("BodyColor",   RNG.ColorToHex(app.BodyColor))
-	slime:SetAttribute("AccentColor", RNG.ColorToHex(app.AccentColor))
-	slime:SetAttribute("EyeColor",    RNG.ColorToHex(app.EyeColor))
+	-- Color helpers may live on SlimeAppearance or RNG.ColorToHex; try both safely
+	local colorToHex = (SlimeAppearance and SlimeAppearance.ColorToHex) or (RNG and RNG.ColorToHex)
+	if colorToHex then
+		slime:SetAttribute("BodyColor",   colorToHex(app.BodyColor))
+		slime:SetAttribute("AccentColor", colorToHex(app.AccentColor))
+		slime:SetAttribute("EyeColor",    colorToHex(app.EyeColor))
+	else
+		slime:SetAttribute("BodyColor",   "#FFFFFF")
+		slime:SetAttribute("AccentColor", "#FFFFFF")
+		slime:SetAttribute("EyeColor",    "#FFFFFF")
+	end
 
 	for _,part in ipairs(slime:GetDescendants()) do
 		if part:IsA("BasePart") then
@@ -423,13 +497,10 @@ end
 
 ----------------------------------------------------------
 -- Ensure runtime inventory entry contains canonical id & immediate persist helper
--- This is the "safe immediate persist" logic requested: when we add a worldEgg runtime entry,
--- ensure the player's Inventory.worldEggs has an Entry_<eggId> with Data.Value JSON containing id,
--- then request an immediate save (best-effort).
+-- (existing helpers for worldEggs retained)
 ----------------------------------------------------------
 local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 	if not player or not eggId then return end
-	-- payloadTable is a table of fields to encode into the Data.Value (e.g. eggId, hatchAt, hatchTime, etc.)
 	local ok, inv = pcall(function() return player:FindFirstChild("Inventory") end)
 	if not ok or not inv then return end
 	local worldEggs = inv:FindFirstChild("worldEggs")
@@ -439,14 +510,12 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 	local successEncode, enc = pcall(function() return HttpService:JSONEncode(payloadTable) end)
 	if successEncode then encoded = enc else encoded = nil end
 
-	-- Try match: if there already exists an entry whose Data.Value JSON contains this id, we're done.
 	for _,entry in ipairs(worldEggs:GetChildren()) do
 		if entry:IsA("Folder") then
 			local data = entry:FindFirstChild("Data")
 			if data and type(data.Value) == "string" and data.Value ~= "" then
 				local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
 				if ok2 and type(t) == "table" and (t.id == eggId or t.eggId == eggId) then
-					-- already canonical
 					if entry.Name ~= ("Entry_"..eggId) then
 						pcall(function() entry.Name = "Entry_"..eggId end)
 					end
@@ -456,7 +525,6 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 		end
 	end
 
-	-- Otherwise, find a non-canonical entry (missing Data or empty Data) to attach id to.
 	for _,entry in ipairs(worldEggs:GetChildren()) do
 		if entry:IsA("Folder") then
 			local data = entry:FindFirstChild("Data")
@@ -466,7 +534,6 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 			elseif not data.Value or data.Value == "" then
 				shouldSet = true
 			else
-				-- try to decode and ensure it's not already another id
 				local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
 				if not ok2 or type(t) ~= "table" or (not t.id and not t.eggId) then
 					shouldSet = true
@@ -478,10 +545,8 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 					data.Name = "Data"
 					data.Parent = entry
 				end
-				-- ensure payload includes canonical id key
 				local payload = payloadTable or {}
 				payload.id = tostring(eggId)
-				-- prefer 'id' and 'eggId' keys to be present for compatibility
 				payload.eggId = payload.eggId or payload.id
 				local ok3, enc2 = pcall(function() return HttpService:JSONEncode(payload) end)
 				if ok3 then
@@ -492,16 +557,13 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 					pcall(function() entry.Name = "Entry_"..eggId end)
 				end
 
-				-- try request immediate profile save/update
 				if InventoryService and InventoryService.UpdateProfileInventory then
 					pcall(function() InventoryService.UpdateProfileInventory(player) end)
 				end
 				if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
-					-- attempt both player-object and userId forms safely
 					pcall(function() PlayerProfileService.SaveNow(player, "EggRegistered_ImmediatePersist") end)
 					pcall(function() PlayerProfileService.SaveNow(player.UserId, "EggRegistered_ImmediatePersist") end)
 				end
-				-- If PlayerDataService exists with SaveImmediately, also try that as backup
 				if PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" then
 					pcall(function() PlayerDataService.SaveImmediately(player, "EggRegistered_ImmediatePersist") end)
 				end
@@ -510,7 +572,6 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 		end
 	end
 
-	-- If we got here, no candidate entry found; create a new Entry_<eggId> folder under worldEggs
 	local okC, newEntry = pcall(function()
 		local f = Instance.new("Folder")
 		f.Name = "Entry_"..eggId
@@ -522,7 +583,6 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 		return f
 	end)
 	if okC and newEntry then
-		-- Request immediate update/save
 		if InventoryService and InventoryService.UpdateProfileInventory then
 			pcall(function() InventoryService.UpdateProfileInventory(player) end)
 		end
@@ -539,10 +599,502 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 	return false
 end
 
+-- New helper: aggressively remove any local Entry_<id> folder(s) under player's Inventory.worldEggs
+-- This is a defensive/local-only cleanup to avoid leftover folder visibility/race artifacts in the runtime Inventory folder.
+local function removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
+	if not player or not id or not folderName then return end
+	local ok, inv = pcall(function() return player:FindFirstChild("Inventory") end)
+	if not ok or not inv then return end
+	local folder = inv:FindFirstChild(folderName)
+	if not folder then return end
+
+	local entryName = "Entry_" .. tostring(id)
+
+	-- Destroy exact match first
+	pcall(function()
+		local f = folder:FindFirstChild(entryName)
+		if f and f.Parent then
+			f:Destroy()
+			if DEBUG then dprint(("Removed local inventory folder %s for player=%s"):format(entryName, player.Name)) end
+		end
+	end)
+
+	-- Also defensively remove any folder whose Data JSON decodes to this id/eggId
+	pcall(function()
+		for _,child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				local data = child:FindFirstChild("Data")
+				if data and type(data.Value) == "string" and data.Value ~= "" then
+					local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
+					if ok2 and type(t) == "table" and (t.id == tostring(id) or t.eggId == tostring(id) or t.EggId == tostring(id)) then
+						if child.Parent then
+							child:Destroy()
+							if DEBUG then dprint(("Removed local inventory folder (by Data) %s for player=%s"):format(child.Name, player.Name)) end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+-- New small helper to perform a couple of retry passes to catch races where a later merge re-adds the folder
+local function removeInventoryEntryFolderWithRetries(player, folderName, id)
+	pcall(function()
+		removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
+	end)
+	-- short retry (race window)
+	task.delay(0.15, function()
+		pcall(function()
+			removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
+		end)
+	end)
+	-- delayed retry to catch later mergers
+	task.delay(1.0, function()
+		pcall(function()
+			removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
+		end)
+	end)
+end
+
+-- New helper: robustly remove any lingering worldEggs inventory entries for a player/userId
+-- Tries InventoryService (by player), PlayerProfileService (by userId), and finally edits loaded profile in-memory.
+local function safeRemoveWorldEggForPlayer(playerOrUser, eggId)
+	if not eggId then return end
+
+	-- Resolve player and userId
+	local ply = nil
+	local uid = nil
+	if type(playerOrUser) == "number" then
+		uid = playerOrUser
+		ply = Players:GetPlayerByUserId(uid)
+	end
+	if type(playerOrUser) == "table" and playerOrUser.UserId then
+		uid = playerOrUser.UserId
+		ply = playerOrUser
+	end
+	-- Avoid using colon expression directly in a logical expression (parser quirk).
+	if type(playerOrUser) == "userdata" and playerOrUser.IsA then
+		local ok, isPlayer = pcall(function() return playerOrUser:IsA("Player") end)
+		if ok and isPlayer then
+			ply = playerOrUser
+			uid = ply.UserId
+		end
+	end
+
+	-- 1) InventoryService removal (fast path for online player)
+	if ply and InventoryService and type(InventoryService.RemoveInventoryItem) == "function" then
+		pcall(function()
+			-- try several common id fields; immediate option if supported
+			InventoryService.RemoveInventoryItem(ply, "worldEggs", "eggId", eggId, { immediate = true })
+			InventoryService.RemoveInventoryItem(ply, "worldEggs", "EggId", eggId, { immediate = true })
+			InventoryService.RemoveInventoryItem(ply, "worldEggs", "id", eggId, { immediate = true })
+			-- make sure inventory folder mirrors profile
+			if type(InventoryService.UpdateProfileInventory) == "function" then
+				InventoryService.UpdateProfileInventory(ply)
+			end
+		end)
+	end
+
+	-- 2) PlayerProfileService removal by userId (persisted store)
+	if uid and PlayerProfileService and type(PlayerProfileService.RemoveInventoryItem) == "function" then
+		pcall(function()
+			PlayerProfileService.RemoveInventoryItem(uid, "worldEggs", "eggId", eggId)
+			PlayerProfileService.RemoveInventoryItem(uid, "worldEggs", "EggId", eggId)
+			PlayerProfileService.RemoveInventoryItem(uid, "worldEggs", "id", eggId)
+			-- force an async save to persist the removal
+			if type(PlayerProfileService.SaveNow) == "function" then
+				PlayerProfileService.SaveNow(uid, "EggRemoved_Ensure")
+			end
+		end)
+	end
+
+	-- 3) Fallback: edit loaded profile in-memory if present
+	if uid and PlayerProfileService and type(PlayerProfileService.GetProfile) == "function" then
+		pcall(function()
+			local ok, prof = pcall(function() return PlayerProfileService.GetProfile(uid) end)
+			if ok and prof and type(prof) == "table" and prof.inventory and prof.inventory.worldEggs then
+				local removed = 0
+				for i = #prof.inventory.worldEggs, 1, -1 do
+					local e = prof.inventory.worldEggs[i]
+					if type(e) == "table" then
+						if tostring(e.eggId or e.EggId or e.id or e.Id) == tostring(eggId) then
+							table.remove(prof.inventory.worldEggs, i)
+							removed = removed + 1
+						end
+					end
+				end
+				if removed > 0 and type(PlayerProfileService.SaveNow) == "function" then
+					PlayerProfileService.SaveNow(uid, "EggRemoved_InMemoryFallback")
+				end
+			end
+		end)
+	end
+
+	-- 4) Local runtime folder cleanup (defensive): remove Entry_<eggId> from the player's Inventory folder if present
+	-- This is a defensive local-only operation to avoid Explorer/UI leftover duplicates during concurrent inventory merges.
+	pcall(function()
+		local targetPlayer = ply
+		if not targetPlayer and uid then
+			targetPlayer = Players:GetPlayerByUserId(uid)
+		end
+		if targetPlayer then
+			removeInventoryEntryFolderWithRetries(targetPlayer, "worldEggs", eggId)
+		end
+	end)
+end
+
+-- Utility: parse a timestamp-like field from an entry
+local function _entry_timestamp(entry)
+	if not entry or type(entry) ~= "table" then return 0 end
+	local cand = nil
+	-- common names: Timestamp, ts, lg (last growth)
+	if entry.Timestamp then cand = tonumber(entry.Timestamp) end
+	if not cand and entry.ts then cand = tonumber(entry.ts) end
+	if not cand and entry.lg then cand = tonumber(entry.lg) end
+	if not cand and entry.lg == nil and entry.Timestamp == nil and entry.ts == nil then
+		-- last resort: use entry.CreatedAt or now
+		if entry.CreatedAt then cand = tonumber(entry.CreatedAt) end
+	end
+	return cand or 0
+end
+
+-- Deduplicate profile.inventory.worldSlimes in-place by canonical id.
+-- Keeps the entry with highest timestamp (or last seen if no timestamps).
+local function dedupe_profile_worldslimes(profile)
+	if not profile or type(profile) ~= "table" or type(profile.inventory) ~= "table" then return false end
+	local ws = profile.inventory.worldSlimes
+	if not ws or type(ws) ~= "table" or #ws == 0 then return false end
+
+	local byId = {}
+	local order = {}
+
+	for _, entry in ipairs(ws) do
+		if type(entry) ~= "table" then
+			-- preserve non-table entries (unlikely)
+			table.insert(order, entry)
+		else
+			local id = entry.id or entry.SlimeId or entry.slimeId or entry.Id
+			if not id then
+				-- entries without id can't be deduped, preserve
+				table.insert(order, entry)
+			else
+				local key = tostring(id)
+				local ts = _entry_timestamp(entry) or 0
+				local prev = byId[key]
+				if not prev then
+					byId[key] = { entry = entry, ts = ts }
+				else
+					-- prefer entry with higher timestamp, else keep existing (stable)
+					if ts > (prev.ts or 0) then
+						byId[key] = { entry = entry, ts = ts }
+					end
+				end
+			end
+		end
+	end
+
+	-- rebuild list preserving non-id items first then canonical id entries in arbitrary order
+	local out = {}
+	for _, v in ipairs(order) do table.insert(out, v) end
+	for k, v in pairs(byId) do
+		table.insert(out, v.entry)
+	end
+
+	-- quick compare to detect change
+	local changed = (#out ~= #ws)
+	if not changed then
+		for i = 1, #out do
+			local a = out[i]; local b = ws[i]
+			local aid = a and (a.id or a.SlimeId or a.Id)
+			local bid = b and (b.id or b.SlimeId or b.Id)
+			if tostring(aid) ~= tostring(bid) then changed = true; break end
+		end
+	end
+
+	if changed then
+		profile.inventory.worldSlimes = out
+		-- mark dirty if possible
+		if PlayerProfileService and type(PlayerProfileService.MarkDirty) == "function" then
+			pcall(function() PlayerProfileService.MarkDirty(profile, "DedupeWorldSlimes") end)
+			pcall(function() PlayerProfileService.MarkDirty(profile.userId or profile.UserId, "DedupeWorldSlimes") end)
+		end
+		-- attempt to save
+		if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+			pcall(function()
+				local uid = tonumber(profile.userId or profile.UserId)
+				if uid then
+					PlayerProfileService.SaveNow(uid, "DedupeWorldSlimes")
+				else
+					PlayerProfileService.SaveNow(profile, "DedupeWorldSlimes")
+				end
+			end)
+		end
+		if DEBUG then
+			dprint(("dedupe_profile_worldslimes: deduped worldSlimes for profile userId=%s newCount=%d"):format(tostring(profile.userId or profile.UserId or "nil"), #profile.inventory.worldSlimes))
+		end
+		return true
+	end
+	return false
+end
+
+-- Persist a worldSlime entry to player's profile (primitive-only fields).
+-- Important: include 'id' (canonical) so InventoryService uses it for Entry_<id> folder naming.
+-- This version adds a re-ensure step after a short delay to reduce races with sanitizers.
+local function persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
+	if not slime then return false end
+
+	-- canonical id (string)
+	local sid = tostring(slime:GetAttribute("SlimeId") or eggId or HttpService:GenerateGUID(false))
+
+	-- Build a minimal, datastore-safe table only containing primitives/tables
+	local entry = {
+		id = sid,                      -- canonical id required by InventoryService.EnsureEntryHasId
+		SlimeId = sid,
+		EggId = tostring(eggId or ""),
+		OwnerUserId = tonumber(ownerUserId) or nil,
+		Size = tonumber(slime:GetAttribute("CurrentSizeScale") or slime:GetAttribute("StartSizeScale")) or nil,
+		GrowthProgress = tonumber(slime:GetAttribute("GrowthProgress")) or nil,
+		ValueBase = tonumber(slime:GetAttribute("ValueBase")) or nil,
+		ValuePerGrowth = tonumber(slime:GetAttribute("ValuePerGrowth")) or nil,
+		Timestamp = os.time(),
+	}
+
+	-- Optional: add a plain position table if PrimaryPart present (no CFrame/Vector3 objects)
+	do
+		local primary = slime.PrimaryPart or slime:FindFirstChildWhichIsA("BasePart")
+		if primary then
+			local p = primary.Position
+			entry.Position = { x = tonumber(p.X) or 0, y = tonumber(p.Y) or 0, z = tonumber(p.Z) or 0 }
+		end
+	end
+
+	-- Optional: sanitize colors to strings (if stored as hex on attributes already, this is safe)
+	entry.BodyColor   = tostring(slime:GetAttribute("BodyColor") or "")
+	entry.AccentColor = tostring(slime:GetAttribute("AccentColor") or "")
+	entry.EyeColor    = tostring(slime:GetAttribute("EyeColor") or "")
+	entry.Breed       = tostring(slime:GetAttribute("Breed") or "")
+
+	-- Debug: log the JSON-encoded payload we intend to persist (helps diagnose sanitizer strips)
+	local payloadJson = nil
+	pcall(function() payloadJson = HttpService:JSONEncode(entry) end)
+	dprint("[PersistWorldSlime][Payload] id=", sid, "json=", payloadJson)
+
+	local added = false
+	-- Try InventoryService path (preferred for online player)
+	if ownerPlayer and InventoryService and type(InventoryService.AddInventoryItem) == "function" then
+		local ok, err = pcall(function()
+			InventoryService.AddInventoryItem(ownerPlayer, "worldSlimes", entry)
+			-- Ensure the Entry_<id> folder is created/populated on the player's Inventory folder
+			if type(InventoryService.EnsureEntryHasId) == "function" then
+				pcall(function() InventoryService.EnsureEntryHasId(ownerPlayer, "worldSlimes", sid, entry) end)
+			else
+				-- fallback to local helper which will create Entry_<id> and Data
+				pcall(function() ensureInventoryEntryHasId(ownerPlayer, sid, entry) end)
+			end
+			-- request an inventory->profile update
+			pcall(function() InventoryService.UpdateProfileInventory(ownerPlayer) end)
+		end)
+		if ok then
+			added = true
+			-- attempt to trigger a SaveNow for the profile
+			if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+				-- prefer userId save if available; call both to be robust
+				pcall(function() PlayerProfileService.SaveNow(ownerPlayer, "SlimePersist") end)
+				pcall(function() PlayerProfileService.SaveNow(ownerUserId, "SlimePersist") end)
+			end
+
+			-- Schedule a short re-check dedupe on authoritative profile to reduce duplicates created by concurrent flows
+			task.delay(0.25, function()
+				pcall(function()
+					if PlayerProfileService and type(PlayerProfileService.GetProfile) == "function" then
+						local okp, prof = pcall(function() return PlayerProfileService.GetProfile(ownerUserId) end)
+						if okp and prof and type(prof) == "table" then
+							dedupe_profile_worldslimes(prof)
+						end
+					end
+				end)
+			end)
+		else
+			warn("[EggService] InventoryService.AddInventoryItem(worldSlimes) failed:", tostring(err))
+		end
+	end
+
+	-- Fallback: write into PlayerProfileService.profile.inventory if InventoryService wasn't available
+	if (not added) and PlayerProfileService and type(PlayerProfileService.GetProfile) == "function" then
+		local prof = nil
+		local okp, profileOrErr = pcall(function() return PlayerProfileService.GetProfile(ownerUserId) end)
+		if okp and profileOrErr and type(profileOrErr) == "table" then
+			prof = profileOrErr
+		else
+			-- Try player param (some PPS implementations accept player)
+			local okp2, profileOrErr2 = pcall(function() return PlayerProfileService.GetProfile(ownerPlayer) end)
+			if okp2 and profileOrErr2 and type(profileOrErr2) == "table" then
+				prof = profileOrErr2
+			end
+		end
+
+		if prof then
+			pcall(function()
+				prof.inventory = prof.inventory or {}
+				prof.inventory.worldSlimes = prof.inventory.worldSlimes or {}
+				-- Avoid inserting duplicates by canonical id
+				local seen = {}
+				for _,e in ipairs(prof.inventory.worldSlimes) do
+					if type(e) == "table" then
+						local cid = e.id or e.SlimeId or e.slimeId
+						if cid then seen[tostring(cid)] = true end
+					end
+				end
+				if not seen[sid] then
+					table.insert(prof.inventory.worldSlimes, entry)
+				end
+			end)
+			-- dedupe right away (in-memory) to avoid multiple duplicates if multiple persisters run
+			pcall(function() dedupe_profile_worldslimes(prof) end)
+
+			-- attempt SaveNow by userId or profile object if available
+			local okSave = false
+			if type(PlayerProfileService.SaveNow) == "function" then
+				pcall(function()
+					-- prefer userId save if we have userId
+					if ownerUserId then
+						PlayerProfileService.SaveNow(ownerUserId, "SlimePersist")
+					else
+						PlayerProfileService.SaveNow(prof, "SlimePersist")
+					end
+				end)
+				okSave = true
+			end
+			if okSave then added = true end
+		end
+	end
+
+	-- final fallback: if PlayerDataService supports direct save/mark-dirty, ask it to persist
+	if (not added) and PlayerDataService then
+		local okD, errD = pcall(function()
+			if ownerPlayer and type(PlayerDataService.SaveImmediately) == "function" then
+				PlayerDataService.SaveImmediately(ownerPlayer, "SlimePersist")
+			elseif ownerUserId and type(PlayerDataService.MarkDirty) == "function" then
+				PlayerDataService.MarkDirty(ownerUserId, "SlimePersist")
+			end
+		end)
+		if okD then added = true end
+	end
+
+	-- Mark slime model attribute so other systems know it's persisted
+	pcall(function() slime:SetAttribute("Persisted", added) end)
+
+	-- PATCH: Ensure PersistedGrowthProgress attribute is also set immediately when we persist the slime.
+	-- This reduces races between visual model growth and profile saves.
+	pcall(function()
+		local gp = slime:GetAttribute("GrowthProgress")
+		if gp ~= nil then
+			slime:SetAttribute("PersistedGrowthProgress", gp)
+		else
+			if slime:GetAttribute("PersistedGrowthProgress") == nil then
+				slime:SetAttribute("PersistedGrowthProgress", 0)
+			end
+		end
+	end)
+
+	-- Re-ensure step: after a short delay re-run EnsureEntryHasId + UpdateProfileInventory + SaveNow
+	-- This is to catch and reapply the canonical id in case a concurrent sanitize/merge removed it.
+	task.delay(0.15, function()
+		pcall(function()
+			if ownerPlayer then
+				-- Re-ensure folder naming & data locally
+				dprint("[PersistWorldSlime][ReEnsure] Re-ensuring Entry_"..tostring(sid).." for player", ownerPlayer.Name)
+				if InventoryService and type(InventoryService.EnsureEntryHasId) == "function" then
+					pcall(function() InventoryService.EnsureEntryHasId(ownerPlayer, "worldSlimes", sid, entry) end)
+				else
+					pcall(function() ensureInventoryEntryHasId(ownerPlayer, sid, entry) end)
+				end
+				-- Request inventory->profile update and SaveNow by userId
+				if InventoryService and InventoryService.UpdateProfileInventory then
+					pcall(function() InventoryService.UpdateProfileInventory(ownerPlayer) end)
+				end
+			end
+			if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" and ownerUserId then
+				pcall(function() PlayerProfileService.SaveNow(ownerUserId, "SlimePersist_ReEnsure") end)
+			end
+
+			-- Ensure we remove any lingering worldEggs entries now that slime persist is ensured.
+			pcall(function() safeRemoveWorldEggForPlayer(ownerPlayer or ownerUserId, eggId) end)
+
+			-- NEW: aggressively remove local Inventory.folder entry to avoid duplicate folder artifacts in Explorer
+			-- This is a defensive/local-only operation and does not alter persisted profile directly.
+			if ownerPlayer then
+				pcall(function() removeInventoryEntryFolderWithRetries(ownerPlayer, "worldEggs", eggId) end)
+			else
+				local resolved = nil
+				if ownerUserId then resolved = Players:GetPlayerByUserId(ownerUserId) end
+				if resolved then pcall(function() removeInventoryEntryFolderWithRetries(resolved, "worldEggs", eggId) end) end
+			end
+		end)
+
+		-- PATCH: After re-ensure, request GrowthService/GrowthPersistenceService to flush stamps and trigger a save.
+		-- This helps ensure PersistedGrowthProgress is written into the player's saved profile before they leave.
+		pcall(function()
+			-- First try to make GrowthService write PersistedGrowthProgress attributes for player's slimes.
+			if SlimeCore and SlimeCore.GrowthService and type(SlimeCore.GrowthService.FlushPlayerSlimes) == "function" then
+				pcall(function() SlimeCore.GrowthService:FlushPlayerSlimes(ownerUserId) end)
+			end
+
+			-- Then attempt to ask GrowthPersistenceService to stamp & save (blocking variant if available).
+			if SlimeCore and SlimeCore.GrowthPersistenceService and type(SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave) == "function" then
+				-- prefer numeric userId
+				local okSave, res = pcall(function() return SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave(ownerUserId, 6) end)
+				if not okSave then
+					dprint("[PersistWorldSlime] GrowthPersistenceService.FlushPlayerSlimesAndSave failed for", ownerUserId, res)
+				end
+			end
+		end)
+	end)
+
+	return added
+end
+
 ----------------------------------------------------------
 -- DESTROY / PURGE HELPERS
--- Note: this now attempts to keep PlayerProfileService + InventoryService in sync
 ----------------------------------------------------------
+
+-- New: helper to decide whether a model should be skipped by immediate purge/dedupe logic.
+-- This helper intentionally does not call destroyEggModel so it can be declared before destroyEggModel.
+local function shouldSkipPurgeForModel(model)
+	if not model or not model.Parent then return false end
+
+	-- Prefer explicit restored marker set by GrandInventorySerializer
+	local ok, restored = pcall(function() return model:GetAttribute("RestoredByGrandInvSer") end)
+	if ok and restored then
+		return true
+	end
+
+	-- Generic "recently placed & saved" marker (set by RestoreEggSnapshot / PreExitInventorySync)
+	local ok2, recent = pcall(function() return model:GetAttribute("RecentlyPlacedSaved") end)
+	if ok2 and recent then
+		return true
+	end
+
+	-- Timestamp-based grace: if RecentlyPlacedSavedAt is present and within grace window, skip purge.
+	-- This protects cases where Recent flag may have been written as a timestamp only.
+	local ok3, ts = pcall(function() return tonumber(model:GetAttribute("RecentlyPlacedSavedAt")) end)
+	if ok3 and ts then
+		local PURGE_SKIP_GRACE = 10 -- seconds; tune as needed
+		if os.time() - ts <= PURGE_SKIP_GRACE then
+			return true
+		end
+	end
+
+	-- Also defensively skip if model has an explicit "IgnorePurge" attribute (future-safe)
+	local ok4, ip = pcall(function() return model:GetAttribute("IgnorePurge") end)
+	if ok4 and ip then
+		return true
+	end
+
+	return false
+end
+
 local function destroyEggModel(model, reason)
 	if not model then return end
 	if model:GetAttribute("EggDestroyed") then return end
@@ -558,37 +1110,48 @@ local function destroyEggModel(model, reason)
 			:format(tostring(model:GetAttribute("EggId")), tostring(reason), model:GetFullName()))
 	end
 
-	-- Sync inventory / profile: remove any worldEgg entries referencing this egg
 	local owner = model:GetAttribute("OwnerUserId")
 	local eggId = model:GetAttribute("EggId")
 	if owner and eggId then
-		-- Attempt to remove from PlayerProfileService inventory (accepts player or userId)
 		if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
 			local okP, errP = pcall(function()
-				-- Try both possible key names (lowercase eggId or capital EggId) defensively
 				PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "eggId", eggId)
 				PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "EggId", eggId)
 			end)
 			if not okP then
 				warn("[EggService] PlayerProfileService.RemoveInventoryItem failed:", tostring(errP))
+			else
+				-- persist removal attempt
+				pcall(function() PlayerProfileService.SaveNow(owner, "EggDestroyed_Remove") end)
 			end
 		end
 
-		-- InventoryService.RemoveInventoryItem expects a live player object. Remove if player present.
 		if InventoryService and InventoryService.RemoveInventoryItem then
 			local ply = Players:GetPlayerByUserId(owner)
 			if ply then
 				local okI, errI = pcall(function()
 					InventoryService.RemoveInventoryItem(ply, "worldEggs", "eggId", eggId)
 					InventoryService.RemoveInventoryItem(ply, "worldEggs", "EggId", eggId)
-					-- Also remove from eggTools in case the tool was destroyed/placed without proper removal
 					InventoryService.RemoveInventoryItem(ply, "eggTools", "EggId", eggId)
+					-- ensure profile update on InventoryService
+					pcall(function() InventoryService.UpdateProfileInventory(ply) end)
 				end)
 				if not okI then
 					warn("[EggService] InventoryService.RemoveInventoryItem failed:", tostring(errI))
 				end
-				-- Update profile copy of runtime state
-				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+				-- also ensure the profile is saved
+				if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+					pcall(function() PlayerProfileService.SaveNow(owner, "EggDestroyed_RemoveInventory") end)
+				end
+			else
+				-- offline: still attempt profile removal by userId
+				if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
+					pcall(function()
+						PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "eggId", eggId)
+						PlayerProfileService.RemoveInventoryItem(owner, "worldEggs", "EggId", eggId)
+						PlayerProfileService.SaveNow(owner, "EggDestroyed_RemoveInventory_Offline")
+					end)
+				end
 			end
 		end
 	end
@@ -605,22 +1168,24 @@ local function purgeResidualEggModels(ownerUserId, eggId, phase)
 		for _,desc in ipairs(container:GetDescendants()) do
 			if desc:IsA("Model") and desc.Name=="Egg" then
 				if desc:GetAttribute("EggId") == eggId then
-					destroyEggModel(desc, "Residual-".. (phase or "immediate"))
-					removed += 1
+					if shouldSkipPurgeForModel(desc) then
+						dprint(("purgeResidualEggModels: skipped residual destroy for eggId=%s at %s"):format(tostring(eggId), tostring(desc:GetFullName())))
+					else
+						destroyEggModel(desc, "Residual-".. (phase or "immediate"))
+						removed += 1
+					end
 				end
 			end
 		end
 	end
 
-	-- Player plot first
 	for _,plr in ipairs(Players:GetPlayers()) do
 		if plr.UserId == ownerUserId then
-			local okPlot, plot = pcall(function() return PlotManager:GetPlayerPlot(plr) end)
+			local okPlot, plot = pcall(function() return (ModulesRoot:FindFirstChild("PlotManager") and require(ModulesRoot:FindFirstChild("PlotManager")) or nil):GetPlayerPlot(plr) end)
 			if okPlot and plot then scan(plot) end
 			break
 		end
 	end
-	-- Workspace fallback
 	scan(Workspace)
 
 	if removed > 0 and DEBUG then
@@ -658,11 +1223,15 @@ local function hatchEgg(worldEgg)
 	ensureGraveyard()
 	worldEgg.Parent = GraveyardFolder
 
-	-- Remove worldEgg entry from profile/inventory now that hatch will consume it
+	-- Early removal attempts (try to remove egg inventory entries immediately)
 	if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
 		pcall(function()
 			PlayerProfileService.RemoveInventoryItem(ownerUserId, "worldEggs", "eggId", eggId)
 			PlayerProfileService.RemoveInventoryItem(ownerUserId, "worldEggs", "EggId", eggId)
+			-- schedule an async save to persist
+			if type(PlayerProfileService.SaveNow) == "function" then
+				PlayerProfileService.SaveNow(ownerUserId, "EggRemoved_PreHatch")
+			end
 		end)
 	end
 	if InventoryService and InventoryService.RemoveInventoryItem then
@@ -670,7 +1239,6 @@ local function hatchEgg(worldEgg)
 			pcall(function()
 				InventoryService.RemoveInventoryItem(ownerPlayer, "worldEggs", "eggId", eggId)
 				InventoryService.RemoveInventoryItem(ownerPlayer, "worldEggs", "EggId", eggId)
-				-- update profile cache to reflect removal
 				InventoryService.UpdateProfileInventory(ownerPlayer)
 			end)
 		end
@@ -714,7 +1282,7 @@ local function hatchEgg(worldEgg)
 	end
 	captureOriginalData(slime, primary)
 
-	local rng = RNG.New()
+	local rng = (RNG and RNG.New and RNG.New()) or Random.new()
 	initializeGrowthAttributes(slime, rng)
 	local startScale = slime:GetAttribute("StartSizeScale")
 	if startScale and startScale < MIN_VISIBLE_START_SCALE then
@@ -743,9 +1311,9 @@ local function hatchEgg(worldEgg)
 
 	local zone = rec and rec.Zone
 	if not zone and ownerPlayer then
-		local okPlot, playerPlot = pcall(function() return PlotManager:GetPlayerPlot(ownerPlayer) end)
+		local okPlot, playerPlot = pcall(function() return (ModulesRoot:FindFirstChild("PlotManager") and require(ModulesRoot:FindFirstChild("PlotManager")) or nil):GetPlayerPlot(ownerPlayer) end)
 		if okPlot and playerPlot then
-			zone = PlotManager:GetPlotOrigin(playerPlot)
+			zone = (ModulesRoot:FindFirstChild("PlotManager") and require(ModulesRoot:FindFirstChild("PlotManager")) or nil):GetPlotOrigin(playerPlot)
 		end
 	end
 
@@ -793,9 +1361,36 @@ local function hatchEgg(worldEgg)
 	end
 
 	visibilitySummary(slime)
-	-- worldEgg has already been moved to graveyard; destroy it and continue
+	-- Remove the egg model now that slime is created
 	destroyEggModel(worldEgg, "HatchComplete")
 
+	-- Persist the created slime into the player's profile (primitive-only table)
+	local persisted_ok = false
+	local okPersist, errPersist = pcall(function()
+		persisted_ok = persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
+	end)
+	if not okPersist then
+		warn("[EggService] persistWorldSlime failed:", tostring(errPersist))
+	end
+	-- If persist succeeded, markEggPersistSucceeded should reflect that
+	markEggPersistSucceeded = markEggPersistSucceeded or persisted_ok
+
+	-- PATCH: Immediately ask GrowthService to flush persisted progress attributes for this player's slimes.
+	-- This makes sure PersistedGrowthProgress attributes get written before any final profile save race.
+	pcall(function()
+		if SlimeCore and SlimeCore.GrowthService and type(SlimeCore.GrowthService.FlushPlayerSlimes) == "function" then
+			SlimeCore.GrowthService:FlushPlayerSlimes(ownerUserId)
+		end
+		-- Also attempt to request the GrowthPersistenceService to stamp+save right away.
+		if SlimeCore and SlimeCore.GrowthPersistenceService and type(SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave) == "function" then
+			pcall(function() SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave(ownerUserId, 6) end)
+		end
+	end)
+
+	-- Defensive: ensure egg inventory entries are removed after persist (final guarantee)
+	pcall(function() safeRemoveWorldEggForPlayer(ownerPlayer or ownerUserId, eggId) end)
+
+	-- If PlayerDataService path exists, make sure server data service knows about the change
 	if PlayerDataService and ownerPlayer then
 		if not markEggPersistSucceeded then
 			if SAVE_ON_HATCH_IMMEDIATE and PlayerDataService.SaveImmediately then
@@ -804,25 +1399,32 @@ local function hatchEgg(worldEgg)
 				end)
 				if not okSave then
 					warn("[EggService] Immediate save failed:", err)
-					PlayerDataService.MarkDirty(ownerPlayer, "EggHatched")
+					if PlayerDataService.MarkDirty then
+						pcall(function() PlayerDataService.MarkDirty(ownerPlayer, "EggHatched") end)
+					end
 				end
 			else
-				PlayerDataService.MarkDirty(ownerPlayer, "EggHatched")
-				task.delay(POST_HATCH_SAVE_FALLBACK_DELAY, function()
-					if slime.Parent then
-						PlayerDataService.MarkDirty(ownerPlayer, "EggHatchedDeferred")
-					end
-				end)
+				if PlayerDataService.MarkDirty then
+					pcall(function() PlayerDataService.MarkDirty(ownerPlayer, "EggHatched") end)
+					task.delay(POST_HATCH_SAVE_FALLBACK_DELAY, function()
+						if slime.Parent and PlayerDataService.MarkDirty then
+							pcall(function() PlayerDataService.MarkDirty(ownerPlayer, "EggHatchedDeferred") end)
+						end
+					end)
+				end
 			end
 		else
-			PlayerDataService.MarkDirty(ownerPlayer, "SlimeFromEgg")
+			-- persisted via persistWorldSlime; let data service know
+			if PlayerDataService and PlayerDataService.MarkDirty then
+				pcall(function() PlayerDataService.MarkDirty(ownerPlayer, "SlimeFromEgg") end)
+			end
 		end
 	end
 
 	task.defer(function()
 		if slime.Parent then
 			pcall(function()
-				SlimeAI.Start(slime, zone)
+				if SlimeAI and type(SlimeAI.Start) == "function" then SlimeAI.Start(slime, zone) end
 			end)
 		end
 	end)
@@ -862,17 +1464,26 @@ local function registerEggModel(worldEgg)
 		local pa = prior:GetAttribute("PlacedAt") or math.huge
 		local pb = worldEgg:GetAttribute("PlacedAt") or math.huge
 		if pb >= pa then
+			if shouldSkipPurgeForModel(worldEgg) then
+				dprint(("RegisterEgg: skipped dedupe destroy for restored/new egg EggId=%s Parent=%s"):format(tostring(worldEgg:GetAttribute("EggId")), tostring(worldEgg.Parent and worldEgg.Parent:GetFullName())))
+				return
+			end
 			destroyEggModel(worldEgg, "DedupeLater")
 			return
 		else
-			destroyEggModel(prior, "DedupeLaterOlderReplaced")
+			if shouldSkipPurgeForModel(prior) then
+				dprint(("RegisterEgg: skipped dedupe destroy for prior restored egg EggId=%s Parent=%s"):format(tostring(prior:GetAttribute("EggId")), tostring(prior.Parent and prior.Parent:GetFullName())))
+			else
+				destroyEggModel(prior, "DedupeLaterOlderReplaced")
+			end
 		end
 	end
 	EggIdSeenWorld[eggId] = worldEgg
 
 	local owner = worldEgg:GetAttribute("OwnerUserId")
 	local hatchAt= worldEgg:GetAttribute("HatchAt")
-	if not (owner and hatchAt) then return end
+	-- Accept eggs that have HatchAt or can be derived by client; for server adoption we require owner at least.
+	if not owner then return end
 
 	PlacedEggs[worldEgg] = {
 		HatchAt = worldEgg:GetAttribute("HatchAt"),
@@ -886,26 +1497,13 @@ local function registerEggModel(worldEgg)
 	updatePlayerAttr(owner)
 	pushSnapshot(worldEgg)
 
-	-- Ensure runtime inventory has an entry for this world egg (defensive)
+	-- When we add worldEgg to the player's inventory we should also mark the model as "RecentlyPlacedSaved"
+	-- and request an authoritative profile save to reduce race windows where the egg is not persisted.
 	if InventoryService and InventoryService.AddInventoryItem then
 		local ply = Players:GetPlayerByUserId(owner)
 		if ply then
 			pcall(function()
-				InventoryService.AddInventoryItem(ply, "worldEggs", {
-					eggId = eggId,
-					hatchAt = worldEgg:GetAttribute("HatchAt"),
-					hatchTime = worldEgg:GetAttribute("HatchTime"),
-					placedAt = worldEgg:GetAttribute("PlacedAt"),
-					rarity = worldEgg:GetAttribute("Rarity"),
-					valueBase = worldEgg:GetAttribute("ValueBase"),
-					valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
-				})
-				-- keep profile cache aligned with runtime immediately
-				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
-
-				-- SAFE IMMEDIATE PERSIST: ensure the runtime entry has proper Data.Value + canonical name,
-				-- then request an immediate save (best-effort).
-				local payload = {
+				local payloadItem = {
 					id = tostring(eggId),
 					eggId = tostring(eggId),
 					hatchAt = worldEgg:GetAttribute("HatchAt"),
@@ -915,7 +1513,45 @@ local function registerEggModel(worldEgg)
 					valueBase = worldEgg:GetAttribute("ValueBase"),
 					valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
 				}
-				ensureInventoryEntryHasId(ply, eggId, payload)
+				InventoryService.AddInventoryItem(ply, "worldEggs", payloadItem)
+				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+
+				-- ensure Entry_<id> folder is created on the player's Inventory folder
+				if type(InventoryService.EnsureEntryHasId) == "function" then
+					pcall(function() InventoryService.EnsureEntryHasId(ply, "worldEggs", eggId, payloadItem) end)
+				else
+					-- fallback to older helper in this module
+					ensureInventoryEntryHasId(ply, eggId, payloadItem)
+				end
+
+				-- Immediately mark model so purge logic won't remove it while profile update races.
+				pcall(function()
+					worldEgg:SetAttribute("RecentlyPlacedSaved", true)
+					worldEgg:SetAttribute("RecentlyPlacedSavedAt", os.time())
+				end)
+
+				-- Request an authoritative profile save shortly after adding the item to reduce race with quick leave.
+				if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+					task.delay(0.15, function()
+						pcall(function() PlayerProfileService.SaveNow(owner, "EggRegistered_SaveNow") end)
+					end)
+				elseif PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" then
+					task.delay(0.15, function()
+						pcall(function() PlayerDataService.SaveImmediately(ply, "EggRegistered_SaveNow") end)
+					end)
+				end
+			end)
+
+			-- Defensive: schedule a dedupe pass on authoritative profile to reduce possibility of InventoryService adding duplicates
+			task.delay(0.3, function()
+				pcall(function()
+					if PlayerProfileService and type(PlayerProfileService.GetProfile) == "function" then
+						local okp, prof = pcall(function() return PlayerProfileService.GetProfile(owner) end)
+						if okp and prof and type(prof) == "table" then
+							dedupe_profile_worldslimes(prof)
+						end
+					end
+				end)
 			end)
 		end
 	end
@@ -938,7 +1574,11 @@ local function adoptExistingEggs()
 					registerEggModel(desc)
 					adopted += 1
 				else
-					destroyEggModel(desc, "AdoptOverCapOrNoOwner")
+					if shouldSkipPurgeForModel(desc) then
+						dprint(("AdoptExistingEggs: skipped destroy for restored egg EggId=%s Parent=%s"):format(tostring(desc:GetAttribute("EggId")), tostring(desc.Parent and desc.Parent:GetFullName())))
+					else
+						destroyEggModel(desc, "AdoptOverCapOrNoOwner")
+					end
 				end
 			end
 		end
@@ -962,7 +1602,6 @@ local function onEggRestoredToPlot(desc)
 	end
 end
 
--- Listen for eggs added to any player plot
 for _,plot in ipairs(Workspace:GetChildren()) do
 	if plot:IsA("Model") and plot.Name:match("^Player%d+$") then
 		plot.DescendantAdded:Connect(onEggRestoredToPlot)
@@ -988,7 +1627,6 @@ end
 
 ----------------------------------------------------------
 -- PLACEMENT
--- When placing we remove eggTools entry and add a worldEggs entry in InventoryService
 ----------------------------------------------------------
 local function uniformHatchTime()
 	return math.random(HATCH_TIME_RANGE[1], HATCH_TIME_RANGE[2])
@@ -1040,18 +1678,17 @@ local function placeEgg(player, hitCFrame, tool)
 		primary.CFrame = hitCFrame
 	end
 
-	-- Wait for plot to exist before parenting egg
 	local parentFolder = nil
 	local tries = 0
 	repeat
-		local okPlot, playerPlot = pcall(function() return PlotManager:GetPlayerPlot(player) end)
+		local okPlot, playerPlot = pcall(function() return (ModulesRoot:FindFirstChild("PlotManager") and require(ModulesRoot:FindFirstChild("PlotManager")) or nil):GetPlayerPlot(player) end)
 		if okPlot and playerPlot then
 			parentFolder = playerPlot
 		else
 			tries = tries + 1
 			task.wait(0.1)
 		end
-	until parentFolder or tries > 50 -- Wait up to 5 seconds
+	until parentFolder or tries > 50
 
 	if not parentFolder then
 		parentFolder = Workspace
@@ -1074,8 +1711,6 @@ local function placeEgg(player, hitCFrame, tool)
 
 	player:SetAttribute("LastEggPlace", os.clock())
 
-	-- Remove the tool's egg entry from saved/runtime inventory and add a worldEggs entry
-	-- PlayerProfileService.RemoveInventoryItem accepts player or userId; InventoryService needs player object
 	local function tryRemoveEggToolFromInventory()
 		if PlayerProfileService and PlayerProfileService.RemoveInventoryItem then
 			pcall(function()
@@ -1092,22 +1727,8 @@ local function placeEgg(player, hitCFrame, tool)
 	end
 	tryRemoveEggToolFromInventory()
 
-	-- Add runtime worldEggs entry so serializer knows about placed egg
 	if InventoryService and InventoryService.AddInventoryItem then
 		pcall(function()
-			InventoryService.AddInventoryItem(player, "worldEggs", {
-				eggId = eggId,
-				hatchAt = worldEgg:GetAttribute("HatchAt"),
-				hatchTime = worldEgg:GetAttribute("HatchTime"),
-				placedAt = worldEgg:GetAttribute("PlacedAt"),
-				rarity = worldEgg:GetAttribute("Rarity"),
-				valueBase = worldEgg:GetAttribute("ValueBase"),
-				valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
-			})
-			-- keep profile cache aligned with runtime immediately
-			pcall(function() InventoryService.UpdateProfileInventory(player) end)
-
-			-- SAFE IMMEDIATE PERSIST: ensure inventory entry includes canonical id and persist quickly
 			local payload = {
 				id = tostring(eggId),
 				eggId = tostring(eggId),
@@ -1118,7 +1739,32 @@ local function placeEgg(player, hitCFrame, tool)
 				valueBase = worldEgg:GetAttribute("ValueBase"),
 				valuePerGrowth = worldEgg:GetAttribute("ValuePerGrowth"),
 			}
-			ensureInventoryEntryHasId(player, eggId, payload)
+			InventoryService.AddInventoryItem(player, "worldEggs", payload)
+			pcall(function() InventoryService.UpdateProfileInventory(player) end)
+
+			-- ensure Entry_<id> folder exists and contains Data
+			if type(InventoryService.EnsureEntryHasId) == "function" then
+				pcall(function() InventoryService.EnsureEntryHasId(player, "worldEggs", eggId, payload) end)
+			else
+				ensureInventoryEntryHasId(player, eggId, payload)
+			end
+
+			-- mark recently-saved so pre-exit/cleanup won't race and destroy model
+			pcall(function()
+				worldEgg:SetAttribute("RecentlyPlacedSaved", true)
+				worldEgg:SetAttribute("RecentlyPlacedSavedAt", os.time())
+			end)
+
+			-- request a short-delay authoritative save so the added inventory is persisted
+			if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+				task.delay(0.15, function()
+					pcall(function() PlayerProfileService.SaveNow(player.UserId, "EggPlaced_SaveNow") end)
+				end)
+			elseif PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" then
+				task.delay(0.15, function()
+					pcall(function() PlayerDataService.SaveImmediately(player, "EggPlaced_SaveNow") end)
+				end)
+			end
 		end)
 	end
 
@@ -1146,6 +1792,226 @@ local function onManualHatch(player, worldEgg)
 	if rec.OwnerUserId ~= player.UserId then return end
 	if rec.HatchAt > os.time() then return end
 	hatchEgg(worldEgg)
+end
+
+
+-- INSERT: RestoreEggSnapshot(userId, eggList)
+-- Adds a second restore path that creates egg models from a profile/worldEgg snapshot.
+-- Safe/defensive: tolerant of incomplete entries and missing PlotManager; will fall back to Workspace parent.
+
+-- Replace or insert this function into EggService.lua (place after registerEggModel / pushSnapshot definitions
+-- and before the final `return EggService` so those locals are available).
+function EggService.RestoreEggSnapshot(userId, eggList)
+	if not eggList or type(eggList) ~= "table" or #eggList == 0 then return false end
+	local uid = tonumber(userId) or userId
+	if not uid then return false end
+
+	-- Try to resolve a plot folder for this user via PlotManager or by scanning Workspace
+	local plotFolder = nil
+	pcall(function()
+		local pmModule = nil
+		local ms = ModulesRoot
+		if ms and ms:FindFirstChild("PlotManager") then
+			local ok, pm = pcall(function() return require(ms:FindFirstChild("PlotManager")) end)
+			if ok and pm then pmModule = pm end
+		elseif ServerScriptService and ServerScriptService:FindFirstChild("Modules") then
+			local modFolder = ServerScriptService:FindFirstChild("Modules")
+			if modFolder and modFolder:FindFirstChild("PlotManager") then
+				local ok2, pm2 = pcall(function() return require(modFolder:FindFirstChild("PlotManager")) end)
+				if ok2 and pm2 then pmModule = pm2 end
+			end
+		end
+
+		if pmModule and type(pmModule.GetPlayerPlot) == "function" then
+			local okP, p = pcall(function()
+				local pl = Players:GetPlayerByUserId(uid)
+				if pl then return pmModule:GetPlayerPlot(pl) end
+				-- fallback: some PlotManager implementations expose GetPlotFolderForUser userId API
+				if type(pmModule.GetPlotFolderForUser) == "function" then
+					return pmModule.GetPlotFolderForUser(uid)
+				end
+				return nil
+			end)
+			if okP and p then plotFolder = p end
+		end
+	end)
+
+	-- Fallback: find any Model under Workspace whose UserId/OwnerUserId matches uid and name looks like Player%d+
+	if not plotFolder then
+		for _, m in ipairs(Workspace:GetChildren()) do
+			if m and m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
+				local ok, attr = pcall(function() return m:GetAttribute("UserId") or m:GetAttribute("OwnerUserId") or m:GetAttribute("AssignedUserId") end)
+				if ok and attr and tostring(attr) == tostring(uid) then
+					plotFolder = m
+					break
+				end
+			end
+		end
+	end
+
+	-- helper: ensure PrimaryPart & interaction object (Prompt / ClickDetector)
+	local function ensurePrimaryAndInteraction(m)
+		-- ensure primary part
+		if not m.PrimaryPart then
+			local handle = m:FindFirstChild("Handle") or m:FindFirstChildWhichIsA("BasePart")
+			if handle then
+				pcall(function() m.PrimaryPart = handle end)
+			end
+		end
+
+		-- check for existing ClickDetector/ProximityPrompt
+		local hasInteract = false
+		for _,d in ipairs(m:GetDescendants()) do
+			if d:IsA("ClickDetector") or d:IsA("ProximityPrompt") then
+				hasInteract = true
+				break
+			end
+		end
+
+		if not hasInteract then
+			-- try to clone the interaction from the EggTemplate (if present)
+			local src = nil
+			pcall(function()
+				if EggTemplate and EggTemplate:IsA("Model") then
+					-- search recursively in template
+					for _,desc in ipairs(EggTemplate:GetDescendants()) do
+						if desc:IsA("ProximityPrompt") or desc:IsA("ClickDetector") then
+							src = desc
+							break
+						end
+					end
+				end
+			end)
+
+			if src then
+				local ok, clone = pcall(function() return src:Clone() end)
+				if ok and clone then
+					local target = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart") or m
+					pcall(function() clone.Parent = target end)
+					return
+				end
+			end
+
+			-- fallback: create a minimal ClickDetector on primary/base part so client code can detect it
+			local primary = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+			if primary then
+				local cd = Instance.new("ClickDetector")
+				cd.MaxActivationDistance = 32
+				pcall(function() cd.Parent = primary end)
+			end
+		end
+	end
+
+	local createdAny = false
+	for _, entry in ipairs(eggList) do
+		pcall(function()
+			if type(entry) ~= "table" then return end
+
+			-- Normalized id fields (accept many variants)
+			local eggId = entry and (entry.eggId or entry.id or entry.EggId or entry.EggID) or nil
+			if not eggId then
+				eggId = HttpService and HttpService:GenerateGUID(false) or ("egg_" .. tostring(os.time()) .. "_" .. tostring(math.random(1, 1e6)))
+			end
+
+			-- clone template where available
+			local m = nil
+			local okClone, cloned = pcall(function() return (EggTemplate and EggTemplate:IsA("Model")) and EggTemplate:Clone() end)
+			if okClone and cloned then
+				m = cloned
+			else
+				m = Instance.new("Model")
+				m.Name = "Egg"
+				local p = Instance.new("Part")
+				p.Name = "Handle"
+				p.Size = Vector3.new(1,1,1)
+				p.Anchored = false
+				p.Parent = m
+				m.PrimaryPart = p
+			end
+
+			m.Name = "Egg"
+			-- attributes: normalize keys and set canonical fields
+			pcall(function() m:SetAttribute("EggId", tostring(eggId)) end)
+			pcall(function() m:SetAttribute("Placed", true) end)
+			-- CRITICAL: ensure ManualHatch attribute is set so client hatch UI recognizes the egg
+			pcall(function() m:SetAttribute("ManualHatch", MANUAL_HATCH_MODE) end)
+			pcall(function() m:SetAttribute("OwnerUserId", tonumber(uid) or uid) end)
+
+			-- placedAt / cr / placed_at variants
+			local placedAt = entry and (entry.placedAt or entry.PlacedAt or entry.cr or entry.placed_at) or nil
+			if placedAt then pcall(function() m:SetAttribute("PlacedAt", tonumber(placedAt) or placedAt) end) end
+
+			-- hatch info: ht/ha/HatchTime/HatchAt
+			local ht = entry and (entry.ht or entry.hatchTime or entry.HatchTime) or nil
+			local ha = entry and (entry.ha or entry.hatchAt or entry.HatchAt) or nil
+			if ht then pcall(function() m:SetAttribute("HatchTime", tonumber(ht)) end) end
+			-- compute/normalize HatchAt: accept epoch-like or compute from placedAt+ht
+			local hatchAtEpoch = nil
+			if ha then
+				local n = tonumber(ha)
+				if n then
+					hatchAtEpoch = n
+				end
+			end
+			if not hatchAtEpoch and ht and placedAt then
+				local pval = tonumber(placedAt) or nil
+				local htv = tonumber(ht) or nil
+				if pval and htv then
+					hatchAtEpoch = pval + htv
+				end
+			end
+			if not hatchAtEpoch and ht then
+				hatchAtEpoch = os.time() + tonumber(ht)
+			end
+			if hatchAtEpoch then pcall(function() m:SetAttribute("HatchAt", hatchAtEpoch) end) end
+
+			-- optional attributes from WE_ATTR_MAP in serializer
+			for k,v in pairs(entry) do
+				if type(k) == "string" then
+					if not (k == "id" or k == "eggId" or k == "EggId" or k == "Placed" or k == "PlacedAt" or k == "OwnerUserId") then
+						pcall(function() m:SetAttribute(k, v) end)
+					end
+				end
+			end
+
+			-- position: support px/py/pz or Position table
+			local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+			if prim then
+				local px = entry and (entry.px or (entry.Position and entry.Position.x))
+				local py = entry and (entry.py or (entry.Position and entry.Position.y))
+				local pz = entry and (entry.pz or (entry.Position and entry.Position.z))
+				if px and py and pz then
+					local okPos, cf = pcall(function() return CFrame.new(tonumber(px) or 0, tonumber(py) or 0, tonumber(pz) or 0) end)
+					if okPos and cf then
+						pcall(function() prim.CFrame = cf end)
+					end
+				end
+			end
+
+			-- parent to plotFolder if found, else to Workspace
+			local targetParent = plotFolder or Workspace
+			pcall(function() m.Parent = targetParent end)
+
+			-- set RecentlyPlacedSaved markers to avoid immediate cleanup/dedupe
+			local now = os.time()
+			pcall(function() m:SetAttribute("RecentlyPlacedSaved", true) end)
+			pcall(function() m:SetAttribute("RecentlyPlacedSavedAt", now) end)
+			pcall(function() m:SetAttribute("RestoredByGrandInvSer", true) end)
+
+			-- ensure PrimaryPart and an interaction object exist
+			ensurePrimaryAndInteraction(m)
+
+			-- ensure EggService register sees it: call registerEggModel (module-local)
+			pcall(function() registerEggModel(m) end)
+
+			-- ensure we push a snapshot to EggSnapshot for consistency
+			pcall(function() pushSnapshot(m) end)
+
+			createdAny = true
+		end)
+	end
+
+	return createdAny
 end
 
 local function pollLoop()
@@ -1222,15 +2088,23 @@ local function pollLoop()
 
 		if RESIDUAL_PURGE_ENABLED then
 			for _,plr in ipairs(Players:GetPlayers()) do
-				local okPlot, plot = pcall(function() return PlotManager:GetPlayerPlot(plr) end)
+				local okPlot, plot = pcall(function() return (ModulesRoot:FindFirstChild("PlotManager") and require(ModulesRoot:FindFirstChild("PlotManager")) or nil):GetPlayerPlot(plr) end)
 				if okPlot and plot then
 					for _,desc in ipairs(plot:GetDescendants()) do
 						if desc:IsA("Model") and desc.Name=="Egg" and not PlacedEggs[desc] then
 							local hat = desc:GetAttribute("HatchAt")
 							if desc:GetAttribute("Hatching") or desc:GetAttribute("Hatched") then
-								destroyEggModel(desc, "OrphanTransitional")
+								if shouldSkipPurgeForModel(desc) then
+									dprint(("pollLoop: skipped OrphanTransitional destroy for restored egg EggId=%s"):format(tostring(desc:GetAttribute("EggId"))))
+								else
+									destroyEggModel(desc, "OrphanTransitional")
+								end
 							elseif hat and type(hat)=="number" and (now - hat) > ORPHAN_EGG_GRACE_SECONDS then
-								destroyEggModel(desc, "OrphanExpired")
+								if shouldSkipPurgeForModel(desc) then
+									dprint(("pollLoop: skipped OrphanExpired destroy for restored egg EggId=%s"):format(tostring(desc:GetAttribute("EggId"))))
+								else
+									destroyEggModel(desc, "OrphanExpired")
+								end
 							end
 						end
 					end
@@ -1268,6 +2142,82 @@ function EggService.Init()
 		HatchEggRemote.OnServerEvent:Connect(onManualHatch)
 	end
 
+	-- Initialize SlimeCore runtime (growth/hunger) and wire GrowthPersistenceService to available save/orchestrator APIs.
+	-- Defensive: only run if SlimeCore present and methods exist.
+	pcall(function()
+		if SlimeCore and type(SlimeCore.Init) == "function" then
+			pcall(function() SlimeCore.Init() end)
+			dprint("SlimeCore.Init() called")
+		end
+
+		if SlimeCore and SlimeCore.GrowthPersistenceService and type(SlimeCore.GrowthPersistenceService.Init) == "function" then
+			-- create a small orchestrator object expected by GrowthPersistenceService
+			local orchestrator = {}
+
+			function orchestrator:MarkDirty(playerOrId, reason)
+				-- best-effort: accept Player instance or numeric userId
+				pcall(function()
+					local ply = nil
+					if type(playerOrId) == "table" and playerOrId.UserId then ply = playerOrId end
+					if tonumber(playerOrId) and not ply then ply = Players:GetPlayerByUserId(tonumber(playerOrId)) end
+
+					-- try to update inventory sync first (fast path)
+					if InventoryService and type(InventoryService.UpdateProfileInventory) == "function" and ply then
+						pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+					end
+
+					-- request profile save via PlayerProfileService if available
+					if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+						if ply then
+							pcall(function() PlayerProfileService.SaveNow(ply, reason or "GrowthMarkDirty") end)
+						elseif tonumber(playerOrId) then
+							pcall(function() PlayerProfileService.SaveNow(tonumber(playerOrId), reason or "GrowthMarkDirty") end)
+						end
+					end
+
+					-- best-effort: notify PlayerDataService
+					if PlayerDataService and type(PlayerDataService.MarkDirty) == "function" then
+						if ply then
+							pcall(function() PlayerDataService.MarkDirty(ply, reason or "GrowthMarkDirty") end)
+						elseif tonumber(playerOrId) then
+							local online = Players:GetPlayerByUserId(tonumber(playerOrId))
+							if online then pcall(function() PlayerDataService.MarkDirty(online, reason or "GrowthMarkDirty") end) end
+						end
+					end
+				end)
+			end
+
+			function orchestrator:SaveNow(playerOrId, reason, opts)
+				pcall(function()
+					local ply = nil
+					if type(playerOrId) == "table" and playerOrId.UserId then ply = playerOrId end
+					if tonumber(playerOrId) and not ply then ply = Players:GetPlayerByUserId(tonumber(playerOrId)) end
+
+					if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+						if ply then
+							pcall(function() PlayerProfileService.SaveNow(ply, reason or "GrowthSaveNow", opts) end)
+						elseif tonumber(playerOrId) then
+							pcall(function() PlayerProfileService.SaveNow(tonumber(playerOrId), reason or "GrowthSaveNow", opts) end)
+						end
+					end
+
+					if InventoryService and type(InventoryService.UpdateProfileInventory) == "function" and ply then
+						pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+					end
+
+					if PlayerDataService and type(PlayerDataService.SaveImmediately) == "function" and ply then
+						pcall(function() PlayerDataService.SaveImmediately(ply, reason or "GrowthSaveNow") end)
+					end
+				end)
+			end
+
+			pcall(function() SlimeCore.GrowthPersistenceService:Init(orchestrator) end)
+			dprint("SlimeCore.GrowthPersistenceService initialized with orchestrator")
+		else
+			dprint("SlimeCore GrowthPersistenceService not available or Init missing")
+		end
+	end)
+
 	task.delay(2, adoptExistingEggs)
 	task.spawn(pollLoop)
 
@@ -1288,6 +2238,18 @@ function EggService.Init()
 		end
 		PlacedCountByUid[uid] = 0
 		updatePlayerAttr(uid)
+
+		-- PATCH: Before player fully leaves, attempt to flush growth progress and request a profile save so
+		-- that PersistedGrowthProgress and worldSlimes entries are written and not lost by a PreExit race.
+		pcall(function()
+			if SlimeCore and SlimeCore.GrowthService and type(SlimeCore.GrowthService.FlushPlayerSlimes) == "function" then
+				SlimeCore.GrowthService:FlushPlayerSlimes(uid)
+			end
+			if SlimeCore and SlimeCore.GrowthPersistenceService and type(SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave) == "function" then
+				pcall(function() SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave(uid, 6) end)
+			end
+		end)
+
 		if CLEAR_EGGS_ON_LEAVE then
 			task.delay(CLEAR_DEFER_SECONDS, function()
 				destroyPlayerEggs(uid)
@@ -1330,5 +2292,7 @@ end
 function EggService.DedupeWorldEggsManual()
 	adoptExistingEggs()
 end
+
+
 
 return EggService

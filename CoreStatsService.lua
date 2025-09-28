@@ -1,13 +1,9 @@
--- CoreStatsService.lua (v1.2)
+-- CoreStatsService.lua (v1.3)
 -- Coins / standings with dirty signaling & leaderstats bridge.
--- Improvements in this patch:
---  - Avoid writing profile tables directly. Use PlayerProfileService.SetCoins / GetCoins which operate on the authoritative profile.
---  - Leaderstats -> profile bridge now uses player attribute "CoinsStored" as the canonical cross-module signal.
---    The attribute listener calls PlayerProfileService.SetCoins + SaveNow (async) so writes are coalesced by PlayerProfileService.
---  - CoreStatsService.SetCoins no longer mutates profile directly; it delegates to PlayerProfileService APIs.
---  - RestoreToPlayer now sets up a single bridge (coins attribute listener) and updates leaderstats from the authoritative profile value.
---  - All calls into PlayerProfileService are wrapped in pcall to avoid runtime errors during load/unload.
---  - Minor API cleanup: GetCoins uses PlayerProfileService.GetCoins for consistency.
+-- Updates:
+--  - Prefer attribute bridge as canonical sync of Coins -> PlayerProfileService to avoid duplicate SetCoins/SaveNow calls.
+--  - CoreStatsService.SetCoins now sets attribute and leaderstats and only falls back to direct profile writes if the bridge is not installed.
+--  - All PlayerProfileService calls wrapped in pcall for safety.
 -----------------------------------------------------------------------
 
 local CoreStatsService = {
@@ -79,6 +75,7 @@ local function installCoinsAttributeBridge(player)
 	if not player or not player:IsDescendantOf(Players) then return end
 	local marker = player:GetAttribute("__CoreCoinsBridgeInstalled")
 	if marker then return end
+	-- mark installed early so racing callers know the bridge exists
 	pcall(function() player:SetAttribute("__CoreCoinsBridgeInstalled", true) end)
 
 	-- Listen for attribute changes
@@ -208,23 +205,48 @@ function CoreStatsService.GetCoins(player)
 end
 
 function CoreStatsService.SetCoins(player, amount)
+	-- New behavior:
+	--  - Ensure attribute bridge is installed.
+	--  - Update leaderstats immediately, then set CoinsStored attribute.
+	--  - If the bridge was not previously installed (startup race), do a direct SetCoins + SaveNow fallback.
 	if not player or not player.UserId then return end
 	amount = math.floor(amount or 0)
 
-	-- Delegate to PlayerProfileService to update authoritative profile and mark dirty.
-	pcall(function()
-		PlayerProfileService.SetCoins(player, amount)
-		-- Schedule async save (coalesced) — SaveNow is debounced in PlayerProfileService.
-		PlayerProfileService.SaveNow(player, "CoinsSet")
-	end)
-
-	-- Update leaderstats and attribute for immediate UI effect
+	-- Ensure leaderstats exists and update for immediate UI
 	local ls = player:FindFirstChild("leaderstats")
-	if ls then
-		local c = ls:FindFirstChild("Coins")
-		if c and c.Value ~= amount then c.Value = amount end
+	if not ls then
+		ls = Instance.new("Folder")
+		ls.Name = "leaderstats"
+		ls.Parent = player
 	end
+	local c = ls:FindFirstChild("Coins")
+	if not c then
+		c = Instance.new("IntValue")
+		c.Name = "Coins"
+		c.Parent = ls
+	end
+	if c.Value ~= amount then
+		c.Value = amount
+	end
+
+	-- Check whether bridge was installed prior to our call
+	local bridgeInstalled = false
+	pcall(function() bridgeInstalled = player:GetAttribute("__CoreCoinsBridgeInstalled") and true or false end)
+
+	-- Ensure bridge is installed (will set marker)
+	installCoinsAttributeBridge(player)
+
+	-- Set attribute (the bridge will call PlayerProfileService.SetCoins + SaveNow)
 	pcall(function() player:SetAttribute("CoinsStored", amount) end)
+
+	-- If the bridge was not installed before this call, do a direct write/fallback so the profile is updated immediately.
+	if not bridgeInstalled then
+		-- Direct authoritative update as fallback (wrapped in pcall)
+		pcall(function()
+			PlayerProfileService.SetCoins(player, amount)
+			PlayerProfileService.SaveNow(player, "CoinsSet_Fallback")
+		end)
+	end
 end
 
 function CoreStatsService.AdjustCoins(player, delta)

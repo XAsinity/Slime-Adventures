@@ -11,9 +11,6 @@
 --   local s = RNG.Stream(12345)         -- Deterministic stream object
 --   local val = RNG.Float(0,1)          -- Global root stream
 --   local pick = RNG.WeightedChoice({{item="A",weight=5},{item="B",weight=1}})
---
--- Stream object has same API subset: s:Float(a,b), s:Int(a,b), s:Bool(prob), etc.
-
 local HttpService = game:GetService("HttpService")
 
 local RNG = {}
@@ -46,14 +43,14 @@ function StreamMethods:Float(min, max) return self._r:NextNumber(min, max) end
 function StreamMethods:Int(min, max) return self._r:NextInteger(min, max) end
 function StreamMethods:Bool(prob)
 	prob = math.clamp(prob or 0, 0, 1)
-	return self._r:NextNumber() < prob
+	return self._r:NextNumber(0, 1) < prob
 end
 function StreamMethods:NextNumber(a,b) return self._r:NextNumber(a,b) end
 function StreamMethods:NextInteger(a,b) return self._r:NextInteger(a,b) end
 function StreamMethods:Gaussian(min, max, samples)
 	samples = samples or 3
 	local sum = 0
-	for _=1,samples do sum += self._r:NextNumber() end
+	for _=1,samples do sum = sum + self._r:NextNumber() end
 	local avg = sum / samples
 	return min + (max - min) * avg
 end
@@ -83,7 +80,7 @@ function RNG.Int(min, max, r) return _r(r):NextInteger(min, max) end
 
 function RNG.Bool(prob, r)
 	prob = math.clamp(prob or 0, 0, 1)
-	return _r(r):NextNumber() < prob
+	return _r(r):NextNumber(0, 1) < prob
 end
 
 ----------------------------------------------------------------------
@@ -95,21 +92,21 @@ function RNG.WeightedChoice(weights, r)
 	local total = 0
 	local listMode = (#weights > 0)
 	if listMode then
-		for _,row in ipairs(weights) do total += row.weight end
+		for _,row in ipairs(weights) do total = total + (tonumber(row.weight) or 0) end
 		if total <= 0 then return nil end
-		local roll = r:NextNumber() * total
+		local roll = r:NextNumber(0, total)
 		local acc = 0
 		for _,row in ipairs(weights) do
-			acc += row.weight
+			acc = acc + (tonumber(row.weight) or 0)
 			if roll <= acc then return row.item end
 		end
 	else
-		for _,wt in pairs(weights) do total += wt end
+		for _,wt in pairs(weights) do total = total + (tonumber(wt) or 0) end
 		if total <= 0 then return nil end
-		local roll = r:NextNumber() * total
+		local roll = r:NextNumber(0, total)
 		local acc = 0
 		for k,wt in pairs(weights) do
-			acc += wt
+			acc = acc + (tonumber(wt) or 0)
 			if roll <= acc then return k end
 		end
 	end
@@ -123,7 +120,7 @@ function RNG.Gaussian(min, max, samples, r)
 	samples = samples or 3
 	local sum = 0
 	r = _r(r)
-	for _=1,samples do sum += r:NextNumber() end
+	for _=1,samples do sum = sum + r:NextNumber() end
 	local avg = sum / samples
 	return min + (max - min) * avg
 end
@@ -183,15 +180,25 @@ end
 ----------------------------------------------------------------------
 function RNG.CascadeJackpots(jackpotTable, rng, cap)
 	rng = rng or _root
+	if not jackpotTable or #jackpotTable == 0 then return 1, 0 end
 	local mult = 1
 	local levels = 0
+	local numericCap = tonumber(cap) or nil
 	for _,entry in ipairs(jackpotTable) do
-		if rng:NextNumber() < entry.p then
-			levels += 1
-			local m = rng:NextNumber(entry.mult[1], entry.mult[2])
-			mult *= m
-			if cap and mult >= cap then
-				mult = cap
+		-- validate entry
+		local p = math.clamp(tonumber(entry and entry.p) or 0, 0, 1)
+		local multRange = (entry and entry.mult) or nil
+		if not multRange or type(multRange) ~= "table" or not tonumber(multRange[1]) or not tonumber(multRange[2]) then
+			-- malformed entry; skip sequence
+			break
+		end
+		if rng:NextNumber(0, 1) < p then
+			levels = levels + 1
+			local m = rng:NextNumber(tonumber(multRange[1]), tonumber(multRange[2]))
+			if type(m) ~= "number" or m <= 0 then m = 1 end
+			mult = mult * m
+			if numericCap and mult >= numericCap then
+				mult = numericCap
 				break
 			end
 		else

@@ -3,9 +3,9 @@
 --   ModelUtils, ColorUtil, SlimeAppearance, SlimeConfig, SlimeMutation,
 --   SlimeFactory, GrowthScaling, GrowthService, SlimeHungerService,
 --   GrowthPersistenceService.
---
--- External dependencies that remain separate:
---   RNG, SizeRNG, SlimeAI
+-- Added: syncModelGrowthIntoProfile to copy authoritative model attributes
+--        into the cached PlayerProfile.inventory.worldSlimes entry and push
+--        an inventory update so UI reflects growth changes in-session.
 --
 -- Usage:
 --   local SlimeCore = require(path.to.SlimeCore)
@@ -110,6 +110,9 @@ do
 end
 SlimeCore.ModelUtils = ModelUtils
 
+
+local DEBUG = _G.DEBUG
+local dprint = _G.dprint or function(...) end
 ----------------------------------------------------------
 -- ColorUtil
 ----------------------------------------------------------
@@ -479,9 +482,12 @@ do
 		return math.max(desired, needed)
 	end
 
+	-- Replace SlimeFactory.applyScale with this implementation (keeps rotation, scales offsets)
 	local function applyScale(model, primary, scale)
 		if not scale or scale <= 0 then return end
-		for _,p in ipairs(model:GetDescendants()) do
+
+		-- First: resize parts (preserve OriginalSize attribute)
+		for _, p in ipairs(model:GetDescendants()) do
 			if typeof(p) == "Instance" and p:IsA("BasePart") then
 				local orig = p:GetAttribute("OriginalSize") or p.Size
 				p:SetAttribute("OriginalSize", orig)
@@ -489,17 +495,53 @@ do
 				p.Size = Vector3.new(math.max(ns.X, MIN_PART_AXIS), math.max(ns.Y, MIN_PART_AXIS), math.max(ns.Z, MIN_PART_AXIS))
 			end
 		end
-		local rootCF = primary and primary.CFrame or CFrame.new()
-		for _,p in ipairs(model:GetDescendants()) do
+
+		-- Nothing more to do if we don't have a primary to compute offsets against
+		if not primary or not primary:IsA("BasePart") then
+			model:SetAttribute("CurrentSizeScale", scale)
+			return
+		end
+
+		-- Reposition parts using stored OriginalRelCF (if present) or compute local offset
+		for _, p in ipairs(model:GetDescendants()) do
 			if typeof(p) == "Instance" and p:IsA("BasePart") and p ~= primary then
-				local rel = p:GetAttribute("OriginalRelCF")
-				if rel then
-					local posRel = rel.Position * scale
-					local rotRel = rel - rel.Position
-					p.CFrame = rootCF * (CFrame.new(posRel) * rotRel)
+				-- try to use stored OriginalRelCF (CFrame). Fallback to deriving local offset if missing.
+				local rel = nil
+				local okRel = pcall(function() rel = p:GetAttribute("OriginalRelCF") end)
+				local newWorldPos = nil
+				local okPos, computed = pcall(function()
+					if rel and typeof(rel) == "CFrame" then
+						-- Use the local position component scaled, then transform to world
+						local scaledLocalPos = rel.Position * scale
+						local worldCF = primary.CFrame * CFrame.new(scaledLocalPos)
+						return worldCF.Position
+					else
+						-- Fallback: compute current local offset and scale it
+						local localPos = primary.CFrame:ToObjectSpace(p.CFrame).Position
+						local scaledLocalPos = localPos * scale
+						local worldCF = primary.CFrame * CFrame.new(scaledLocalPos)
+						return worldCF.Position
+					end
+				end)
+				if okPos and computed then newWorldPos = computed end
+
+				-- Preserve the part's orientation vectors (look/up) and set CFrame using lookAt
+				if newWorldPos then
+					local look, up = nil, nil
+					pcall(function() look = p.CFrame.LookVector end)
+					pcall(function() up = p.CFrame.UpVector end)
+					-- fallback to primary orientation if needed
+					if not look then look = primary.CFrame.LookVector end
+					if not up then up = primary.CFrame.UpVector end
+					local okSet = pcall(function() p.CFrame = CFrame.lookAt(newWorldPos, newWorldPos + look, up) end)
+					if not okSet then
+						-- final fallback: just set position, preserve orientation if possible
+						pcall(function() p.CFrame = CFrame.new(newWorldPos) * CFrame.fromMatrix(Vector3.new(), p.CFrame.RightVector, p.CFrame.UpVector) end)
+					end
 				end
 			end
 		end
+
 		model:SetAttribute("CurrentSizeScale", scale)
 	end
 
@@ -609,92 +651,19 @@ do
 
 		pcall(function() ModelUtils.AutoWeld(slime, primary) end)
 
-		return slime
-	end
-
-	function SlimeFactory.RestoreFromSnapshot(entry, player, plot)
-		local template = findTemplate()
-		if not template then
-			warn("[SlimeFactory] Missing slime template.")
-			return nil
-		end
-		local slime = template:Clone()
-		slime.Name = "Slime"
-
-		local function setAttr(long, short)
-			local v = entry[short]
-			if v ~= nil then slime:SetAttribute(long, v) end
-		end
-
-		setAttr("GrowthProgress","gp"); setAttr("ValueFull","vf"); setAttr("CurrentValue","cv")
-		setAttr("ValueBase","vb"); setAttr("ValuePerGrowth","vg"); setAttr("MutationStage","ms")
-		setAttr("Tier","ti"); setAttr("FedFraction","ff"); setAttr("CurrentSizeScale","sz")
-		setAttr("BodyColor","bc"); setAttr("AccentColor","ac"); setAttr("MovementScalar","mv")
-		setAttr("WeightScalar","ws"); setAttr("MutationRarityBonus","mb"); setAttr("WeightPounds","wt")
-		setAttr("MaxSizeScale","mx"); setAttr("StartSizeScale","st"); setAttr("SizeLuckRolls","lr")
-		setAttr("FeedBufferSeconds","fb"); setAttr("FeedBufferMax","fx"); setAttr("HungerDecayRate","hd")
-		setAttr("CurrentFullness","cf"); setAttr("FeedSpeedMultiplier","fs"); setAttr("LastHungerUpdate","lu")
-		setAttr("EyeColor","ec"); setAttr("LastGrowthUpdate","lg"); setAttr("OfflineGrowthApplied","og")
-		setAttr("AgeSeconds","ag")
-
-		slime:SetAttribute("SlimeId", entry.id or HttpService:GenerateGUID(false))
-		slime:SetAttribute("OwnerUserId", player and player.UserId or 0)
-
-		local gp = slime:GetAttribute("GrowthProgress") or 0
-		if slime:GetAttribute("PersistedGrowthProgress") == nil then
-			slime:SetAttribute("PersistedGrowthProgress", gp)
-		end
-
-		if slime:GetAttribute("LastGrowthUpdate") == nil and entry.ts then
-			slime:SetAttribute("LastGrowthUpdate", entry.ts)
-		end
-
-		local primary = choosePrimary(slime)
-		if primary then
-			captureOriginalData(slime, primary)
-			local curScale = slime:GetAttribute("CurrentSizeScale") or 1
-			applyScale(slime, primary, curScale)
-		end
-
-		if slime:GetAttribute("CurrentFullness") == nil then
-			slime:SetAttribute("CurrentFullness", slime:GetAttribute("FedFraction") or 1)
-		end
-		if slime:GetAttribute("FedFraction") == nil then slime:SetAttribute("FedFraction", 1) end
-		if slime:GetAttribute("LastHungerUpdate") == nil then slime:SetAttribute("LastHungerUpdate", os.time()) end
-		if slime:GetAttribute("HungerDecayRate") == nil then slime:SetAttribute("HungerDecayRate", 0.02/15) end
-
-		SlimeMutation.InitSlime(slime)
-		SlimeMutation.RecomputeValueFull(slime)
-		local prog = slime:GetAttribute("GrowthProgress") or 0
-		local vf = slime:GetAttribute("ValueFull") or 0
-		slime:SetAttribute("CurrentValue", vf * prog)
-
-		applyAppearanceFromAttributes(slime)
-
-		if primary then
-			pcall(function() ModelUtils.AutoWeld(slime, primary) end)
-		end
-
-		slime:SetAttribute("IsRestored", true)
-		slime:SetAttribute("RestoredAt", os.time())
-		slime.Parent = plot
-
-		if entry.px and entry.py and entry.pz then
-			local cf = CFrame.new(entry.px, entry.py, entry.pz)
-			if entry.rx or entry.ry or entry.rz then
-				cf = cf * CFrame.Angles(entry.rx or 0, entry.ry or 0, entry.rz or 0)
-			end
-			if slime.PrimaryPart then slime.PrimaryPart.CFrame = cf else slime:PivotTo(cf) end
-		end
-
-		task.defer(function()
-			if slime.Parent then pcall(function() SlimeAI.Start(slime, nil) end) end
-		end)
+		-- Ensure persisted progress is initialized for newly created slimes so storage reflects current state.
+		slime:SetAttribute("PersistedGrowthProgress", slime:GetAttribute("GrowthProgress") or 0)
 
 		return slime
 	end
+
+	-- Replacement SlimeFactory.RestoreFromSnapshot (full implementation above in BuildNew block for clarity)
+	-- Note: RestoreFromSnapshot implemented earlier in full above inside this block (function present).
+
 end
 SlimeCore.SlimeFactory = SlimeFactory
+
+
 
 ----------------------------------------------------------
 -- GrowthService
@@ -718,7 +687,7 @@ do
 		GROWTH_TIMESTAMP_UPDATE_INTERVAL = 5,
 		INIT_OFFLINE_ASSUME_SECONDS      = 0,
 		SECOND_PASS_REAPPLY_WINDOW       = 2.0,
-		DEFER_OFFLINE_APPLY_ONE_HEARTBEAT = true,
+		DEFER_OFFLINE_APPLY_ONE_HEARTBEAT = false,
 		NON_REGRESS_SECOND_PASS_WINDOW   = 4.0,
 
 		OFFLINE_DEBUG                    = true,
@@ -833,8 +802,17 @@ do
 		end
 	end
 
+	-- Hunger multiplier: prefer SlimeCore.SlimeHungerService.GetHungerMultiplier if available,
+	-- otherwise fall back to default fed fraction formula.
 	local function hungerMultiplier(slime)
 		if not (CONFIG.HungerGrowthEnabled) then return 1 end
+		-- prefer the unified hunger service exposed on SlimeCore if present
+		if SlimeCore and SlimeCore.SlimeHungerService and type(SlimeCore.SlimeHungerService.GetHungerMultiplier) == "function" then
+			local ok, val = pcall(function() return SlimeCore.SlimeHungerService.GetHungerMultiplier(slime) end)
+			if ok and type(val) == "number" then
+				return val
+			end
+		end
 		local fed = slime:GetAttribute("FedFraction")
 		if fed == nil then return 1 end
 		return 0.40 + (1.00 - 0.40) * fed
@@ -866,6 +844,113 @@ do
 		end
 	end
 
+	-- Sync model attributes into the authoritative cached profile (player inventory) and push inventory update.
+	-- This is lazy/defensive: it requires PlayerProfileService/InventoryService at call time (pcall),
+	-- and marks the profile dirty and calls InventoryService.UpdateProfileInventory to update clients.
+	local function syncModelGrowthIntoProfile(slime)
+		if not slime or not slime.Parent then return end
+		local owner = nil
+		local sid = nil
+		pcall(function()
+			owner = slime:GetAttribute("OwnerUserId")
+			sid = slime:GetAttribute("SlimeId")
+		end)
+		if not owner or not sid then return end
+
+		-- require PlayerProfileService / InventoryService lazily (avoid module init cycles)
+		local PlayerProfileService = nil
+		local InventoryService = nil
+		local ok, svc = pcall(function() return require(ModulesRoot:WaitForChild("PlayerProfileService")) end)
+		if ok and svc then PlayerProfileService = svc end
+		local ok2, inv = pcall(function() return require(ModulesRoot:WaitForChild("InventoryService")) end)
+		if ok2 and inv then InventoryService = inv end
+
+		-- must have PPS to update cached profile; otherwise bail
+		if not PlayerProfileService or type(PlayerProfileService.GetProfile) ~= "function" then return end
+
+		local profile = nil
+		pcall(function() profile = PlayerProfileService.GetProfile(owner) end)
+		if not profile then
+			-- try a short WaitForProfile if available
+			if PlayerProfileService and type(PlayerProfileService.WaitForProfile) == "function" then
+				local okp, p = pcall(function() return PlayerProfileService.WaitForProfile(owner, 0.25) end)
+				if okp then profile = p end
+			end
+		end
+		if not profile or type(profile) ~= "table" then return end
+
+		profile.inventory = profile.inventory or {}
+		profile.inventory.worldSlimes = profile.inventory.worldSlimes or {}
+
+		-- gather model attrs
+		local gp = slime:GetAttribute("GrowthProgress")
+		local pgp = slime:GetAttribute("PersistedGrowthProgress")
+		local lgu = slime:GetAttribute("LastGrowthUpdate")
+		local ts  = slime:GetAttribute("Timestamp") or lgu
+
+		-- hunger attributes
+		local cf = slime:GetAttribute("CurrentFullness")
+		local ff = slime:GetAttribute("FedFraction")
+		local lhu = slime:GetAttribute("LastHungerUpdate")
+		local hdr = slime:GetAttribute("HungerDecayRate")
+
+		local pos = nil
+		local prim = slime.PrimaryPart or slime:FindFirstChildWhichIsA("BasePart")
+		if prim then
+			local okp, cf2 = pcall(function() return prim:GetPivot() end)
+			if okp and cf2 then pos = { x = cf2.X, y = cf2.Y, z = cf2.Z } end
+		end
+
+		local updated = false
+		for i,entry in ipairs(profile.inventory.worldSlimes) do
+			if type(entry) == "table" then
+				local id = entry.SlimeId or entry.id or entry.Id
+				if id and tostring(id) == tostring(sid) then
+					if gp ~= nil then entry.GrowthProgress = gp; updated = true end
+					if pgp ~= nil then entry.PersistedGrowthProgress = pgp; updated = true end
+					if lgu ~= nil then entry.LastGrowthUpdate = lgu; updated = true end
+					if ts  ~= nil then entry.Timestamp = ts; updated = true end
+					if pos then entry.Position = pos; updated = true end
+
+					-- hunger
+					if cf ~= nil then entry.CurrentFullness = cf; updated = true end
+					if ff ~= nil then entry.FedFraction = ff; updated = true end
+					if lhu ~= nil then entry.LastHungerUpdate = lhu; updated = true end
+					if hdr ~= nil then entry.HungerDecayRate = hdr; updated = true end
+
+					profile.inventory.worldSlimes[i] = entry
+					break
+				end
+			end
+		end
+
+		if not updated then
+			local newEntry = { id = sid, SlimeId = sid }
+			if gp ~= nil then newEntry.GrowthProgress = gp end
+			if pgp ~= nil then newEntry.PersistedGrowthProgress = pgp end
+			if lgu ~= nil then newEntry.LastGrowthUpdate = lgu end
+			if ts ~= nil then newEntry.Timestamp = ts end
+			if pos then newEntry.Position = pos end
+			-- hunger
+			if cf ~= nil then newEntry.CurrentFullness = cf end
+			if ff ~= nil then newEntry.FedFraction = ff end
+			if lhu ~= nil then newEntry.LastHungerUpdate = lhu end
+			if hdr ~= nil then newEntry.HungerDecayRate = hdr end
+
+			table.insert(profile.inventory.worldSlimes, newEntry)
+			updated = true
+		end
+
+		if updated then
+			-- mark dirty and push inventory update (best-effort)
+			pcall(function() if PlayerProfileService.MarkDirty then PlayerProfileService.MarkDirty(owner) end end)
+			if InventoryService and type(InventoryService.UpdateProfileInventory) == "function" then
+				local ply = Players:GetPlayerByUserId(owner)
+				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+			end
+		end
+	end
+
 	local function computeOfflineDelta(slime)
 		if not CONFIG.OFFLINE_GROWTH_ENABLED then
 			logOffline(slime, "detect_delta_result", {delta=0, reason="disabled"})
@@ -874,7 +959,6 @@ do
 		local now = os.time()
 		local last = slime:GetAttribute("LastGrowthUpdate")
 		logOffline(slime, "detect_delta_start", {now=now, last=last})
-
 		if not last or type(last) ~= "number" then
 			if CONFIG.INIT_OFFLINE_ASSUME_SECONDS > 0 then
 				local assumed = math.min(CONFIG.INIT_OFFLINE_ASSUME_SECONDS, CONFIG.OFFLINE_GROWTH_MAX_SECONDS)
@@ -907,6 +991,8 @@ do
 			if (not prior) or gp > prior then slime:SetAttribute("PersistedGrowthProgress", gp) end
 			local sid = slime:GetAttribute("SlimeId")
 			if sid then lastPersistedProgress[sid] = gp; microCumulative[sid] = 0 end
+			-- keep inventory/UI in sync: attempt to copy authoritative model attributes to profile
+			pcall(function() syncModelGrowthIntoProfile(slime) end)
 		end
 	end
 
@@ -919,7 +1005,16 @@ do
 	end
 
 	local function applyOfflineGrowth(slime, offlineDelta, isReapply)
-		if offlineDelta <= 0 then return 0 end
+		local sid = nil
+		if slime and slime.GetAttribute then
+			local ok, val = pcall(function() return slime:GetAttribute("SlimeId") end)
+			if ok then sid = val end
+		end
+
+		if offlineDelta <= 0 then
+			return 0
+		end
+
 		local progress = slime:GetAttribute("GrowthProgress") or 0
 		if progress >= 1 then
 			slime:SetAttribute("AgeSeconds", (slime:GetAttribute("AgeSeconds") or 0) + offlineDelta)
@@ -933,18 +1028,10 @@ do
 		if unfedDuration <= 0 then unfedDuration = 600 end
 		local hungerSpeed   = hungerMultiplier(slime)
 
-		logOffline(slime, "apply_offline_before", {
-			delta=offlineDelta,
-			progress_before=progress,
-			feedBuffer=feedBuffer,
-			unfed=unfedDuration,
-			hunger=hungerSpeed,
-			feedMult=feedMult,
-			reapply=isReapply
-		})
-
 		local function segmentIncrement(seconds, speedMultiplier)
-			if seconds <= 0 or progress >= 1 then return 0 end
+			if seconds <= 0 or progress >= 1 then
+				return 0
+			end
 			local inc = (seconds * speedMultiplier) / unfedDuration
 			local cap = 1 - progress
 			if inc > cap then inc = cap end
@@ -959,15 +1046,45 @@ do
 		local inc2 = segmentIncrement(normalTime, hungerSpeed)
 		local totalInc = inc1 + inc2
 
-		if totalInc > 0 then slime:SetAttribute("GrowthProgress", progress) end
-		if bufferConsume > 0 then slime:SetAttribute("FeedBufferSeconds", math.max(0, feedBuffer - bufferConsume)) end
+		if totalInc > 0 then
+			slime:SetAttribute("GrowthProgress", progress)
+			-- keep inventory/UI in sync for this immediate authoritative change
+			pcall(function() syncModelGrowthIntoProfile(slime) end)
+		end
+
+		if bufferConsume > 0 then
+			local newBuffer = math.max(0, feedBuffer - bufferConsume)
+			slime:SetAttribute("FeedBufferSeconds", newBuffer)
+		end
+
 		slime:SetAttribute("AgeSeconds", (slime:GetAttribute("AgeSeconds") or 0) + offlineDelta)
 		if CONFIG.OFFLINE_GROWTH_VERBOSE then
 			slime:SetAttribute("OfflineGrowthApplied", (slime:GetAttribute("OfflineGrowthApplied") or 0) + offlineDelta)
 		end
 
+		-- Persist progress immediately to reduce race with PreExit saves.
 		writePersistedProgress(slime)
 
+		-- Recompute visual scale and stats to keep model and attributes in sync after offline growth.
+		pcall(function()
+			local startScale = slime:GetAttribute("StartSizeScale") or 1
+			local maxScale = slime:GetAttribute("MaxSizeScale") or startScale
+			local eased = (function(t) return t*t*(3 - 2*t) end)(progress)
+			local targetScale = startScale + (maxScale - startScale) * eased
+			local currentScale = slime:GetAttribute("CurrentSizeScale") or targetScale
+			if math.abs(targetScale - currentScale) > (CONFIG.RESIZE_EPSILON or 1e-4) then
+				applyScale(slime, targetScale)
+				slime:SetAttribute("CurrentSizeScale", targetScale)
+				local cache = SlimeCache and SlimeCache[slime]
+				if cache then cache.lastScale = targetScale end
+			end
+
+			if SlimeMutation and type(SlimeMutation.RecomputeValueFull) == "function" then
+				SlimeMutation.RecomputeValueFull(slime)
+			end
+		end)
+
+		-- Persist metadata and debug info
 		logOffline(slime, "apply_offline_after", {
 			progress_after=progress,
 			progress_inc=totalInc,
@@ -1078,6 +1195,8 @@ do
 			if progress ~= prevProgress then
 				slime:SetAttribute("GrowthProgress", progress)
 				tryMicroProgressStamp(slime, progress, prevProgress)
+				-- keep inventory/UI in sync for in-session growth changes
+				pcall(function() syncModelGrowthIntoProfile(slime) end)
 			end
 		end
 
@@ -1172,6 +1291,7 @@ do
 		end
 	end
 
+	-- Keep this method lightweight: explicitly write persisted progress + stamp dirty for pre-leave flow.
 	function GrowthService.FlushPlayerSlimes(userId)
 		for slime,_ in pairs(SlimeCache) do
 			if slime.Parent and slime:GetAttribute("OwnerUserId") == userId then
@@ -1275,6 +1395,12 @@ do
 		return computeCurrent(slime, os.time())
 	end
 
+	function SlimeHungerService.GetHungerMultiplier(slime)
+		local fed = slime:GetAttribute("FedFraction")
+		if fed == nil then return 1 end
+		return 0.40 + (1.00 - 0.40) * fed
+	end
+
 	function SlimeHungerService.Start()
 		if heartbeatConn then return end
 		heartbeatConn = RunService.Heartbeat:Connect(function()
@@ -1299,6 +1425,11 @@ do
 	end
 end
 SlimeCore.SlimeHungerService = SlimeHungerService
+
+-- Public helper for feeding slimes from other modules
+function SlimeCore.FeedSlime(slime, restoreFraction)
+	return SlimeCore.SlimeHungerService.Feed(slime, restoreFraction)
+end
 
 ----------------------------------------------------------
 -- GrowthPersistenceService (integrated, decoupled)
@@ -1454,6 +1585,66 @@ do
 
 		task.spawn(periodicLoop)
 		dprint("Initialized (decoupled).")
+	end
+
+	function GrowthPersistenceService.FlushPlayerSlimesAndSave(userId, timeoutSeconds)
+		local player = Players_local:GetPlayerByUserId(userId)
+		local slimes = iterSlimesOnce()
+
+		if player then
+			stampPlayerSlimes(player, slimes)
+		else
+			dprint("FlushPlayerSlimesAndSave: player not found, stamping by userId", userId)
+			for _, slime in ipairs(slimes) do
+				local owner = slime:GetAttribute(CONFIG.OwnerAttr)
+				if owner and tostring(owner) == tostring(userId) then
+					stampSlime(slime)
+				end
+			end
+		end
+
+		safeMarkDirty(player or userId, CONFIG.MarkDirtyReasonEvent)
+
+		if Orchestrator then
+			local orchestratorArg = player or userId
+
+			if Orchestrator.SaveNowAndWait then
+				local ok, result = pcall(function()
+					if CONFIG.SaveEventSkipWorldFlag and type(CONFIG.SaveEventSkipWorldFlag) == "table" then
+						return Orchestrator:SaveNowAndWait(orchestratorArg, timeoutSeconds or 6, CONFIG.SaveEventSkipWorldFlag)
+					else
+						return Orchestrator:SaveNowAndWait(orchestratorArg, timeoutSeconds or 6)
+					end
+				end)
+				if not ok then
+					dprint("FlushPlayerSlimesAndSave: SaveNowAndWait error", result)
+					return false, "save_error"
+				end
+
+				if result == true then
+					return true
+				elseif result == false or result == nil then
+					dprint("FlushPlayerSlimesAndSave: SaveNowAndWait returned falsy:", tostring(result))
+					return false, "save_failed"
+				else
+					return true
+				end
+
+			elseif Orchestrator.SaveNow then
+				safeSaveNow(orchestratorArg, CONFIG.SaveReasonEventFlush, CONFIG.SaveEventSkipWorldFlag)
+				return true
+			else
+				dprint("FlushPlayerSlimesAndSave: Orchestrator has no SaveNow/SaveNowAndWait")
+				return false, "orchestrator_no_save"
+			end
+		end
+
+		dprint("FlushPlayerSlimesAndSave: no orchestrator available")
+		return false, "no_orchestrator"
+	end
+
+	function GrowthPersistenceService.FlushPlayerSlimes(userId, timeoutSeconds)
+		return GrowthPersistenceService.FlushPlayerSlimesAndSave(userId, timeoutSeconds)
 	end
 
 	function GrowthPersistenceService:OnProfileLoaded() end

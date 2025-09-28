@@ -86,14 +86,18 @@ end
 local Modules = ServerScriptService:WaitForChild("Modules")
 
 -- Prioritize some modules that must be required early for others' requires/Init.
--- Added "SlimeCore" here so the combined module is loaded early and can be used as fallback.
+-- We added PlayerProfileServiceWrappers and moved PreExitInventorySync earlier to ensure:
+--  - PlayerProfileService is available early,
+--  - the wrapper can wrap SaveNow/ForceFullSaveNow before other modules may trigger saves,
+--  - PreExitInventorySync installs its hooks early so pre-exit coin-preserve runs before other finalizers.
 local prioritizedRequireNames = {
 	"PlayerProfileService",
+	"PlayerProfileServiceWrappers", -- wrapper that ensures coins are present before saves; optional
+	"PreExitInventorySync",         -- run early to install pre-exit hooks before other finalizers
 	"GrandInventorySerializer",
 	"InventoryService",
 	"SlimeCore",
 	"PlotManager",
-	"PreExitInventorySync",
 	"ShopService",
 }
 
@@ -156,6 +160,22 @@ for name, inst in pairs(moduleScriptMap) do
 	end
 end
 
+-- Ensure FoodService module is explicitly required if present but wasn't already required.
+-- This is the only addition: explicitly require ServerScriptService.Modules.FoodService so it's present
+-- in requiredModules and will be picked up by the prioritized Init phase below.
+do
+	local foodInst = moduleScriptMap["FoodService"]
+	if foodInst and requiredModules["FoodService"] == nil then
+		local ok, res = pcall(function() return require(foodInst) end)
+		if ok then
+			requiredModules["FoodService"] = res
+			log("Loaded module: FoodService (explicit require)")
+		else
+			warnf("Require failed for FoodService: %s", tostring(res))
+		end
+	end
+end
+
 -- Expose a helper to access required modules by name
 local function Mod(name) return requiredModules[name] end
 
@@ -164,6 +184,7 @@ local function Mod(name) return requiredModules[name] end
 --     But now prefer SlimeCore submodules if the standalone modules were removed.
 ----------------------------------------------------------------
 local PlayerProfileService = Mod("PlayerProfileService")
+local PlayerProfileServiceWrappers = Mod("PlayerProfileServiceWrappers")
 local GrandInventorySerializer = Mod("GrandInventorySerializer")
 local InventoryService = Mod("InventoryService")
 local PlotManager = Mod("PlotManager")
@@ -172,6 +193,11 @@ local ShopService = Mod("ShopService")
 
 -- Load SlimeCore if present (fallback container for many slime subsystems).
 local SlimeCore = Mod("SlimeCore")
+
+-- If we loaded the PlayerProfileServiceWrappers early, log that it was loaded.
+if PlayerProfileServiceWrappers then
+	log("PlayerProfileServiceWrappers loaded early to protect saves.")
+end
 
 -- Utility: resolve a domain module by checking standalone mod first, then SlimeCore submodule
 local function ResolveDomain(name)
@@ -208,6 +234,23 @@ if type(PlotManager) == "table" and type(PlotManager.Init) == "function" then
 	end
 end
 
+-- Ensure PreExitInventorySync.Init is run extremely early if present (to install hooks),
+-- so pre-exit coin-preservation and FinalizePlayer wrapper are active before other finalizers.
+if type(PreExitInventorySync) == "table" then
+	if type(PreExitInventorySync.Init) == "function" then
+		local ok, err = pcall(PreExitInventorySync.Init, PreExitInventorySync)
+		if ok then
+			log("PreExitInventorySync.Init() run very early (pre-inventory).")
+		else
+			warnf("PreExitInventorySync.Init error (very early): "..tostring(err))
+		end
+	else
+		log("PreExitInventorySync required (no Init()); module loaded early.")
+	end
+else
+	log("PreExitInventorySync not present at very-early stage; will attempt later if available.")
+end
+
 -- Ensure GrandInventorySerializer registered BEFORE InventoryService.Init
 -- InventoryService.RegisterSerializer expects (name, serializer)
 if type(InventoryService) == "table" and GrandInventorySerializer and type(InventoryService.RegisterSerializer) == "function" then
@@ -237,22 +280,6 @@ if PlayerProfileService and GrandInventorySerializer and type(PlayerProfileServi
 			log("Attached GrandInventorySerializer adapter to PlayerProfileService.GrandInventory")
 		end
 	end)
-end
-
--- Ensure PreExitInventorySync.Init is run early if present (to install hooks)
-if type(PreExitInventorySync) == "table" then
-	if type(PreExitInventorySync.Init) == "function" then
-		local ok, err = pcall(PreExitInventorySync.Init, PreExitInventorySync)
-		if ok then
-			log("PreExitInventorySync.Init() run early (pre-inventory).")
-		else
-			warnf("PreExitInventorySync.Init error (early): "..tostring(err))
-		end
-	else
-		log("PreExitInventorySync required (no Init()); module loaded early.")
-	end
-else
-	log("PreExitInventorySync not present; proceeding without early pre-exit hook.")
 end
 
 ----------------------------------------------------------------

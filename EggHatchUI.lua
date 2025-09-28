@@ -1,8 +1,10 @@
--- EggHatchUI.client.lua (generic title variant)
+-- EggHatchUI.client.lua (updated to tolerate missing HatchAt by deriving it)
 -- Changes:
---   * Title no longer displays rarity (always "Egg").
---   * Rarity still fetched & can be used for coloring progress bar optional.
---   * Added flag SHOW_RARITY_IN_TITLE if you later want to re-enable showing it.
+--  - Derived HatchAt from HatchTime + PlacedAt when HatchAt is missing so restored eggs are usable.
+--  - isOwnedEgg now accepts eggs where HatchAt can be derived.
+--  - updateUI and hatch button use derived hatchAt consistently.
+--  - Sorting and multi-select use derived hatch time for ordering.
+--  - Minimal, local-only logic: server remains authoritative for actual hatching.
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -135,11 +137,48 @@ local function fmtTime(sec)
 	return string.format("%02d:%02d", m, s)
 end
 
+-- Try to derive a numeric hatch timestamp (epoch seconds) from attributes when HatchAt is missing.
+-- Returns number (epoch seconds) or nil if can't derive.
+local function deriveHatchAtFromAttrs(inst)
+	if not inst then return nil end
+	local hatchAt = inst:GetAttribute("HatchAt")
+	if type(hatchAt) == "number" then return hatchAt end
+
+	local hatchTime = tonumber(inst:GetAttribute("HatchTime"))
+	local placedAt = tonumber(inst:GetAttribute("PlacedAt"))
+
+	-- If there is no HatchTime we cannot derive reliably
+	if not hatchTime then return nil end
+
+	-- If PlacedAt appears to be an epoch seconds timestamp (> ~1e8), use it directly.
+	if placedAt and placedAt > 1e8 then
+		return placedAt + hatchTime
+	end
+
+	-- If PlacedAt looks like tick()-based or small, attempt to approximate using current os.time()
+	-- We can approximate: assume placedAt was tick() when set; convert using (os.time() + (placedAt + hatchTime - tick()))
+	if placedAt and placedAt > 0 then
+		-- compute remaining from tick() perspective and translate to os.time()
+		local remaining = (placedAt + hatchTime) - tick()
+		return os.time() + math.max(0, remaining)
+	end
+
+	-- If only HatchTime is set, assume it's a duration from now (best-effort UI)
+	return os.time() + hatchTime
+end
+
+local function getHatchAtForSort(inst)
+	local v = deriveHatchAtFromAttrs(inst)
+	return v or math.huge
+end
+
 local function isOwnedEgg(inst)
 	if not inst or not inst:IsA("Model") then return false end
 	if not inst:GetAttribute("ManualHatch") then return false end
 	if inst:GetAttribute("OwnerUserId") ~= LocalPlayer.UserId then return false end
-	if not inst:GetAttribute("HatchAt") then return false end
+	-- Accept eggs where HatchAt exists OR can be derived from other attributes
+	local hatchAt = deriveHatchAtFromAttrs(inst)
+	if type(hatchAt) ~= "number" then return false end
 	return true
 end
 
@@ -165,7 +204,9 @@ local function updateUI()
 		selectedEgg = nil
 		return
 	end
-	local hatchAt = selectedEgg:GetAttribute("HatchAt")
+
+	-- Use derived hatchAt for display logic
+	local hatchAt = deriveHatchAtFromAttrs(selectedEgg)
 	if type(hatchAt) ~= "number" then
 		timeLabel.Text = "Time: --:--"
 		hatchBtn.Text = "Err"
@@ -173,6 +214,7 @@ local function updateUI()
 		hatchBtn.Active = false
 		return
 	end
+
 	local now = os.time()
 	local remaining = hatchAt - now
 	local total = selectedEgg:GetAttribute("HatchTime") or 0
@@ -225,11 +267,10 @@ local function handleClick()
 		local now = tick()
 		if now - lastClickTime < 0.3 then
 			if selectedEgg == egg then
-				multiList = collectNearbyOwnedEggs(egg.PrimaryPart and egg.PrimaryPart.Position or egg:GetPivot().Position, 40)
+				local originPos = (egg.PrimaryPart and egg.PrimaryPart.Position) or (egg.GetPivot and egg:GetPivot().Position) or Vector3.new()
+				multiList = collectNearbyOwnedEggs(originPos, 40)
 				table.sort(multiList, function(a,b)
-					local ha = a:GetAttribute("HatchAt") or 0
-					local hb = b:GetAttribute("HatchAt") or 0
-					return ha < hb
+					return getHatchAtForSort(a) < getHatchAtForSort(b)
 				end)
 				if #multiList > 1 then
 					multiIndex = (multiIndex % #multiList) + 1
@@ -279,7 +320,8 @@ end)
 hatchBtn.MouseButton1Click:Connect(function()
 	if hatchDebounce then return end
 	if not selectedEgg then return end
-	local remaining = (selectedEgg:GetAttribute("HatchAt") or os.time()) - os.time()
+	local hatchAt = deriveHatchAtFromAttrs(selectedEgg)
+	local remaining = (hatchAt or os.time()) - os.time()
 	if remaining > 0 then
 		msgLabel.Text = "Not ready."
 		return

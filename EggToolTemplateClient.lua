@@ -1,9 +1,8 @@
--- Egg Tool Client (v10.4-nocooldown)
--- Changes from v10.3:
---   * Removed client/server cooldown gating.
---   * Removed previewCooldown and onCooldown usage.
---   * Added MIN_LOCAL_INTERVAL (set to 0 for no client throttling).
---   * Retains EggId auto-fix, obstruction ignoring own eggs, verbose debug.
+-- Egg Tool Client (v10.4-nocooldown) - patched to ensure preview is always removed when no egg is held
+-- Changes:
+--   * destroyPreview now accepts a `force` flag to bypass client-preserve heuristics.
+--   * Calls to destroyPreview updated (Unequipped, Destroying, and after placing) use force so preview doesn't linger.
+--   * Preserving logic still honored when not forced and tool is actively held.
 
 local tool              = script.Parent
 local Players           = game:GetService("Players")
@@ -229,12 +228,16 @@ local function _clientPreserveTool(tool)
 	return false
 end
 
--- Example usage: guard preview removal if tool preserved
-local function destroyPreview()
-	if _clientPreserveTool(tool) then
-		dprint("Preserving server-restored egg tool; skipping preview destroy.")
-		return
+-- Destroy preview. If `force`==true, bypass _clientPreserveTool checks and always remove preview.
+local function destroyPreview(force)
+	-- If not forced, allow preservation heuristics when tool is actively held.
+	if not force then
+		if _clientPreserveTool(tool) and tool.Parent == player.Character then
+			dprint("Preserving server-restored egg tool; skipping preview destroy.")
+			return
+		end
 	end
+
 	if previewModel then previewModel:Destroy() end
 	previewModel = nil
 	previewHighlight = nil
@@ -403,7 +406,8 @@ local function fire(reason)
 	if REMOVE_PREVIEW_ON_PLACE then
 		removalPending = true
 		stopLoop()
-		destroyPreview()
+		-- Force destroy preview so preserved tools don't leave it around after placement.
+		destroyPreview(true)
 		task.delay(PREVIEW_REAPPEAR_DELAY, function()
 			if removalPending and tool.Parent == player.Character then
 				removalPending = false
@@ -431,7 +435,8 @@ end)
 tool.Unequipped:Connect(function()
 	removeHeld()
 	stopLoop()
-	destroyPreview()
+	-- Force preview destruction on unequip so preview doesn't linger if player drops tool or tool is destroyed server-side.
+	destroyPreview(true)
 end)
 
 tool.Activated:Connect(function()
@@ -447,7 +452,8 @@ end)
 
 tool.Destroying:Connect(function()
 	stopLoop()
-	destroyPreview()
+	-- Tool is being destroyed: force removal of preview & held visuals
+	destroyPreview(true)
 	removeHeld()
 end)
 
