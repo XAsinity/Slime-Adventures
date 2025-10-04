@@ -54,9 +54,11 @@ local FEATURES = {
 	ShowProgressBar       = true,
 
 	EnableHunger          = true,
-	EnableStage           = true,
+	EnableMutationSummary = true,
 	FedAttributeName      = "FedFraction",
-	StageAttributeName    = "MutationStage",
+	MutationCountAttributeName      = "MutationCount",
+	MutationLastTypeAttributeName   = "MutationLastType",
+	MutationValueMultAttributeName  = "MutationValueMult",
 	ValueAttributeName    = "CurrentValue",
 
 	HungerDisplayMode     = "Fullness",
@@ -67,7 +69,6 @@ local FEATURES = {
 	HungerMidpoint        = 0.5,
 
 	ToggleKey             = Enum.KeyCode.T,
-	HoldStageKey          = Enum.KeyCode.LeftAlt,
 
 	SmoothOffset          = true,
 	OffsetLerpAlpha       = 0.18,
@@ -81,7 +82,8 @@ local FEATURES = {
 }
 
 local FullnessStaticColor = Color3.fromRGB(255, 180, 230)
-local STAGE_COLOR         = Color3.fromRGB(255, 255, 255)
+local MUTATION_COLOR      = Color3.fromRGB(200, 235, 255)
+local MUTATION_MULT_COLOR = Color3.fromRGB(255, 215, 120)
 local VALUE_COLOR         = Color3.fromRGB(230, 230, 230)
 local HUNGER_GRADIENT = {
 	FullColor = Color3.fromRGB( 80, 255, 120),
@@ -300,7 +302,6 @@ local lastUpdate = 0
 local currentOffset = 0
 local updateInterval = 1 / FEATURES.UpdateHz
 local displayMode = "HUNGER"
-local holdStageActive = false
 local lastValidCheck = 0
 local STUCK_FAILSAFE_DELAY = 0.3
 
@@ -389,8 +390,12 @@ local function attach(slime)
 		table.insert(attrConnections, sig)
 	end
 	listen("GrowthProgress")
-	if FEATURES.EnableStage then listen(FEATURES.StageAttributeName) end
 	if FEATURES.EnableHunger then listen(FEATURES.FedAttributeName) end
+	if FEATURES.EnableMutationSummary then
+		listen(FEATURES.MutationCountAttributeName)
+		listen(FEATURES.MutationLastTypeAttributeName)
+		listen(FEATURES.MutationValueMultAttributeName)
+	end
 	if FEATURES.ShowValue then listen(FEATURES.ValueAttributeName) end
 
 	ancestryConn = slime.AncestryChanged:Connect(function(_, parent)
@@ -400,15 +405,19 @@ local function attach(slime)
 		end
 	end)
 
+	displayMode = "HUNGER"
 	lastUpdate = 0
 end
 
 local function buildInfoLine()
 	if not currentSlime then return "" end
 	local parts = {}
-	local effectiveMode = (holdStageActive and FEATURES.EnableStage) and "STAGE" or displayMode
+	local mode = displayMode
+	if mode ~= "MUTATION" or not FEATURES.EnableMutationSummary then
+		mode = "HUNGER"
+	end
 
-	if effectiveMode == "HUNGER" and FEATURES.EnableHunger then
+	if mode == "HUNGER" and FEATURES.EnableHunger then
 		local fed = tonumber(currentSlime:GetAttribute(FEATURES.FedAttributeName)) or 0
 		fed = clamp01(fed)
 		local pct
@@ -424,10 +433,24 @@ local function buildInfoLine()
 		local col = hungerColor(fed)
 		local r,g,b = math.floor(col.R*255+0.5), math.floor(col.G*255+0.5), math.floor(col.B*255+0.5)
 		table.insert(parts, string.format('<font color="#%02X%02X%02X">%s%d%%</font>', r,g,b,label,pct))
-	elseif effectiveMode == "STAGE" and FEATURES.EnableStage then
-		local stage = currentSlime:GetAttribute(FEATURES.StageAttributeName) or 0
-		local r,g,b = math.floor(STAGE_COLOR.R*255+0.5), math.floor(STAGE_COLOR.G*255+0.5), math.floor(STAGE_COLOR.B*255+0.5)
-		table.insert(parts, string.format('<font color="#%02X%02X%02X">Stage: %s</font>', r,g,b,tostring(stage)))
+	elseif mode == "MUTATION" and FEATURES.EnableMutationSummary then
+		local countAttr = FEATURES.MutationCountAttributeName
+		local lastTypeAttr = FEATURES.MutationLastTypeAttributeName
+		local multAttr = FEATURES.MutationValueMultAttributeName
+		local count = tonumber(currentSlime:GetAttribute(countAttr)) or 0
+		local lastType = currentSlime:GetAttribute(lastTypeAttr)
+		if type(lastType) ~= "string" or lastType == "" then
+			lastType = (count > 0) and "Unknown" or "None"
+		else
+			lastType = lastType:gsub("^%l", string.upper)
+		end
+		local mr, mg, mb = math.floor(MUTATION_COLOR.R*255+0.5), math.floor(MUTATION_COLOR.G*255+0.5), math.floor(MUTATION_COLOR.B*255+0.5)
+		table.insert(parts, string.format('<font color="#%02X%02X%02X">Mutations: %d (%s)</font>', mr, mg, mb, count, lastType))
+		local mult = tonumber(currentSlime:GetAttribute(multAttr)) or 1
+		if math.abs(mult - 1) > 0.01 then
+			local vr, vg, vb = math.floor(MUTATION_MULT_COLOR.R*255+0.5), math.floor(MUTATION_MULT_COLOR.G*255+0.5), math.floor(MUTATION_MULT_COLOR.B*255+0.5)
+			table.insert(parts, string.format('<font color="#%02X%02X%02X">Value x%.2f</font>', vr, vg, vb, mult))
+		end
 	end
 
 	if FEATURES.ShowValue then
@@ -495,29 +518,19 @@ end
 
 -- Input ---------------------------------------------------------------------
 local function cycleMode()
+	if not FEATURES.EnableMutationSummary then return end
 	if displayMode == "HUNGER" then
-		displayMode = FEATURES.EnableStage and "STAGE" or "HUNGER"
+		displayMode = "MUTATION"
 	else
 		displayMode = "HUNGER"
 	end
+	lastUpdate = 0
 end
 
 UserInputService.InputBegan:Connect(function(input, gpe)
 	if gpe then return end
 	if input.KeyCode == FEATURES.ToggleKey then
 		cycleMode()
-		lastUpdate = 0
-	elseif input.KeyCode == FEATURES.HoldStageKey then
-		holdStageActive = true
-		lastUpdate = 0
-	end
-end)
-
-UserInputService.InputEnded:Connect(function(input, gpe)
-	if gpe then return end
-	if input.KeyCode == FEATURES.HoldStageKey then
-		holdStageActive = false
-		lastUpdate = 0
 	end
 end)
 

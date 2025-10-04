@@ -34,6 +34,13 @@ local function safeWaitForModules()
 	return nil
 end
 
+local function safeGetAttr(inst, attr)
+	if not inst or type(inst.GetAttribute) ~= "function" then return nil end
+	local ok, value = pcall(function() return inst:GetAttribute(attr) end)
+	if ok then return value end
+	return nil
+end
+
 local ToolTemplates = safeFindReplicated("ToolTemplates")
 local EggToolTemplate = nil
 if ToolTemplates then
@@ -63,8 +70,15 @@ do
 	if not FoodService then
 		local ms = safeFindReplicated("Modules")
 		if ms then
-			local ok2, fs2 = pcall(function() return require(ms:WaitForChild("FoodService")) end)
-			if ok2 then FoodService = fs2 end
+			local replica = ms:FindFirstChild("FoodService")
+			if replica then
+				local ok2, fs2 = pcall(function() return require(replica) end)
+				if ok2 then
+					FoodService = fs2
+				else
+					warn("[ShopService] Failed to require replicated FoodService:", fs2)
+				end
+			end
 		end
 	end
 end
@@ -79,18 +93,26 @@ local function warnlog(...) warn("[ShopService]", ...) end
 ----------------------------------------------------------------
 -- Config
 ----------------------------------------------------------------
+local DEFAULT_EGG_TYPE = "Egg"
+local EGG_RARITY_TAGS = {
+	common = true,
+	rare = true,
+	epic = true,
+	legendary = true,
+}
+
 local EggPurchaseOptions = {
-	Basic     = {cost = 50,   forcedRarity = nil},
-	Rare      = {cost = 150,  forcedRarity = "Rare"},
-	Epic      = {cost = 350,  forcedRarity = "Epic"},
-	Legendary = {cost = 1000, forcedRarity = "Legendary"},
+	Basic     = {cost = 50,   forcedRarity = nil,         eggType = DEFAULT_EGG_TYPE},
+	Rare      = {cost = 150,  forcedRarity = "Rare",      eggType = DEFAULT_EGG_TYPE},
+	Epic      = {cost = 350,  forcedRarity = "Epic",      eggType = DEFAULT_EGG_TYPE},
+	Legendary = {cost = 1000, forcedRarity = "Legendary", eggType = DEFAULT_EGG_TYPE},
 }
 
 local FoodPurchaseOptions = {
 	BasicFood = { cost = 10, displayName = "Basic Food" },
 }
 
-local ALWAYS_USE_GENERIC_EGG_TOOL_NAME = true
+local ALWAYS_USE_GENERIC_EGG_TOOL_NAME = false
 local GENERIC_EGG_TOOL_NAME = "Egg"
 
 ----------------------------------------------------------------
@@ -230,6 +252,8 @@ end
 ----------------------------------------------------------------
 -- Inventory snapshot helper
 ----------------------------------------------------------------
+local normalizeEggTool
+
 local function buildInventorySnapshot(player)
 	local snap = { Coins = getCoins(player), Eggs = {}, Foods = {} }
 	local bp = player:FindFirstChildOfClass("Backpack")
@@ -237,9 +261,11 @@ local function buildInventorySnapshot(player)
 		for _,t in ipairs(bp:GetChildren()) do
 			if t:IsA("Tool") then
 				if t:GetAttribute("EggId") and not t:GetAttribute("Placed") then
+					normalizeEggTool(t)
 					table.insert(snap.Eggs, {
 						EggId         = t:GetAttribute("EggId"),
 						Rarity        = t:GetAttribute("Rarity"),
+						EggType       = t:GetAttribute("EggType"),
 						HatchTime     = t:GetAttribute("HatchTime"),
 						Weight        = t:GetAttribute("WeightScalar"),
 						Move          = t:GetAttribute("MovementScalar"),
@@ -274,6 +300,42 @@ end
 ----------------------------------------------------------------
 -- Egg tool creation (unchanged)
 ----------------------------------------------------------------
+
+local function resolveEggDisplayName(eggType)
+	local trimmed = nil
+	if type(eggType) == "string" then
+		trimmed = string.match(eggType, "^%s*(.-)%s*$")
+	end
+	if not trimmed or trimmed == "" then
+		return DEFAULT_EGG_TYPE
+	end
+	local lower = string.lower(trimmed)
+	if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
+		return DEFAULT_EGG_TYPE
+	end
+	return trimmed .. " Egg"
+end
+
+normalizeEggTool = function(tool)
+	if not tool or type(tool.IsA) ~= "function" or not tool:IsA("Tool") then return end
+	if not tool:GetAttribute("EggId") then return end
+	local attrType = safeGetAttr(tool, "EggType")
+	local name = resolveEggDisplayName(attrType)
+	if tool.Name ~= name then
+		pcall(function() tool.Name = name end)
+	end
+	local shouldNormalizeType = attrType == nil
+	if not shouldNormalizeType and type(attrType) == "string" then
+		local lower = string.lower(attrType)
+		if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
+			shouldNormalizeType = true
+		end
+	end
+	if shouldNormalizeType then
+		pcall(function() tool:SetAttribute("EggType", DEFAULT_EGG_TYPE) end)
+	end
+end
+
 local function createEggTool(player, purchaseKey)
 	local opt = EggPurchaseOptions[purchaseKey]
 	if not opt then return nil, "Invalid egg key" end
@@ -282,17 +344,23 @@ local function createEggTool(player, purchaseKey)
 	if not EggToolTemplate then return nil, "Missing EggToolTemplate" end
 	local tool  = EggToolTemplate:Clone()
 	local eggId = HttpService:GenerateGUID(false)
+	local eggType = opt and opt.eggType
+	if type(eggType) ~= "string" or eggType == "" then
+		eggType = DEFAULT_EGG_TYPE
+	end
+	stats.EggType = eggType
 
 	if ALWAYS_USE_GENERIC_EGG_TOOL_NAME then
 		tool.Name = GENERIC_EGG_TOOL_NAME
 	else
-		tool.Name = (stats.Rarity or "Egg") .. " Egg"
+		tool.Name = resolveEggDisplayName(eggType)
 	end
 
 	tool:SetAttribute("EggId", eggId)
 	tool:SetAttribute("ServerIssued", true)
 	tool:SetAttribute("OwnerUserId", player.UserId)
 	tool:SetAttribute("StatsVersion", STATS_VERSION)
+	tool:SetAttribute("EggType", eggType)
 
 	-- Ensure deterministic unique key for inventory merging/dedupe
 	if not tool:GetAttribute("ToolUniqueId") then
@@ -302,6 +370,7 @@ local function createEggTool(player, purchaseKey)
 	for k,v in pairs(stats) do
 		tool:SetAttribute(k, v)
 	end
+	normalizeEggTool(tool)
 	return tool
 end
 
@@ -375,6 +444,34 @@ local function safeGiveFood(player, foodId, silent)
 		end)
 		pcall(function() tool:SetAttribute("PersistentFoodTool", true) end)
 
+		local appliedName, appliedLabel, appliedCharges = nil, nil, nil
+		if FoodService and type(FoodService.ApplyCanonicalToolName) == "function" then
+			local okApply, name, label, charges = pcall(FoodService.ApplyCanonicalToolName, tool, {
+				foodId = foodId,
+				definition = def,
+			})
+			if okApply then
+				appliedName, appliedLabel, appliedCharges = name, label, charges
+			end
+		end
+
+		if not appliedName then
+			local fallbackLabel = (def and def.Label) or tostring(foodId)
+			local fallbackCharges = safeGetAttr(tool, "Charges") or (def and def.Charges) or 0
+			fallbackCharges = tonumber(fallbackCharges) or 0
+			fallbackCharges = math.max(0, math.floor(fallbackCharges + 0.0001))
+			appliedName = string.format("%s %d", fallbackLabel, fallbackCharges)
+			appliedLabel = fallbackLabel
+			appliedCharges = fallbackCharges
+			pcall(function() tool.Name = appliedName end)
+		end
+
+		pcall(function()
+			if appliedLabel then
+				tool:SetAttribute("FoodTypeLabel", appliedLabel)
+			end
+		end)
+
 		-- Ensure it has a handle or visible part (don't create LocalScript.Source)
 		local hasHandle = false
 		for _,c in ipairs(tool:GetChildren()) do
@@ -405,9 +502,11 @@ local function safeGiveFood(player, foodId, silent)
 				PlayerProfileService.AddInventoryItem(player, "foodTools", {
 					FoodId = foodId,
 					ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
-					Charges = tool:GetAttribute("Charges"),
+					Charges = appliedCharges or tool:GetAttribute("Charges"),
 					ServerIssued = true,
 					GrantedAt = os.time(),
+					FoodTypeLabel = appliedLabel,
+					DisplayName = appliedName or tool.Name,
 				})
 			end
 		end)
@@ -416,9 +515,11 @@ local function safeGiveFood(player, foodId, silent)
 				InventoryService.AddInventoryItem(player, "foodTools", {
 					FoodId = foodId,
 					ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
-					Charges = tool:GetAttribute("Charges"),
+					Charges = appliedCharges or tool:GetAttribute("Charges"),
 					ServerIssued = true,
 					GrantedAt = os.time(),
+					FoodTypeLabel = appliedLabel,
+					DisplayName = appliedName or tool.Name,
 				})
 			end
 		end)
@@ -568,6 +669,7 @@ local function onPurchase(player, purchaseType, itemKey)
 				PlayerProfileService.AddInventoryItem(player, "eggTools", {
 					EggId         = tool:GetAttribute("EggId"),
 					Rarity        = tool:GetAttribute("Rarity"),
+					EggType       = tool:GetAttribute("EggType"),
 					HatchTime     = tool:GetAttribute("HatchTime"),
 					Weight        = tool:GetAttribute("WeightScalar"),
 					Move          = tool:GetAttribute("MovementScalar"),
@@ -594,6 +696,7 @@ local function onPurchase(player, purchaseType, itemKey)
 					InventoryService.AddInventoryItem(player, "eggTools", {
 						EggId         = tool:GetAttribute("EggId"),
 						Rarity        = tool:GetAttribute("Rarity"),
+						EggType       = tool:GetAttribute("EggType"),
 						HatchTime     = tool:GetAttribute("HatchTime"),
 						Weight        = tool:GetAttribute("WeightScalar"),
 						Move          = tool:GetAttribute("MovementScalar"),

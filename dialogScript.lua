@@ -15,6 +15,7 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 
 local SellRequest = Remotes:WaitForChild("SellSlimesRequest")
 local SellResult  = Remotes:WaitForChild("SellSlimesResult")
+local StandingRequest = Remotes:FindFirstChild("RequestFactionStanding")
 
 local FACTION = "Pacifist"
 
@@ -70,7 +71,18 @@ local function fetchFactionTotal()
 end
 
 local function getStanding()
-	return player:GetAttribute("Standing_"..FACTION) or 0
+	local attrValue = player:GetAttribute("Standing_"..FACTION)
+	local rf = StandingRequest or Remotes:FindFirstChild("RequestFactionStanding")
+	if rf and rf:IsA("RemoteFunction") then
+		StandingRequest = rf
+		local ok, result = pcall(function()
+			return rf:InvokeServer(FACTION)
+		end)
+		if ok and type(result) == "number" then
+			return result
+		end
+	end
+	return attrValue or 0
 end
 
 local function liveUpdate(text)
@@ -128,8 +140,11 @@ dialog.responded:Connect(function(responseNum, dialogNum)
 				showInfoMessage("I cannot sense our full records right now.")
 			end
 		elseif responseNum == 4 then
-			local s = getStanding()
-			showInfoMessage(("Your standing with us is %.3f (%.0f%% of maximum compassion)."):format(s, s*100))
+			showInfoMessage("Let me sense your compassion...")
+			task.spawn(function()
+				local s = getStanding()
+				showInfoMessage(("Your standing with us is %.3f (%.0f%% of maximum compassion)."):format(s, s*100))
+			end)
 		elseif responseNum == 5 then
 			finalClose("May harmony guide you.")
 		else

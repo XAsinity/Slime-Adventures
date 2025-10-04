@@ -34,6 +34,7 @@ FoodDefinitions.Foods = {
 		FeedBufferBonus = 15,
 		Charges = 1,
 		Rarity = "Common",
+		VisualModel = "SlimeFoodBasic",
 
 		-- DEBUG / TESTING: allow feeding non-owned slimes
 		RequireOwnership = false,

@@ -1158,10 +1158,15 @@ local function requestVerifiedSave(playerOrId, timeoutSeconds)
 	timeoutSeconds = tonumber(timeoutSeconds) or 3
 	local ok, res = pcall(function()
 		if type(PlayerProfileService.SaveNowAndWait) == "function" then
-			return PlayerProfileService.SaveNowAndWait(playerOrId, timeoutSeconds, true)
+			return PlayerProfileService.SaveNowAndWait(playerOrId, timeoutSeconds, {
+				verified = true,
+				reason = "InventoryService",
+				failFast = true,
+				noFallback = true,
+			})
 		else
 			if type(PlayerProfileService.ForceFullSaveNow) == "function" then
-				return PlayerProfileService.ForceFullSaveNow(playerOrId, "InventoryService_VerifiedFallback")
+				return PlayerProfileService.ForceFullSaveNow(playerOrId, "InventoryService_VerifiedFallback", { failFast = true, noFallback = true })
 			else
 				PlayerProfileService.SaveNow(playerOrId, "InventoryService_VerifiedFallback")
 				if type(PlayerProfileService.WaitForSaveComplete) == "function" then
@@ -1179,7 +1184,16 @@ local function requestVerifiedSave(playerOrId, timeoutSeconds)
 	return res and true or false
 end
 
-local function serializePlayer(player, reason, finalFlag)
+local function serializePlayer(player, reason, finalFlag, opts)
+	if type(finalFlag) == "table" and opts == nil then
+		opts = finalFlag
+		finalFlag = opts and opts.finalFlag
+	end
+	opts = opts or {}
+	if finalFlag == nil then
+		finalFlag = false
+	end
+	finalFlag = finalFlag and true or false
 	local st = PlayerState[player]; if not st then return end
 	st.lastSerialize = os.clock()
 	local correlationId = HttpService:GenerateGUID(false)
@@ -1288,12 +1302,17 @@ local function serializePlayer(player, reason, finalFlag)
 			dprint(("SaveNow requested for %s reason=%s"):format(player.Name, tostring(reason)))
 		end
 
-		if finalFlag then
+		if finalFlag and not opts.skipVerified then
 			local ok2, res2 = pcall(function()
 				if type(PlayerProfileService.SaveNowAndWait) == "function" then
-					return PlayerProfileService.SaveNowAndWait(player, 5, true)
+					return PlayerProfileService.SaveNowAndWait(player, 5, {
+						verified = true,
+						reason = "InventoryFinalize",
+						failFast = true,
+						noFallback = true,
+					})
 				elseif type(PlayerProfileService.ForceFullSaveNow) == "function" then
-					return PlayerProfileService.ForceFullSaveNow(player, reason or "InventoryFinal")
+					return PlayerProfileService.ForceFullSaveNow(player, reason or "InventoryFinal", { failFast = true, noFallback = true })
 				else
 					PlayerProfileService.SaveNow(player, reason or "InventoryFinal")
 					if type(PlayerProfileService.WaitForSaveComplete) == "function" then
@@ -2434,7 +2453,7 @@ function InventoryService.FinalizePlayer(playerOrId, reason)
 
 	-- 1) Serialize player (final) to ensure in-memory st.fields reflect serializer output before we merge
 	local okSer, serErr = pcall(function()
-		serializePlayer(ply, reason or "Leave", true)
+		serializePlayer(ply, reason or "Leave", true, { skipVerified = true })
 	end)
 	if not okSer then
 		warnLog(("FinalizePlayer: serializePlayer failed for %s err=%s"):format(ply.Name, tostring(serErr)))
@@ -2463,7 +2482,7 @@ function InventoryService.FinalizePlayer(playerOrId, reason)
 		-- Fallback: ForceFullSaveNow if available
 		pcall(function()
 			if type(PlayerProfileService.ForceFullSaveNow) == "function" then
-				PlayerProfileService.ForceFullSaveNow(ply, reason or "FinalizePlayer_Fallback")
+				PlayerProfileService.ForceFullSaveNow(ply, reason or "FinalizePlayer_Fallback", { failFast = true, noFallback = true })
 			else
 				PlayerProfileService.SaveNow(ply, reason or "FinalizePlayer_Fallback")
 			end
@@ -2471,6 +2490,12 @@ function InventoryService.FinalizePlayer(playerOrId, reason)
 		dprint(("FinalizePlayer: Verified save unavailable for %s (fallback triggered)"):format(ply.Name))
 	else
 		dprint(("FinalizePlayer: Verified save succeeded for %s"):format(ply.Name))
+	end
+
+	if type(PlayerProfileService) == "table" and type(PlayerProfileService.AwaitSaveQueue) == "function" then
+		pcall(function()
+			PlayerProfileService.AwaitSaveQueue(ply.UserId, 2)
+		end)
 	end
 
 	return true
@@ -2576,6 +2601,57 @@ local function onPlayerRemoving(player)
 	-- Defensive wrapper for player leaving; avoid nil calls and log profile snapshot
 	pcall(function()
 		dprint(("onPlayerRemoving start for %s"):format(player.Name))
+
+		local function getLeaveAttr(name)
+			if not player or type(player.GetAttribute) ~= "function" then return nil end
+			local okAttr, val = pcall(function() return player:GetAttribute(name) end)
+			if okAttr then return val end
+			return nil
+		end
+
+		local function attrIsRecent(ts)
+			return type(ts) == "number" and (os.clock() - ts) <= 8
+		end
+
+		local preExitFinalTs = getLeaveAttr("__PreExitInventorySyncFinalizedAt")
+		if attrIsRecent(preExitFinalTs) then
+			dprint(("onPlayerRemoving: PreExitInventorySync already finalized for %s; skipping duplicate finalize."):format(player.Name))
+			PlayerState[player] = nil
+			return
+		end
+
+		local preExitActiveTs = getLeaveAttr("__PreExitInventorySyncActive")
+		if attrIsRecent(preExitActiveTs) then
+			dprint(("onPlayerRemoving: PreExitInventorySync active for %s; deferring InventoryService finalize."):format(player.Name))
+			local startWait = os.clock()
+			local maxWait = 18
+			while os.clock() - startWait < maxWait do
+				task.wait(0.1)
+				preExitFinalTs = getLeaveAttr("__PreExitInventorySyncFinalizedAt")
+				if attrIsRecent(preExitFinalTs) then
+					dprint(("onPlayerRemoving: PreExitInventorySync completed during wait for %s; skipping duplicate finalize."):format(player.Name))
+					PlayerState[player] = nil
+					return
+				end
+				preExitActiveTs = getLeaveAttr("__PreExitInventorySyncActive")
+				if not attrIsRecent(preExitActiveTs) then
+					break
+				end
+			end
+			preExitFinalTs = getLeaveAttr("__PreExitInventorySyncFinalizedAt")
+			if attrIsRecent(preExitFinalTs) then
+				dprint(("onPlayerRemoving: PreExitInventorySync finalized after wait for %s; skipping duplicate finalize."):format(player.Name))
+				PlayerState[player] = nil
+				return
+			end
+			if attrIsRecent(getLeaveAttr("__PreExitInventorySyncActive")) then
+				warnLog(("onPlayerRemoving: PreExitInventorySync still active after %.1fs for %s; proceeding with fallback finalize.")
+					:format(os.clock() - startWait, player.Name))
+			else
+				dprint(("onPlayerRemoving: PreExitInventorySync inactive for %s after wait; continuing with fallback finalize.")
+					:format(player.Name))
+			end
+		end
 		-- Try to flush growth-related progress (if present) in a guarded way
 		if SlimeCoreAvailable and SlimeCore and SlimeCore.GrowthService and type(SlimeCore.GrowthService.FlushPlayerSlimes) == "function" then
 			local ok, err = pcall(function()

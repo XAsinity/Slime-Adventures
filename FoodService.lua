@@ -14,7 +14,22 @@ local ServerStorage       = game:GetService("ServerStorage")
 
 local Modules             = ServerScriptService:WaitForChild("Modules")
 local PlayerProfileService = require(Modules:WaitForChild("PlayerProfileService"))
-local InventoryService     = require(Modules:WaitForChild("InventoryService"))
+local InventoryService
+
+local function ensureInventoryService()
+	if InventoryService then
+		return InventoryService
+	end
+	local ok, svc = pcall(function()
+		return require(Modules:WaitForChild("InventoryService"))
+	end)
+	if ok and svc then
+		InventoryService = svc
+		return InventoryService
+	end
+	warn("[FoodService] Failed to require InventoryService:", svc)
+	return nil
+end
 
 -- Use the consolidated SlimeCore (contains SlimeHungerService)
 local SlimeCore = nil
@@ -120,6 +135,120 @@ local grantLogLast   = {}
 local feedLogLast    = {}
 local pendingPersist = {}
 
+local nameWatcherConnections = setmetatable({}, { __mode = "k" })
+local destroyWatcherConnections = setmetatable({}, { __mode = "k" })
+
+local function safeGetAttribute(inst, attr)
+	if not inst or type(inst.GetAttribute) ~= "function" then return nil end
+	local ok, value = pcall(function() return inst:GetAttribute(attr) end)
+	if ok then return value end
+	return nil
+end
+
+local function safeSetAttribute(inst, attr, value)
+	if not inst or type(inst.SetAttribute) ~= "function" then return end
+	pcall(function() inst:SetAttribute(attr, value) end)
+end
+
+local function coerceFoodLabel(foodId, preferredLabel, def)
+	if type(preferredLabel) == "string" and preferredLabel ~= "" then
+		return preferredLabel
+	end
+	if def and type(def.Label) == "string" and def.Label ~= "" then
+		return def.Label
+	end
+	if type(foodId) == "string" and foodId ~= "" then
+		return foodId
+	end
+	return "Food"
+end
+
+local function coerceCharges(rawValue, def)
+	local charges = rawValue
+	if charges == nil and def and def.Charges ~= nil then
+		charges = def.Charges
+	end
+	charges = tonumber(charges)
+	if not charges then charges = 0 end
+	if charges < 0 then charges = 0 end
+	return math.floor(charges + 0.0001)
+end
+
+local function formatFoodName(label, charges)
+	return string.format("%s %d", tostring(label or "Food"), tonumber(charges) or 0)
+end
+
+local function resolveCharges(tool, explicitCharges, def)
+	if explicitCharges ~= nil then
+		return coerceCharges(explicitCharges, def)
+	end
+	return coerceCharges(safeGetAttribute(tool, "Charges"), def)
+end
+
+local function bindChargeWatcher(tool, def, label)
+	if not tool or type(tool.GetAttributeChangedSignal) ~= "function" then
+		return
+	end
+
+	local function refresh()
+		local charges = resolveCharges(tool, nil, def)
+		local computed = formatFoodName(label, charges)
+		pcall(function() tool.Name = computed end)
+		return computed
+	end
+
+	refresh()
+
+	local existing = nameWatcherConnections[tool]
+	if existing and type(existing.Disconnect) == "function" then
+		existing:Disconnect()
+	end
+
+	local conn = tool:GetAttributeChangedSignal("Charges"):Connect(refresh)
+	nameWatcherConnections[tool] = conn
+
+	if not destroyWatcherConnections[tool] and tool.Destroying and type(tool.Destroying.Connect) == "function" then
+		destroyWatcherConnections[tool] = tool.Destroying:Connect(function()
+			local stored = nameWatcherConnections[tool]
+			if stored and type(stored.Disconnect) == "function" then
+				stored:Disconnect()
+			end
+			nameWatcherConnections[tool] = nil
+			destroyWatcherConnections[tool] = nil
+		end)
+	end
+end
+
+local function applyCanonicalToolName(tool, meta)
+	if not tool then return nil, nil, nil end
+	meta = meta or {}
+	local foodId = meta.foodId or safeGetAttribute(tool, "FoodId")
+	local def = meta.definition
+	if not def and meta.resolveDefinition ~= false then
+		local ok, resolved = pcall(function() return FoodDefinitions.resolve(foodId) end)
+		if ok and type(resolved) == "table" then
+			def = resolved
+		end
+	end
+	local label = coerceFoodLabel(foodId, meta.label or safeGetAttribute(tool, "FoodTypeLabel"), def)
+	safeSetAttribute(tool, "FoodTypeLabel", label)
+	local charges = resolveCharges(tool, meta.charges, def)
+	local computedName = formatFoodName(label, charges)
+	pcall(function() tool.Name = computedName end)
+	bindChargeWatcher(tool, def, label)
+	return computedName, label, charges, def
+end
+
+function FoodService.ApplyCanonicalToolName(tool, meta)
+	return applyCanonicalToolName(tool, meta)
+end
+
+function FoodService.FormatFoodToolName(foodId, charges, label, def)
+	local nameLabel = coerceFoodLabel(foodId, label, def)
+	local nameCharges = coerceCharges(charges, def)
+	return formatFoodName(nameLabel, nameCharges)
+end
+
 local function log(...) if CONFIG.Debug then print("[FoodService]", ...) end end
 local function warnf(...) warn("[FoodService]", ...) end
 
@@ -141,9 +270,7 @@ end
 
 local function saveImmediate(player, reason)
 	pcall(function()
-		if type(PlayerProfileService.ForceFullSaveNow) == "function" then
-			PlayerProfileService.ForceFullSaveNow(player, reason or "FoodChange")
-		else
+		if type(PlayerProfileService.SaveNow) == "function" then
 			PlayerProfileService.SaveNow(player, reason or "FoodChange")
 		end
 	end)
@@ -491,26 +618,236 @@ end
 		tostring(tool.Name), tostring(containerName)))
 end
 
-local function ensureVisualHandle(tool, def)
-	if tool:FindFirstChild("Handle") then return end
-	local ASSETS_FOLDER  = ReplicatedStorage:FindFirstChild(CONFIG.AssetsFolderName)
-	if def and def.VisualModel and ASSETS_FOLDER then
-		local model = ASSETS_FOLDER:FindFirstChild(def.VisualModel)
-		if model and type(model.IsA) == "function" and model:IsA("Model") then
-			local c = model:Clone()
-			local prim = c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart")
-			if prim then prim.Name = "Handle" end
-			for _,child in ipairs(c:GetChildren()) do child.Parent = tool end
-			c:Destroy()
-			return
+local FALLBACK_HANDLE_ATTR = "_FoodFallbackHandle"
+local INVISIBLE_HANDLE_ATTR = "_FoodInvisibleHandle"
+local HANDLE_WELD_NAME = "FoodHandleWeld"
+
+local function markFallbackHandle(part)
+	if part then
+		pcall(function() part:SetAttribute(FALLBACK_HANDLE_ATTR, true) end)
+	end
+end
+
+local function isFallbackHandle(part)
+	if not part or type(part.IsA) ~= "function" or not part:IsA("BasePart") then return false end
+	if part:GetAttribute(INVISIBLE_HANDLE_ATTR) then return false end
+	if part:GetAttribute(FALLBACK_HANDLE_ATTR) then return true end
+	local fallbackSize = CONFIG.FallbackHandleSize or Vector3.new(1,1,1)
+	local sizeMatch = (part.Size - fallbackSize).Magnitude <= 1e-3
+	local noChildren = #part:GetChildren() == 0
+	local colorMatch = part.Color == Color3.new(1,1,1)
+	if sizeMatch and noChildren and colorMatch and part.Transparency <= 0 then
+		return true
+	end
+	return false
+end
+
+local function splitPath(path)
+	if type(path) == "table" then
+		return path
+	elseif type(path) == "string" then
+		local segments = {}
+		for segment in string.gmatch(path, "[^/]+") do
+			table.insert(segments, segment)
+		end
+		if #segments <= 1 then
+			segments = {}
+			for segment in string.gmatch(path, "[^%.]+") do
+				table.insert(segments, segment)
+			end
+		end
+		return segments
+	end
+	return nil
+end
+
+local function findAssetByPath(path)
+	if not path then return nil end
+	local segments = splitPath(path)
+	if not segments or #segments == 0 then
+		if type(path) == "string" then
+			local direct = ReplicatedStorage:FindFirstChild(path)
+			if direct then return direct end
+			local assets = ReplicatedStorage:FindFirstChild(CONFIG.AssetsFolderName)
+			if assets then
+				local item = assets:FindFirstChild(path)
+				if item then return item end
+				local foodFolder = assets:FindFirstChild("Food")
+				if foodFolder then
+					local foodItem = foodFolder:FindFirstChild(path)
+					if foodItem then return foodItem end
+				end
+			end
+		end
+		return nil
+	end
+	local node = ReplicatedStorage
+	for _, segment in ipairs(segments) do
+		if not node or type(node.FindFirstChild) ~= "function" then return nil end
+		node = node:FindFirstChild(segment)
+		if not node then return nil end
+	end
+	return node
+end
+
+local function resolveVisualAsset(def, foodId, templateTool, templateContainer)
+	if templateTool and type(templateTool.IsA) == "function" and templateTool:IsA("Tool") then
+		return nil -- template already provided full tool visuals
+	end
+	if templateTool and type(templateTool.IsA) == "function" and (templateTool:IsA("Model") or templateTool:IsA("Folder")) then
+		return templateTool
+	end
+	if templateContainer and templateContainer ~= templateTool and type(templateContainer.IsA) == "function" and (templateContainer:IsA("Model") or templateContainer:IsA("Folder")) then
+		return templateContainer
+	end
+	local candidates = {}
+	if def then
+		if def.VisualModelPath then table.insert(candidates, def.VisualModelPath) end
+		if def.VisualModel then table.insert(candidates, def.VisualModel) end
+	end
+	if foodId then
+		table.insert(candidates, {CONFIG.AssetsFolderName, "Food", foodId})
+		table.insert(candidates, {CONFIG.AssetsFolderName, foodId})
+		table.insert(candidates, foodId)
+	end
+	if CONFIG.FallbackFoodHandleModel then
+		table.insert(candidates, {CONFIG.AssetsFolderName, CONFIG.FallbackFoodHandleModel})
+		table.insert(candidates, CONFIG.FallbackFoodHandleModel)
+	end
+	for _, candidate in ipairs(candidates) do
+		local asset = findAssetByPath(candidate)
+		if asset then return asset end
+	end
+	return nil
+end
+
+local function cloneAssetIntoTool(tool, asset)
+	if not tool or not asset then return false end
+	local cloned = false
+	local function safeClone(child)
+		local ok, copy = pcall(function() return child:Clone() end)
+		if ok and copy then
+			copy.Parent = tool
+			return true
+		end
+		return false
+	end
+	if type(asset.IsA) == "function" and asset:IsA("Tool") then
+		for _, child in ipairs(asset:GetChildren()) do
+			if safeClone(child) then cloned = true end
+		end
+	else
+		local ok, copy = pcall(function() return asset:Clone() end)
+		if ok and copy then
+			copy.Parent = tool
+			cloned = true
 		end
 	end
-	local h = Instance.new("Part")
-	h.Name = "Handle"
-	h.Size = CONFIG.FallbackHandleSize
-	h.TopSurface = Enum.SurfaceType.Smooth
-	h.BottomSurface = Enum.SurfaceType.Smooth
-	h.Parent = tool
+	return cloned
+end
+
+local function hasVisualGeometry(tool, handleToIgnore)
+	if not tool then return false end
+	local descendants = tool:GetDescendants()
+	for _, inst in ipairs(descendants) do
+		if inst ~= handleToIgnore and type(inst.IsA) == "function" and inst:IsA("BasePart") then
+			return true
+		end
+	end
+	return false
+end
+
+local function createInvisibleHandle(tool)
+	local handle = tool:FindFirstChild("Handle")
+	if handle then
+		if type(handle.IsA) == "function" and handle:IsA("BasePart") and not isFallbackHandle(handle) then
+			pcall(function() handle:SetAttribute(INVISIBLE_HANDLE_ATTR, true) end)
+			handle.Transparency = 1
+			handle.Size = Vector3.new(0.1, 0.1, 0.1)
+			handle.CanCollide = false
+			handle.CanTouch = false
+			handle.CanQuery = false
+			handle.Massless = true
+			pcall(function() tool.PrimaryPart = handle end)
+			pcall(function() tool.RequiresHandle = true end)
+			return handle
+		end
+		if isFallbackHandle(handle) then
+			handle:Destroy()
+			handle = nil
+		end
+	end
+	handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.1, 0.1, 0.1)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.CanTouch = false
+	handle.CanQuery = false
+	handle.Anchored = false
+	handle.Massless = true
+	handle.Parent = tool
+	pcall(function() handle:SetAttribute(INVISIBLE_HANDLE_ATTR, true) end)
+	pcall(function() tool.PrimaryPart = handle end)
+	pcall(function() tool.RequiresHandle = true end)
+	return handle
+end
+
+local function weldVisualsToHandle(tool, handle)
+	if not tool or not handle or type(handle.IsA) ~= "function" or not handle:IsA("BasePart") then return end
+	for _, desc in ipairs(tool:GetDescendants()) do
+		if desc ~= handle and type(desc.IsA) == "function" and desc:IsA("BasePart") then
+			pcall(function()
+				desc.Anchored = false
+				desc.CanCollide = false
+				desc.Massless = true
+			end)
+			for _, existing in ipairs(desc:GetChildren()) do
+				if existing:IsA("WeldConstraint") and existing.Name == HANDLE_WELD_NAME then
+					existing:Destroy()
+				end
+			end
+			local weld = Instance.new("WeldConstraint")
+			weld.Name = HANDLE_WELD_NAME
+			weld.Part0 = handle
+			weld.Part1 = desc
+			weld.Parent = desc
+		end
+	end
+end
+
+local function ensureVisualHandle(tool, def, templateTool, templateContainer)
+	if not tool then return end
+	local existingHandle = tool:FindFirstChild("Handle")
+	if existingHandle and type(existingHandle.IsA) == "function" and existingHandle:IsA("BasePart") and not isFallbackHandle(existingHandle) then
+		return
+	end
+	local foodId = nil
+	pcall(function() foodId = tool:GetAttribute("FoodId") end)
+	foodId = foodId or def and def.FoodId or tool.Name
+	local visualAsset = resolveVisualAsset(def, foodId, templateTool, templateContainer)
+	local addedVisual = false
+	if not hasVisualGeometry(tool, existingHandle) and visualAsset then
+		addedVisual = cloneAssetIntoTool(tool, visualAsset)
+	end
+	if existingHandle and isFallbackHandle(existingHandle) and (addedVisual or hasVisualGeometry(tool, existingHandle)) then
+		existingHandle:Destroy()
+		existingHandle = nil
+	end
+	local handle = createInvisibleHandle(tool)
+	if not hasVisualGeometry(tool, handle) and not addedVisual and visualAsset then
+		addedVisual = cloneAssetIntoTool(tool, visualAsset)
+	end
+	if not hasVisualGeometry(tool, handle) then
+		if handle then
+			handle.Transparency = 1
+			handle.Size = CONFIG.FallbackHandleSize or Vector3.new(1,1,1)
+			handle.Color = Color3.fromRGB(255,255,255)
+			handle:SetAttribute(FALLBACK_HANDLE_ATTR, true)
+		end
+		return
+	end
+	weldVisualsToHandle(tool, handle)
 end
 
 local function createFoodTool(player, foodId, def)
@@ -549,7 +886,12 @@ local function createFoodTool(player, foodId, def)
 	pcall(function() tool:SetAttribute("ToolUniqueId", HttpService:GenerateGUID(false)) end)
 	pcall(function() tool:SetAttribute("PersistentFoodTool", true) end)
 
-	ensureVisualHandle(tool, def)
+	applyCanonicalToolName(tool, {
+		foodId = foodId,
+		definition = def,
+	})
+
+	ensureVisualHandle(tool, def, template, templateContainer)
 	-- pass both the template tool and the templateContainer so the attach function can prefer the correct source
 	attachClientLocalScriptIfMissing(tool, template, templateContainer)
 
@@ -615,6 +957,8 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 		return nil
 	end
 
+	ensureInventoryService()
+
 	local granted = {}
 	for i=1, amount do
 		local tool = createFoodTool(player, foodId, def)
@@ -630,17 +974,29 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 		end)
 
 		if throttled(grantLogLast, CONFIG.GrantLogThrottle, player.UserId.."|"..foodId) then
-			log(("Granted %s foodId=%s Charges=%s (x%d)"):format(player.Name, foodId, tostring(tool:GetAttribute("Charges")), amount))
+			log(("Granted %s foodId=%s name='%s' Charges=%s (x%d)"):format(
+				player.Name,
+				foodId,
+				tostring(tool.Name),
+				tostring(safeGetAttribute(tool, "Charges")),
+				amount
+			))
 		end
 		verifyReplication(player, tool)
 		table.insert(granted, tool)
 
+		local displayLabel = safeGetAttribute(tool, "FoodTypeLabel") or (def and def.Label) or foodId
+		local chargeCount = tonumber(safeGetAttribute(tool, "Charges")) or def.Charges or 0
+		local displayName = tool.Name
+
 		local foodItemData = {
 			FoodId = foodId,
 			ToolUniqueId = tool:GetAttribute("ToolUniqueId"),
-			Charges = tool:GetAttribute("Charges"),
+			Charges = chargeCount,
 			ServerIssued = true,
 			GrantedAt = os.time(),
+			FoodTypeLabel = displayLabel,
+			DisplayName = displayName,
 			-- canonical id fields to prevent serializer/other code from inventing alternate ids
 			id = tool:GetAttribute("ToolUniqueId"),
 			uid = tool:GetAttribute("ToolUniqueId"),
@@ -797,6 +1153,8 @@ function FoodService.HandleFeed(player, slime, tool)
 	local restore = math.clamp(tool:GetAttribute("RestoreFraction") or def.RestoreFraction or 0, 0, 1)
 	local before = slime:GetAttribute("FedFraction")
 
+	ensureInventoryService()
+
 	-- Attempt feeding via SlimeCore API
 	local okFeed = SlimeCore.FeedSlime(slime, restore)
 	if not okFeed then return false, "Feed rejected" end
@@ -813,62 +1171,102 @@ function FoodService.HandleFeed(player, slime, tool)
 	slimeCooldowns[slime] = now
 
 	local consumed = false
-	if tool:GetAttribute("Consumable") then
-		-- capture identifying ids before tool may be destroyed
-		local toolUid = tool:GetAttribute("ToolUniqueId") or tool:GetAttribute("ToolUid")
-		local ownerUserId = tool:GetAttribute("OwnerUserId") or player.UserId
+	local toolUid = tool:GetAttribute("ToolUniqueId") or tool:GetAttribute("ToolUid")
+	local ownerUserId = tool:GetAttribute("OwnerUserId") or player.UserId
 
-		-- Remove inventory entry (profile/state) first (immediate) so persistent state is updated before tool destruction
+	local function coerceBoolean(value, fallback)
+		local vt = type(value)
+		if vt == "boolean" then return value end
+		if vt == "number" then return value ~= 0 end
+		if vt == "string" then
+			local lowered = string.lower(value)
+			if lowered == "false" or lowered == "0" or lowered == "" then return false end
+			return true
+		end
+		if value ~= nil then return true end
+		return fallback
+	end
+
+	local rawConsumable = tool:GetAttribute("Consumable")
+	local consumable = coerceBoolean(rawConsumable, nil)
+	if consumable == nil then
+		consumable = coerceBoolean(def.Consumable, true)
+	end
+
+	local rawCharges = tool:GetAttribute("Charges")
+	local charges = tonumber(rawCharges)
+	local chargesRemaining = charges
+	if charges then
+		chargesRemaining = math.max(0, charges - 1)
+		pcall(function() tool:SetAttribute("Charges", chargesRemaining) end)
+		if chargesRemaining <= 0 then
+			consumable = true
+		else
+			consumable = false
+		end
+	end
+
+	local function destroyToolInstance(inst, reason)
+		if not inst then return false end
+		ensureInventoryService()
+		local removed = false
+		if InventoryService and InventoryService._safeRemoveOrDefer then
+			local okSafe, code = pcall(function() return InventoryService._safeRemoveOrDefer(inst, reason or "FoodConsumed", { force = true, grace = 0.2 }) end)
+			if okSafe and code then
+				removed = true
+			end
+		end
+		if not removed then
+			local okDetach = pcall(function() inst.Parent = nil end)
+			local okDestroy = pcall(function() inst:Destroy() end)
+			removed = okDetach or okDestroy
+		end
+		return removed
+	end
+
+	if consumable then
+		ensureInventoryService()
 		pcall(function()
-			if type(PlayerProfileService.RemoveInventoryItem) == "function" then
+			if type(PlayerProfileService.RemoveInventoryItem) == "function" and toolUid then
 				PlayerProfileService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", toolUid)
 			end
 		end)
 
-		local okInvRem, invRemErr = pcall(function()
-			if InventoryService and type(InventoryService.RemoveInventoryItem) == "function" then
-				-- request immediate removal/persist of this tool id (best-effort)
-				return InventoryService.RemoveInventoryItem(player, "foodTools", "ToolUniqueId", toolUid, { immediate = true })
+		local invRemoved = false
+		if InventoryService and type(InventoryService.RemoveInventoryItem) == "function" and toolUid then
+			local okInvRem, removedFlag, errCode = pcall(InventoryService.RemoveInventoryItem, player, "foodTools", "ToolUniqueId", toolUid, { immediate = true })
+			if not okInvRem then
+				warnf("[FoodService] InventoryService.RemoveInventoryItem error: %s", tostring(removedFlag))
+			elseif removedFlag ~= true then
+				warnf("[FoodService] InventoryService.RemoveInventoryItem returned %s (code=%s) for toolUid=%s", tostring(removedFlag), tostring(errCode), tostring(toolUid))
+			else
+				invRemoved = true
 			end
-		end)
-		if not okInvRem then
-			warnf("[FoodService] InventoryService.RemoveInventoryItem failed: %s", tostring(invRemErr))
 		end
 
-		-- Also attempt to remove the tool instance from character/backpack immediately so it's not present on next join
-		pcall(function()
-			-- prefer InventoryService safe removal helper if available
-			local foundTool = nil
-			-- try local finder first (fast, avoids cross-module dependency)
+		local destroyed = destroyToolInstance(tool, "FoodConsumedPrimary")
+		if toolUid and not destroyed then
 			local okFindLocal, localTool = pcall(function() return findToolForPlayerById(player, toolUid) end)
-			if okFindLocal and localTool then
-				foundTool = localTool
-			else
-				-- fallback to InventoryService's potential helper (if it exposes one)
-				local okHas, okRes = pcall(function() return InventoryService and InventoryService.FindToolForPlayerById end)
-				if okHas and type(okRes) == "function" then
-					local ok2, inst2 = pcall(function() return okRes(player, toolUid) end)
-					if ok2 and inst2 then foundTool = inst2 end
+			if okFindLocal and localTool and localTool ~= tool then
+				destroyed = destroyToolInstance(localTool, "FoodConsumedLookup") or destroyed
+			end
+			if not destroyed then
+				local okHasFinder, finder = pcall(function() return InventoryService and InventoryService.FindToolForPlayerById end)
+				if okHasFinder and type(finder) == "function" then
+					local okLookup, altTool = pcall(function() return finder(player, toolUid) end)
+					if okLookup and altTool then
+						destroyed = destroyToolInstance(altTool, "FoodConsumedInventoryFinder") or destroyed
+					end
 				end
 			end
-
-			if foundTool then
-				if InventoryService and InventoryService._safeRemoveOrDefer then
-					pcall(function() InventoryService._safeRemoveOrDefer(foundTool, "FoodConsumed", { force = true, grace = 0.2 }) end)
-				else
-					pcall(function() foundTool.Parent = nil end)
-					pcall(function() foundTool:Destroy() end)
-				end
-			else
-				-- fallback: if the server-side reference 'tool' is parented, detach/destroy safely
-				if tool and tool.Parent then
-					pcall(function() tool.Parent = nil end)
-					pcall(function() tool:Destroy() end)
-				end
-			end
-		end)
+		end
+		if not destroyed and tool and tool.Parent then
+			destroyToolInstance(tool, "FoodConsumedFallback")
+		end
 
 		consumed = true
+	else
+		consumed = false
 	end
 
 	if throttled(feedLogLast, CONFIG.FeedLogThrottle, player.UserId.."|"..tostring(slime:GetAttribute("SlimeId") or "")) then
@@ -889,40 +1287,18 @@ function FoodService.HandleFeed(player, slime, tool)
 		saveImmediate(player, "FoodConsumeImmediate")
 	end
 
-	return true
-end
-
---[[ --- FEED REMOTE LOGIC (NEW) ---
-	Allows SlimeCaptureUI Feed button to call FeedRemote:FireServer(slime, tool)
-	Returns result to client via FeedResult remote.
---]]
-
-local FeedRemote    = ReplicatedStorage:FindFirstChild("FeedSlime")
-local FeedResult    = ReplicatedStorage:FindFirstChild("FeedResult")
-
-if FeedRemote and typeof(FeedRemote) == "Instance" and FeedRemote:IsA("RemoteEvent") then
-	FeedRemote.OnServerEvent:Connect(function(player, slime, tool)
-		local success, msg = false, ""
-		local ok, err = pcall(function()
-			success = FoodService.HandleFeed(player, slime, tool)
-			if not success then
-				msg = "Feed failed"
-			else
-				msg = "Fed!"
-			end
-		end)
-		if not ok then
-			success = false
-			msg = err or "Exception"
-		end
-		-- Optionally send feedback to client
-		if FeedResult and typeof(FeedResult) == "Instance" and FeedResult:IsA("RemoteEvent") then
-			FeedResult:FireClient(player, { success = success, message = msg })
-		end
-	end)
+	return true, {
+		restoreFraction = restore,
+		before = before,
+		after = after,
+		consumed = consumed,
+		cooldown = cd,
+		chargesRemaining = chargesRemaining,
+	}
 end
 
 FoodService.Definitions = FoodDefinitions
 FoodService.Effects = FoodEffects
+FoodService.FindToolForPlayerById = findToolForPlayerById
 
 return FoodService

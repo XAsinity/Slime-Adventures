@@ -33,7 +33,7 @@ local CONFIG = {
 	StripScriptsInToolCopy  = true,
 	Debug                   = false,
 
-	USE_GENERIC_CAPTURED_TOOL_NAME = true,
+	USE_GENERIC_CAPTURED_TOOL_NAME = false,
 	GENERIC_CAPTURED_NAME          = "CapturedSlime",
 
 	-- Save behavior
@@ -128,6 +128,28 @@ local function computeWeightLbs(slime)
 	end
 	if type(scale) ~= "number" or scale <= 0 then scale = 1 end
 	return (scale ^ 3) * CONFIG.BASE_WEIGHT_LBS
+end
+
+local function formatCapturedToolName(weightLbs, slimeType)
+	local weightStr = nil
+	if type(weightLbs) == "number" and weightLbs > 0 then
+		weightStr = string.format("%.1f", weightLbs)
+	end
+	local typeStr = nil
+	if type(slimeType) == "string" then
+		slimeType = slimeType:match("^%s*(.-)%s*$")
+		if slimeType ~= "" then
+			typeStr = slimeType
+		end
+	end
+	if weightStr and typeStr then
+		return string.format("%slb %s", weightStr, typeStr)
+	elseif typeStr then
+		return typeStr
+	elseif weightStr then
+		return string.format("%slb Slime", weightStr)
+	end
+	return CONFIG.GENERIC_CAPTURED_NAME
 end
 
 -- read a child Value instance by name (NumberValue/StringValue/etc.)
@@ -239,13 +261,17 @@ local function weldVisual(tool)
 	end
 end
 
+local alignToolScaleFromWeight
+
 local FULL_ATTR_LIST = {
 	"GrowthProgress","CurrentValue","ValueFull","ValueBase","ValuePerGrowth",
-	"MutationStage","Tier","WeightPounds","FedFraction","BodyColor","AccentColor","EyeColor",
+	"MutationCount","MutationValueMult","MutationLastType","MutationLastApplied",
+	"MutationHasPhysical","MutationFoodStub","MutationFoodStubCount","MutationSizeBoost","MutationHistory",
+	"Tier","WeightPounds","FedFraction","BodyColor","AccentColor","EyeColor",
 	"MovementScalar","WeightScalar","MutationRarityBonus",
 	"MaxSizeScale","StartSizeScale","CurrentSizeScale","SizeLuckRolls",
 	"FeedBufferSeconds","FeedBufferMax","HungerDecayRate","CurrentFullness",
-	"FeedSpeedMultiplier","LastHungerUpdate","Rarity",
+	"FeedSpeedMultiplier","LastHungerUpdate","Rarity","SlimeType",
 }
 
 -- Hardened buildTool: read attributes from model defensively and compute sensible defaults
@@ -260,11 +286,7 @@ local function buildTool(slime, player)
 	local tool = TOOL_TEMPLATE:Clone()
 	pcall(function() tool:SetAttribute("PersistentCaptured", true) end)
 
-	if CONFIG.USE_GENERIC_CAPTURED_TOOL_NAME then
-		tool.Name = CONFIG.GENERIC_CAPTURED_NAME
-	else
-		tool.Name = "CapturedSlime"
-	end
+	tool.Name = CONFIG.GENERIC_CAPTURED_NAME
 
 	-- read helpers with legacy keys
 	local function r(key, legacy)
@@ -272,6 +294,23 @@ local function buildTool(slime, player)
 	end
 
 	local slimeId = r("SlimeId", {"id","Id"}) or HttpService:GenerateGUID(false)
+	local slimeTypeRaw = r("SlimeType", {"SlimeType","Type","type","slimeType","tp"})
+	if type(slimeTypeRaw) ~= "string" or slimeTypeRaw == "" then
+		local breed = r("Breed", {"br"})
+		if type(breed) == "string" and breed ~= "" then
+			slimeTypeRaw = breed
+		end
+	end
+	local resolvedSlimeType = nil
+	if type(slimeTypeRaw) == "string" then
+		local trimmed = slimeTypeRaw:match("^%s*(.-)%s*$")
+		if trimmed ~= "" then
+			resolvedSlimeType = trimmed
+		end
+	end
+	if not resolvedSlimeType then
+		resolvedSlimeType = "Slime"
+	end
 
 	local growthRaw = r("GrowthProgress", {"gp","growth"})
 	local growth = tonumber(growthRaw) or 0
@@ -288,6 +327,10 @@ local function buildTool(slime, player)
 
 	local valueBase = tonumber(r("ValueBase")) or computeValueBase(valueFull, valuePerGrowth)
 	local weightLbs = tonumber(r("WeightPounds")) or computeWeightLbs(slime)
+	local displayName = formatCapturedToolName(weightLbs, resolvedSlimeType)
+	tool.Name = displayName or CONFIG.GENERIC_CAPTURED_NAME
+	pcall(function() tool:SetAttribute("DisplayName", tool.Name) end)
+
 	local rarity = r("Rarity") or "Common"
 
 	-- === New: read size attributes early and infer MaxSizeScale when missing ===
@@ -330,6 +373,7 @@ local function buildTool(slime, player)
 	pcall(function() tool:SetAttribute("CurrentValue", tonumber(currentValue) or 0) end)
 	pcall(function() tool:SetAttribute("WeightPounds", tonumber(weightLbs) or computeWeightLbs(slime)) end)
 	pcall(function() tool:SetAttribute("Rarity", tostring(rarity or "Common")) end)
+	pcall(function() tool:SetAttribute("SlimeType", tostring(resolvedSlimeType or "Slime")) end)
 
 	pcall(function() tool:SetAttribute("BodyColor", tostring(bodyHex)) end)
 	pcall(function() tool:SetAttribute("AccentColor", tostring(accentHex)) end)
@@ -366,6 +410,8 @@ local function buildTool(slime, player)
 	if not tool:GetAttribute("ToolUniqueId") then
 		pcall(function() tool:SetAttribute("ToolUniqueId", HttpService:GenerateGUID(false)) end)
 	end
+
+	alignToolScaleFromWeight(tool)
 
 	-- capture visual
 	cloneVisual(slime, tool)
@@ -468,6 +514,104 @@ local function applyScaleToModel(model, scale)
 	pcall(function() model:SetAttribute("CurrentSizeScale", scale) end)
 end
 
+local MIN_TOOL_SCALE = 0.05
+
+local function safeToolAttr(inst, name)
+	if not inst or type(inst.GetAttribute) ~= "function" then return nil end
+	local ok, value = pcall(function()
+		return inst:GetAttribute(name)
+	end)
+	if ok then return value end
+	return nil
+end
+
+local function computeScaleFromWeightAttribute(inst)
+	local weight = tonumber(safeToolAttr(inst, "WeightPounds"))
+	if weight and weight > 0 then
+		local ratio = weight / CONFIG.BASE_WEIGHT_LBS
+		if ratio > 0 then
+			local scale = ratio ^ (1/3)
+			if scale > 0 and scale < 1e6 then
+				return scale
+			end
+		end
+	end
+	local weightScalar = tonumber(safeToolAttr(inst, "WeightScalar"))
+	if weightScalar and weightScalar > 0 then
+		local scale = weightScalar ^ (1/3)
+		if scale > 0 and scale < 1e6 then
+			return scale
+		end
+	end
+	return nil
+end
+
+alignToolScaleFromWeight = function(inst)
+	local target = computeScaleFromWeightAttribute(inst)
+	if not target then return nil end
+
+	local currentMax = tonumber(safeToolAttr(inst, "MaxSizeScale"))
+	if not currentMax or currentMax <= 0 or math.abs(currentMax - target) > 1e-4 then
+		inst:SetAttribute("MaxSizeScale", target)
+		currentMax = target
+	else
+		target = currentMax
+	end
+
+	local growthProgress = tonumber(safeToolAttr(inst, "GrowthProgress"))
+	if growthProgress then
+		if growthProgress ~= growthProgress then
+			growthProgress = nil
+		else
+			growthProgress = math.clamp(growthProgress, 0, 1)
+		end
+	end
+
+	local startScale = tonumber(safeToolAttr(inst, "StartSizeScale"))
+	local startFraction = nil
+	if startScale and currentMax and currentMax > 0 then
+		startFraction = math.clamp(startScale / currentMax, 0, 1)
+	end
+	if not startFraction then
+		if growthProgress and growthProgress > 0 and growthProgress < 1 then
+			startFraction = growthProgress
+		end
+	end
+	if not startFraction then
+		startFraction = 0.05
+	end
+
+	local newStart = math.max(target * startFraction, MIN_TOOL_SCALE)
+	inst:SetAttribute("StartSizeScale", newStart)
+
+	local currentScale = tonumber(safeToolAttr(inst, "CurrentSizeScale"))
+	local newCurrent = currentScale
+	if growthProgress ~= nil then
+		newCurrent = newStart + (target - newStart) * growthProgress
+	elseif currentScale and target ~= newStart then
+		local denom = target - newStart
+		if math.abs(denom) > 1e-6 then
+			local frac = math.clamp((currentScale - newStart) / denom, 0, 1)
+			newCurrent = newStart + (target - newStart) * frac
+		end
+	end
+	if not newCurrent or newCurrent <= 0 then
+		if growthProgress ~= nil then
+			newCurrent = newStart + (target - newStart) * growthProgress
+		elseif currentScale and currentScale > 0 then
+			newCurrent = math.max(currentScale, MIN_TOOL_SCALE)
+		else
+			newCurrent = target
+		end
+	end
+
+	newCurrent = math.max(newCurrent, MIN_TOOL_SCALE)
+	inst:SetAttribute("CurrentSizeScale", newCurrent)
+	inst:SetAttribute("_LastAppliedSizeScale", newCurrent)
+
+	return target
+end
+
 local function decodeColorString(v)
 	if typeof and typeof(v) == "Color3" then return v end
 	if type(v) == "string" then
@@ -515,6 +659,8 @@ local function BuildVisualFromTool(tool)
 	local model = deepCloneAndSanitize(template)
 	model.Name = "SlimeVisual"
 
+	alignToolScaleFromWeight(tool)
+
 	local scale = tool:GetAttribute("CurrentSizeScale") or tool:GetAttribute("StartSizeScale")
 	if not scale then
 		local gp = tool:GetAttribute("GrowthProgress")
@@ -547,10 +693,17 @@ local function BuildVisualFromTool(tool)
 end
 
 local function EnsureToolVisual(tool)
-	-- Disabled: prevent automatic creation/grafting of SlimeVisual into captured-slime Tools during restore.
-	-- Returning false indicates no visual was added.
-	return false
-end
+	if not tool or not tool:IsA("Tool") then return false end
+	local okAttr, isSlime = pcall(function() return tool:GetAttribute("SlimeItem") end)
+	if not okAttr or not isSlime then return false end
+	if tool:FindFirstChild("SlimeVisual") then return true end
+
+	local model = BuildVisualFromTool(tool)
+	if not model then
+		local handle = tool:FindFirstChild("Handle")
+		if not handle then
+			handle = Instance.new("Part")
+			handle.Name = "Handle"
 			handle.Size = Vector3.new(1,1,1)
 			handle.CanCollide = false
 			handle.Parent = tool
@@ -585,13 +738,13 @@ local function RestorePlayerCapturedVisuals(player)
 		local char = player.Character
 		if backpack then
 			for _, item in ipairs(backpack:GetChildren()) do
-				pcall(function() EnsureToolVisual(item) end)
+				EnsureToolVisual(item)
 			end
 		end
 		if char then
 			for _, item in ipairs(char:GetChildren()) do
 				if item:IsA("Tool") then
-					pcall(function() EnsureToolVisual(item) end)
+					EnsureToolVisual(item)
 				end
 			end
 		end
@@ -602,7 +755,7 @@ local function RestorePlayerCapturedVisuals(player)
 			backpack.ChildAdded:Connect(function(child)
 				if child and child:IsA("Tool") then
 					task.wait(0.03)
-					pcall(function() EnsureToolVisual(child) end)
+					EnsureToolVisual(child)
 				end
 			end)
 		end
@@ -684,6 +837,9 @@ local function perform(player, slime)
 		CapturedAt = tool:GetAttribute("CapturedAt"),
 		OwnerUserId = player.UserId,
 		Rarity = tool:GetAttribute("Rarity"),
+		SlimeType = tool:GetAttribute("SlimeType"),
+		ToolName = tool.Name,
+		DisplayName = tool:GetAttribute("DisplayName"),
 		WeightPounds = tool:GetAttribute("WeightPounds"),
 		CurrentValue = tool:GetAttribute("CurrentValue"),
 		GrowthProgress = tool:GetAttribute("GrowthProgress"),
@@ -692,6 +848,10 @@ local function perform(player, slime)
 		EyeColor = tool:GetAttribute("EyeColor"),
 		ValueFull = tool:GetAttribute("ValueFull"),
 		ValueBase = tool:GetAttribute("ValueBase"),
+		ValuePerGrowth = tool:GetAttribute("ValuePerGrowth"),
+		MaxSizeScale = tool:GetAttribute("MaxSizeScale"),
+		StartSizeScale = tool:GetAttribute("StartSizeScale"),
+		CurrentSizeScale = tool:GetAttribute("CurrentSizeScale"),
 	}
 
 	-- Add to PlayerProfileService inventory
@@ -724,7 +884,7 @@ local function perform(player, slime)
 	pcall(function() slime:Destroy() end)
 
 	-- Ensure visual exists for the tool (idempotent)
-	pcall(function() EnsureToolVisual(tool) end)
+	EnsureToolVisual(tool)
 
 	-- Persist immediately if configured
 	if CONFIG.ImmediateSave then
@@ -775,10 +935,15 @@ local function perform(player, slime)
 
 	return true, {
 		ToolName       = tool.Name,
+		DisplayName    = tool:GetAttribute("DisplayName"),
 		WeightPounds   = tool:GetAttribute("WeightPounds"),
 		CurrentValue   = tool:GetAttribute("CurrentValue"),
 		GrowthProgress = tool:GetAttribute("GrowthProgress"),
 		Rarity         = tool:GetAttribute("Rarity"),
+		SlimeType      = tool:GetAttribute("SlimeType"),
+		MaxSizeScale   = tool:GetAttribute("MaxSizeScale"),
+		StartSizeScale = tool:GetAttribute("StartSizeScale"),
+		CurrentSizeScale = tool:GetAttribute("CurrentSizeScale"),
 	}
 end
 

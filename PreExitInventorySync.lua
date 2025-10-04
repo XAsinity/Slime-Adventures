@@ -37,6 +37,26 @@ pcall(function()
 	PlayerProfileService = require(ModulesRoot:WaitForChild("PlayerProfileService"))
 end)
 
+local GrandInventorySerializer = nil
+local function getGrandInventorySanitizer()
+	if GrandInventorySerializer and GrandInventorySerializer._internal then
+		local fn = GrandInventorySerializer._internal.sanitizeInventoryOnProfile
+		if type(fn) == "function" then
+			return fn
+		end
+	end
+	return nil
+end
+
+do
+	local ok, mod = pcall(function()
+		return require(ModulesRoot:WaitForChild("GrandInventorySerializer"))
+	end)
+	if ok and type(mod) == "table" then
+		GrandInventorySerializer = mod
+	end
+end
+
 local SlimeCore = nil
 do
 	local inst = ModulesRoot:FindFirstChild("SlimeCore")
@@ -54,6 +74,22 @@ local function dprint(...)
 	else
 		print("[PreExitInventorySync]", ...)
 	end
+end
+
+local function awaitProfileQueue(userId, stage, timeoutSeconds)
+	if not PlayerProfileService or type(PlayerProfileService.AwaitSaveQueue) ~= "function" then
+		return false
+	end
+	local label = stage or ""
+	local ok, drained = pcall(function()
+		return PlayerProfileService.AwaitSaveQueue(userId, timeoutSeconds or 2.5)
+	end)
+	if ok and drained then
+		dprint(string.format("Awaited PlayerProfileService queue%s for userId=%s", label ~= "" and (" ["..label.."]") or "", tostring(userId)))
+	else
+		dprint(string.format("PlayerProfileService queue wait %s for userId=%s (ok=%s, drained=%s)", label ~= "" and ("["..label.."]") or "", tostring(userId), tostring(ok), tostring(drained)))
+	end
+	return ok and drained or false
 end
 
 local function deepCopy(src)
@@ -411,6 +447,15 @@ function PreExitInventorySync.Init()
 			local uid = player.UserId
 			dprint("PlayerRemoving for", player.Name, "userId=", uid)
 
+			-- Mark that PreExitInventorySync has taken ownership of the leave flow so other handlers can observe.
+			pcall(function()
+				if type(player.SetAttribute) == "function" then
+					player:SetAttribute("__PreExitInventorySyncActive", os.clock())
+				end
+			end)
+
+			awaitProfileQueue(uid, "pre-exit-begin", 2.5)
+
 			-- attempt to get in-memory profile
 			local profile = nil
 			local okProf, prof = pcall(function() return PlayerProfileService and PlayerProfileService.GetProfile and PlayerProfileService.GetProfile(uid) end)
@@ -485,6 +530,13 @@ function PreExitInventorySync.Init()
 
 				local otherMerged = merge_pre_exit_snapshot_into_profile(profile, payload)
 				if otherMerged then dprint("Merged additional snapshot fields for", uid) end
+
+				local sanitizeFn = getGrandInventorySanitizer()
+				if sanitizeFn then
+					pcall(function()
+						sanitizeFn(profile)
+					end)
+				end
 			else
 				dprint("No in-memory profile object found for", uid, "- will request save by uid")
 			end
@@ -512,11 +564,21 @@ function PreExitInventorySync.Init()
 				end)
 			end
 
+			awaitProfileQueue(uid, "post-update-profile", 2.5)
+
 			-- === PRE-SAVE PROTECTION: ensure profile.core.coins is present and not accidentally zeroed ===
 			-- Fetch canonical cached profile (may have been updated by InventoryService.UpdateProfileInventory)
 			local canonicalProfile = nil
 			pcall(function() canonicalProfile = PlayerProfileService and PlayerProfileService.GetProfile and PlayerProfileService.GetProfile(uid) end)
 			canonicalProfile = canonicalProfile or profile
+			if canonicalProfile then
+				local sanitizeFn = getGrandInventorySanitizer()
+				if sanitizeFn then
+					pcall(function()
+						sanitizeFn(canonicalProfile)
+					end)
+				end
+			end
 
 			-- If canonicalProfile exists, ensure core/coions exist. If missing/zero while authoritative GetCoins > 0, restore coins.
 			if canonicalProfile and type(canonicalProfile) == "table" then
@@ -581,10 +643,15 @@ function PreExitInventorySync.Init()
 				local okSaveNowAndWait, saveRes = pcall(function()
 					if PlayerProfileService and type(PlayerProfileService.SaveNowAndWait) == "function" then
 						dprint("Invoking PlayerProfileService.SaveNowAndWait for", numericId)
-						return PlayerProfileService.SaveNowAndWait(numericId, 4, true)
+						return PlayerProfileService.SaveNowAndWait(numericId, 4, {
+							verified = true,
+							reason = "PreExit",
+							failFast = true,
+							noFallback = true,
+						})
 					elseif PlayerProfileService and type(PlayerProfileService.ForceFullSaveNow) == "function" then
 						dprint("Invoking PlayerProfileService.ForceFullSaveNow for", numericId)
-						return PlayerProfileService.ForceFullSaveNow(numericId, "PreExitInventorySync_Verified")
+						return PlayerProfileService.ForceFullSaveNow(numericId, "PreExitInventorySync_Verified", { failFast = true, noFallback = true })
 					else
 						if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
 							dprint("Invoking PlayerProfileService.SaveNow (async fallback) for", numericId)
@@ -641,11 +708,27 @@ function PreExitInventorySync.Init()
 				end)
 			end
 
+			awaitProfileQueue(uid, "post-finalize", 3.0)
+
+			pcall(function()
+				if type(player.SetAttribute) == "function" then
+					player:SetAttribute("__PreExitInventorySyncActive", nil)
+					if saved then
+						player:SetAttribute("__PreExitInventorySyncFinalizedAt", os.clock())
+					end
+				end
+			end)
+
 			dprint("PreExitInventorySync persistence complete (saved="..tostring(saved)..") for userId=", numericId)
 		end)
 
 		if not ok then
 			warn("[PreExitInventorySync] PlayerRemoving handler error for", player and player.Name or "nil", err)
+			pcall(function()
+				if player and type(player.SetAttribute) == "function" then
+					player:SetAttribute("__PreExitInventorySyncActive", nil)
+				end
+			end)
 		end
 	end)
 end
