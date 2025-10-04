@@ -1018,7 +1018,7 @@ end)
 --------------------------------------------------------------------------------
 -- Public API
 --------------------------------------------------------------------------------
-function SlimeAI.Start(model, zonePart)
+function SlimeAI.Start(model, zonePart, spawnOverride)
 	local prim = ensurePrimary(model)
 	if not prim then
 		warn("[SlimeAI] Cannot start; no primary part.")
@@ -1047,8 +1047,55 @@ function SlimeAI.Start(model, zonePart)
 		pcall(function() prim:SetNetworkOwner(nil) end)
 	end
 
-	if not model:GetAttribute("SpawnPosition") then
-		model:SetAttribute("SpawnPosition", prim.Position)
+	local function coerceSpawnPosition(value)
+		if value == nil then return nil end
+		local valueType = typeof(value)
+		if valueType == "CFrame" then
+			return value.Position
+		elseif valueType == "Vector3" then
+			return value
+		elseif valueType == "Instance" then
+			local ok, pos = pcall(function()
+				if value:IsA("BasePart") then
+					return value.Position
+				end
+				return nil
+			end)
+			if ok then return pos end
+		elseif valueType == "table" then
+			local ok, pos = pcall(function()
+				if value.Position then return value.Position end
+				if value.x and value.y and value.z then return Vector3.new(value.x, value.y, value.z) end
+				if value.X and value.Y and value.Z then return Vector3.new(value.X, value.Y, value.Z) end
+				return nil
+			end)
+			if ok then return pos end
+		end
+		return nil
+	end
+
+	local function isFiniteVector(vec)
+		if typeof(vec) ~= "Vector3" then return false end
+		if vec.X ~= vec.X or vec.Y ~= vec.Y or vec.Z ~= vec.Z then return false end
+		if math.abs(vec.X) == math.huge or math.abs(vec.Y) == math.huge or math.abs(vec.Z) == math.huge then return false end
+		return true
+	end
+
+	local spawnPosition = coerceSpawnPosition(spawnOverride)
+	if spawnPosition == nil then
+		local attr = model:GetAttribute("SpawnPosition")
+		spawnPosition = coerceSpawnPosition(attr)
+	end
+	if spawnPosition == nil then
+		spawnPosition = prim.Position
+	elseif not isFiniteVector(spawnPosition) then
+		spawnPosition = prim.Position
+	end
+	model:SetAttribute("SpawnPosition", spawnPosition)
+	if typeof(zonePart) == "Instance" and zonePart:IsA("BasePart") then
+		pcall(function()
+			model:SetAttribute("ClampZoneName", zonePart:GetFullName())
+		end)
 	end
 
 	ACTIVE[model] = {
@@ -1056,7 +1103,7 @@ function SlimeAI.Start(model, zonePart)
 		Zone  = zonePart,
 		RNG   = Random.new(math.floor(os.clock()*1e6)%1e6),
 		State = "Idle",
-		SpawnPosition = model:GetAttribute("SpawnPosition"),
+		SpawnPosition = spawnPosition,
 		StartedAt = time(),
 		NextDecisionAt = time() + math.random(CONFIG.IdleMinTime*1000, CONFIG.IdleMaxTime*1000)/1000,
 		SplatActiveCount = 0,

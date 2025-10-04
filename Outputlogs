@@ -1,0 +1,737 @@
+initial join 
+ 
+
+  23:55:06.813  [InitGameServices] Created remote: FeedResult  -  Server - InitGameServices:18
+  23:55:06.813  [InitGameServices] Created BindableEvent: PersistInventoryRestored  -  Server - InitGameServices:18
+  23:55:06.825  [GrandInvSer] WorldSlimeService_fixed.lua loaded (dedupe + in-flight locks enabled).  -  Server - GrandInventorySerializer:88
+  23:55:06.825  [FoodSer] FoodTool section loaded (updated).  -  Server - GrandInventorySerializer:3821
+  23:55:06.825  [CapturedSlimeSer] CapturedSlime serializer section loaded (updated).  -  Server - GrandInventorySerializer:4891
+  23:55:06.830  [InitGameServices] Loaded module: PlayerProfileService  -  Server - InitGameServices:18
+  23:55:06.830  [InitGameServices] Loaded module: PlayerProfileServiceWrappers  -  Server - InitGameServices:18
+  23:55:06.836  [SlimeAI] SOURCE LOADED v1.3.3-fullfix-rp  -  Server - SlimeAI:26
+  23:55:06.837  [InitGameServices] Loaded module: PreExitInventorySync  -  Server - InitGameServices:18
+  23:55:06.837  [InitGameServices] Loaded module: GrandInventorySerializer  -  Server - InitGameServices:18
+  23:55:06.841  [InitGameServices] Loaded module: InventoryService  -  Server - InitGameServices:18
+  23:55:06.841  [InitGameServices] Loaded module: SlimeCore  -  Server - InitGameServices:18
+  23:55:06.842  [InitGameServices] Loaded module: PlotManager  -  Server - InitGameServices:18
+  23:55:06.845  [FoodService] FoodService module loaded (debug)  -  Server - FoodService:252
+  23:55:06.845  [InitGameServices] Loaded module: ShopService  -  Server - InitGameServices:18
+  23:55:06.848  [AnchorFolliage] Processed 1000 parts (anchored 0, already 1000)  -  Server
+  23:55:06.848  [AnchorFolliage] Processed 2000 parts (anchored 0, already 2000)  -  Server
+  23:55:06.849  [AnchorFolliage] Processed 3000 parts (anchored 0, already 3000)  -  Server
+  23:55:06.849  [AnchorFolliage] Processed 4000 parts (anchored 0, already 4000)  -  Server
+  23:55:06.850  [AnchorFolliage] Processed 5000 parts (anchored 7, already 4993)  -  Server
+  23:55:06.851  [AnchorFolliage] Processed 6000 parts (anchored 7, already 5993)  -  Server
+  23:55:06.851  [AnchorFolliage] Processed 7000 parts (anchored 7, already 6993)  -  Server
+  23:55:06.851  -------------------------------------------------------  -  Server
+  23:55:06.851  [AnchorFolliage] COMPLETE  -  Server
+  23:55:06.851  Folder: Workspace.Folliage  -  Server
+  23:55:06.852  Total BaseParts scanned : 7460  -  Server
+  23:55:06.852  Newly anchored          : 7  -  Server
+  23:55:06.852  Already anchored        : 7453  -  Server
+  23:55:06.852  Undo data collected     : true  -  Server
+  23:55:06.852  Dry run                 : false  -  Server
+  23:55:06.852  -------------------------------------------------------  -  Server
+  23:55:06.852  -- Undo snippet (run in command bar to revert):  -  Server
+  23:55:06.852  do
+  local list = _G.__FolliageAnchorUndo
+  if not list then warn("No undo data present.") return end
+  local restored=0
+  for _,rec in ipairs(list) do
+    local p = rec.ref
+    if p and p.Parent and p:IsA("BasePart") then
+      p.Anchored = rec.wasAnchored
+      restored += 1
+    end
+  end
+  print(string.format("[AnchorFolliage][Undo] Restored %d parts", restored))
+end
+  -  Server
+  23:55:06.852  [ChatGiveCash] Legacy hook installed.  -  Server - ChatGiveCash:17
+  23:55:06.853  [ChatGiveCash] No TextChannels folder (server).  -  Server - ChatGiveCash:17
+  23:55:06.853  [ChatGiveCash] ChatGiveCash minimal server script ready.  -  Server - ChatGiveCash:17
+  23:55:06.857  [GrandInvSer] UserId changed; registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:06.857  [GrandInvSer] UserId changed; registered plot=Workspace.Player2 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:06.857  [GrandInvSer] UserId changed; registered plot=Workspace.Player3 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:06.858  [GrandInvSer] UserId changed; registered plot=Workspace.Player4 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:06.858  [GrandInvSer] UserId changed; registered plot=Workspace.Player5 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:06.858  [GrandInvSer] UserId changed; registered plot=Workspace.Player6 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:55:07.110  [PlotManager][DEBUG] Assigned plot 'Player1' (Index=1) to player 'combatcollin65432' (UserId=52601646)  -  Server - PlotManager:377
+  23:55:07.111  [GrandInvSer] UserId changed; registered plot=Workspace.Player1 -> userId=52601646  -  Server - GrandInventorySerializer:88
+  23:55:07.111  [GrandInvSer] [processPendingForPlayer] start uid=52601646 name=combatcollin65432 pendingUidKeys=0 pendingNameKeys=0 pendingPidKeys=0  -  Server - GrandInventorySerializer:88
+  23:55:07.111  [GrandInvSer] [processPendingForPlayer] no pending queue for uid=52601646 (name=combatcollin65432) - nothing to do  -  Server - GrandInventorySerializer:88
+  23:55:07.176  [DEBUG] debug_food_owner_scan.lua initialized - equip a food tool to begin live scans.  -  Client - debug:190
+  23:55:07.679  [MusicVolumePersistence] Loaded volume 0 for 52601646  -  Server - MusicVolumePersistance:25
+  23:55:07.799  [GrandInvSer] [processPendingForPlayer] start uid=52601646 name=combatcollin65432 pendingUidKeys=0 pendingNameKeys=0 pendingPidKeys=0  -  Server - GrandInventorySerializer:88
+  23:55:07.799  [GrandInvSer] [processPendingForPlayer] no pending queue for uid=52601646 (name=combatcollin65432) - nothing to do  -  Server - GrandInventorySerializer:88
+  23:55:07.851  [MusicController] Initialized. Tracks in queue: 4  -  Client - MusicController:580
+  23:55:07.857  ---- SERVER REMOTE AUDIT (FeedSlime) ----  -  Server - RemoteAudit:6
+  23:55:07.861  [1] ReplicatedStorage.Remotes.FeedSlime  Class=RemoteEvent  Parent=Folder  -  Server - RemoteAudit:11
+  23:55:07.862  ---- END AUDIT ----  -  Server - RemoteAudit:17
+  23:55:07.862  [RemoteAudit] Stamped ServerGUID = 70b06f56-425e-461a-a81d-a6c3657c29e0 on ReplicatedStorage.Remotes.FeedSlime  -  Server - RemoteAudit:31
+  23:55:08.106  [InitGameServices] Required module FactionTotalsService  -  Server - InitGameServices:18
+  23:55:08.107  [InitGameServices] Required module EggHatchService  -  Server - InitGameServices:18
+  23:55:08.107  [InitGameServices] Required module EggRegistry  -  Server - InitGameServices:18
+  23:55:08.107  [InitGameServices] Required module CoreStatsService  -  Server - InitGameServices:18
+  23:55:08.107  [InitGameServices] Required module SlimeWeldFix  -  Server - InitGameServices:18
+  23:55:08.108  [InitGameServices] Required module SlimeTypeRegistry  -  Server - InitGameServices:18
+  23:55:08.111  [InitGameServices] Required module EggService  -  Server - InitGameServices:18
+  23:55:08.111  [InitGameServices] Required module GrandInventorySerializerEggWatcher  -  Server - InitGameServices:18
+  23:55:08.111  [InitGameServices] Required module SlimeAI  -  Server - InitGameServices:18
+  23:55:08.112  [InitGameServices] Required module GrandInventorySerializerPreExitHelpers  -  Server - InitGameServices:18
+  23:55:08.112  [InitGameServices] Required module DebugFlags  -  Server - InitGameServices:18
+  23:55:08.112  [InitGameServices] Required module TableUtil  -  Server - InitGameServices:18
+  23:55:08.112  [InitGameServices] Required module SizeRNG  -  Server - InitGameServices:18
+  23:55:08.113  [InitGameServices] Required module StagedToolManager  -  Server - InitGameServices:18
+  23:55:08.113  [InitGameServices] Required module WorldAssetCleanup  -  Server - InitGameServices:18
+  23:55:08.114  [FactionSlimeBuyerService] Remote binding active  -  Server - FactionSlimeBuyerService:626
+  23:55:08.114  [InitGameServices] Required module FactionSlimeBuyerService  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] Required module SlimeCaptureService  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] Required module EggConfig  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] Required module RNG  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] Required module FoodService  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] PlayerProfileServiceWrappers loaded early to protect saves.  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] PlotManager initialized early for persistence ordering.  -  Server - InitGameServices:18
+  23:55:08.115  [InitGameServices] PreExitInventorySync.Init() run very early (pre-inventory).  -  Server - InitGameServices:18
+  23:55:08.115  [InvSvc] Registered serializer 'GrandInventorySerializer' (Serialize=true, Restore=true)  -  Server - InventoryService:100
+  23:55:08.116  [InitGameServices] Registered GrandInventorySerializer (InventoryService.Init deferred).  -  Server - InitGameServices:18
+  23:55:08.116  [InitGameServices] Attached GrandInventorySerializer adapter to PlayerProfileService.GrandInventory  -  Server - InitGameServices:18
+  23:55:08.116  [PlotManager][DEBUG] Assigned plot 'Player1' (Index=1) to player 'combatcollin65432' (UserId=52601646)  -  Server - PlotManager:377
+  23:55:08.116  [EggService] SlimeCore.Init() called  -  Server - EggService:188
+  23:55:08.116  [GrowthPersist] Initialized (decoupled).  -  Server - SlimeCore:2311
+  23:55:08.117  [EggService] SlimeCore.GrowthPersistenceService initialized with orchestrator  -  Server - EggService:188
+  23:55:08.117  [EggService] v4.0.0-placement-cap-snapshot-purge-stable Manual=true AutoHatch=false Cap=3 Snapshot=true Purge=true Debug=true  -  Server - EggService:2569
+  23:55:08.117  [InitGameServices] Initialized EggService.  -  Server - InitGameServices:18
+  23:55:08.117  [WorldAssetCleanup] Initialized (DestroyOnLeave=true, FinalDelay=0.08, Grace=2.5)  -  Server - WorldAssetCleanup:32
+  23:55:08.117  [InitGameServices] Initialized WorldAssetCleanup.  -  Server - InitGameServices:18
+  23:55:08.118  [ShopService] Initialized OK (Module).  -  Server - ShopService:90
+  23:55:08.118  [InitGameServices] Initialized ShopService.  -  Server - InitGameServices:18
+  23:55:08.118  [CoreStats] Init complete (PlayerProfileService integration)  -  Server - CoreStatsService:28
+  23:55:08.118  [InitGameServices] Initialized CoreStatsService.  -  Server - InitGameServices:18
+  23:55:08.118  [InitGameServices] Initialized SlimeCore.  -  Server - InitGameServices:18
+  23:55:08.119  [InitGameServices] Initialized PreExitInventorySync.  -  Server - InitGameServices:18
+  23:55:08.158  Inventory Update:  ▶ {...}  -  Client - dialogScript:93
+  23:55:08.179  ---- DEBUG: Listing Tools in Backpack and Character ----  -  Client - LocalScript:13
+  23:55:08.179  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:55:08.182  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:55:08.183  ---- DEBUG: Probe complete. Now equip a food tool and watch Client Output for equip-time logs ----  -  Client - LocalScript:146
+  23:55:10.121  [EggService] AdoptExistingEggs complete adopted=0  -  Server - EggService:188
+  23:55:14.193  [GrandInvSer] [Restore][RawArgs] a1=table(keys=0 sample=inventory,dataVersion,extra,userId,core,schemaVersion) a2=table(keys=0 sample=ws,et,ft,cs,we,)  -  Server - GrandInventorySerializer:88
+  23:55:14.193  [GrandInvSer] payload counts - ws=2 we=1 et=0 ft=1 cs=3  -  Server - GrandInventorySerializer:88
+  23:55:14.193  [GrandInvSer] [Restore][Sample] we[1..2]=table: 0x15c78530c46fbab0,<nil>  -  Server - GrandInventorySerializer:88
+  23:55:14.202  [WS_DBG captureOriginalData(SlimeCore)] model= Slime primary= Inner  -  Server - SlimeCore:713
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= Outer OriginalRelOffset= 0.0999755859375, 0.1999969482421875, -0.031005859375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= EyeRod OriginalRelOffset= 0.5, 0.35001373291015625, 1.4500732421875 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= TopRightBall OriginalRelOffset= 0.5, 1.1499977111816406, 1.45013427734375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= BottomRightBall OriginalRelOffset= 0.5, -0.4499931335449219, 1.449951171875 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= EyeRod OriginalRelOffset= -0.5, 0.350006103515625, 1.45947265625 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= TopLeftBall OriginalRelOffset= -0.5, 1.1500129699707031, 1.45941162109375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.202  [WS_DBG captureOriginalData] SlimeId= 0d809210-e159-4ae6-adb9-44660b4d8a8c part= BottomLeftBall OriginalRelOffset= -0.5, -0.4499855041503906, 1.45941162109375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.221  [GrandInvSer] ws_restore: new slime id=0d809210-e159-4ae6-adb9-44660b4d8a8c targetCF=-605.89, 60.21, 592.28 parent=Workspace.Player1 origin=<nil> local=(nil,nil,nil) abs=(-605.8896484375,60.21318435668945,592.2787475585938)  -  Server - GrandInventorySerializer:88
+  23:55:14.221  [GrandInvSer] ws_restore: enforcePivot[new-immediate] -> -605.890, 60.213, 592.279  -  Server - GrandInventorySerializer:88
+  23:55:14.221  [GrandInvSer] ws_restore: new slime id=0d809210-e159-4ae6-adb9-44660b4d8a8c preStart pivot=-605.890, 60.213, 592.279 spawn=-605.890, 60.213, 592.279  -  Server - GrandInventorySerializer:88
+  23:55:14.221  [SlimeAI] Start called for slimeId=0d809210-e159-4ae6-adb9-44660b4d8a8c  -  Server - SlimeAI:1114
+  23:55:14.221  [GrandInvSer] ws_restore: new slime id=0d809210-e159-4ae6-adb9-44660b4d8a8c finalized at -605.890, 60.213, 592.279 parent=Workspace.Player1 spawn=-605.890, 60.213, 592.279  -  Server - GrandInventorySerializer:88
+  23:55:14.229  [WS_DBG captureOriginalData(SlimeCore)] model= Slime primary= Inner  -  Server - SlimeCore:713
+  23:55:14.229  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= Outer OriginalRelOffset= 0.0999755859375, 0.1999969482421875, -0.031005859375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.229  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= EyeRod OriginalRelOffset= 0.5, 0.35001373291015625, 1.4500732421875 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.229  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= TopRightBall OriginalRelOffset= 0.5, 1.1499977111816406, 1.45013427734375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.229  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= BottomRightBall OriginalRelOffset= 0.5, -0.4499931335449219, 1.449951171875 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.230  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= EyeRod OriginalRelOffset= -0.5, 0.350006103515625, 1.45947265625 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.230  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= TopLeftBall OriginalRelOffset= -0.5, 1.1500129699707031, 1.45941162109375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.230  [WS_DBG captureOriginalData] SlimeId= bb22a811-837e-4475-8ad8-e5392afaef4c part= BottomLeftBall OriginalRelOffset= -0.5, -0.4499855041503906, 1.45941162109375 OriginalRelYaw= 0  -  Server - SlimeCore:736
+  23:55:14.231  [GrandInvSer] ws_restore: enforcePivot[new-deferred] -> -605.890, 60.213, 592.279  -  Server - GrandInventorySerializer:88
+  23:55:14.243  [GrandInvSer] ws_restore: new slime id=bb22a811-837e-4475-8ad8-e5392afaef4c targetCF=-619.89, 60.21, 579.90 parent=Workspace.Player1 origin=<nil> local=(nil,nil,nil) abs=(-619.8915405273438,60.21318435668945,579.9013061523438)  -  Server - GrandInventorySerializer:88
+  23:55:14.244  [GrandInvSer] ws_restore: enforcePivot[new-immediate] -> -619.892, 60.213, 579.901  -  Server - GrandInventorySerializer:88
+  23:55:14.244  [GrandInvSer] ws_restore: new slime id=bb22a811-837e-4475-8ad8-e5392afaef4c preStart pivot=-619.892, 60.213, 579.901 spawn=-619.892, 60.213, 579.901  -  Server - GrandInventorySerializer:88
+  23:55:14.244  [SlimeAI] Start called for slimeId=bb22a811-837e-4475-8ad8-e5392afaef4c  -  Server - SlimeAI:1114
+  23:55:14.244  [GrandInvSer] ws_restore: new slime id=bb22a811-837e-4475-8ad8-e5392afaef4c finalized at -619.892, 60.213, 579.901 parent=Workspace.Player1 spawn=-619.892, 60.213, 579.901  -  Server - GrandInventorySerializer:88
+  23:55:14.246  [GrandInvSer] Scheduling we_restore_by_userid for uid=52601646 entries=1 (pid=nil)  -  Server - GrandInventorySerializer:88
+  23:55:14.247  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:14.249  [GrandInvSer] Created egg id=7ad99157-ec64-47c5-af94-21077ea42a0e for userId=52601646 parent=Workspace.Player1  -  Server - GrandInventorySerializer:88
+  23:55:14.249  [EggService] PushSnapshot exporting count=1  -  Server - EggService:188
+  23:55:14.250  [EggService] RegisterEgg eggId=7ad99157-ec64-47c5-af94-21077ea42a0e owner=52601646 placed=1/3 hatchIn=0.0s  -  Server - EggService:188
+  23:55:14.250  [EggService] PushSnapshot exporting count=1  -  Server - EggService:188
+  23:55:14.250  [GrandInvSer] GrandInvSer: EggService.RestoreEggSnapshot invoked for uid=52601646 entries=1  -  Server - GrandInventorySerializer:88
+  23:55:14.250  [GrandInvSer] Scheduling cs restore under pendingRestores[52601646] entries=3  -  Server - GrandInventorySerializer:88
+  23:55:14.250  [CapturedSlimeSer] cs_restoreImmediate entries=3 for player=combatcollin65432  -  Server - GrandInventorySerializer:4891
+  23:55:14.250  [CapturedSlimeSer] Built visual for tool: CapturedSlimeTool SlimeId= 12698be9-7d14-4457-92bb-fc0f6d4c0382  -  Server - GrandInventorySerializer:4891
+  23:55:14.251  [CapturedSlimeSer] Built visual for tool: CapturedSlimeTool SlimeId= c45c02ec-76fd-4cd2-8e61-7a71d681fc5f  -  Server - GrandInventorySerializer:4891
+  23:55:14.252  [CapturedSlimeSer] Built visual for tool: CapturedSlimeTool SlimeId= 97cb353d-8efb-4f15-8e2c-e6db71ccbc2d  -  Server - GrandInventorySerializer:4891
+  23:55:14.252  [GrandInvSer] cs_restoreImmediate applied for online uid=52601646  -  Server - GrandInventorySerializer:88
+  23:55:14.252  [GrandInvSer] Scheduling ft restore under pendingRestores[52601646] entries=1 (pid=nil)  -  Server - GrandInventorySerializer:88
+  23:55:14.252  [FoodSer] entries=1 batch=1  -  Server - GrandInventorySerializer:3821
+  23:55:14.252  [FoodSer] ft_buildTool: instanced empty Tool for BasicFood  -  Server - GrandInventorySerializer:3821
+  23:55:14.253  [FoodSer] ft_buildTool: cloned visuals from template BasicFood  -  Server - GrandInventorySerializer:3821
+  23:55:14.253  [FoodSer] [FoodSer][RestoreImmediate] Tool created and parented to Backpack: Basic Food 1  -  Server - GrandInventorySerializer:3821
+  23:55:14.253  [GrandInvSer] ft_restoreImmediate applied for online uid=52601646  -  Server - GrandInventorySerializer:88
+  23:55:14.253  [GrandInvSer] Applied payload.ws -> profile.inventory.worldSlimes  -  Server - GrandInventorySerializer:88
+  23:55:14.253  [GrandInvSer] [Profile][AfterRestore] for 52601646 - eggTools=0 foodTools=1 worldEggs=1 worldSlimes=2 capturedSlimes=3 persistentId=5ad78569-80bb-4a52-8b93-06dbc7534b65  -  Server - GrandInventorySerializer:88
+  23:55:14.253  [InvRestore] combatcollin65432 field=eggTools count=0 (initial)  -  Server - InventoryService:1661
+  23:55:14.254  [InvRestore] combatcollin65432 field=capturedSlimes count=3 (initial)  -  Server - InventoryService:1661
+  23:55:14.254  [InvRestore] combatcollin65432 field=worldSlimes count=2 (initial)  -  Server - InventoryService:1661
+  23:55:14.255  [InvRestore] combatcollin65432 field=foodTools count=1 (initial)  -  Server - InventoryService:1661
+  23:55:14.255  [InvRestore] Completed for combatcollin65432  -  Server - InventoryService:1666
+  23:55:14.255  [GrowthPersist] Initialized (decoupled).  -  Server - SlimeCore:2311
+  23:55:14.258  [InvSvc] InventoryService v3.1.3-grand-unified-support initialized AutoPeriodic=true Interval=5s Serializers=1  -  Server - InventoryService:3179
+  23:55:14.258  [InitGameServices] Initialized InventoryService.  -  Server - InitGameServices:18
+  23:55:14.258  [InitGameServices] Initialized PlotManager.  -  Server - InitGameServices:18
+  23:55:14.258  [InitGameServices] Game services ready signal fired.  -  Server - InitGameServices:18
+  23:55:14.258  [InitGameServices] InventoryService initialized (deferred init).  -  Server - InitGameServices:18
+  23:55:14.258  [InitGameServices] Initialization sequence complete.  -  Server - InitGameServices:18
+  23:55:14.259  [GrandInvSer] ws_restore: enforcePivot[new-deferred] -> -619.892, 60.213, 579.901  -  Server - GrandInventorySerializer:88
+  23:55:14.259  [EggService][Debug] destroyEggModel called for: Egg EggId: 7ad99157-ec64-47c5-af94-21077ea42a0e Reason: DedupeLater Parent: Player1  -  Server - EggService:1365
+  23:55:14.259  [EggService] [Purge] Destroy egg EggId=7ad99157-ec64-47c5-af94-21077ea42a0e reason=DedupeLater path=Workspace.Player1.Egg  -  Server - EggService:188
+  23:55:14.286   ▶ DEBUG: hooking tool events for Players.combatcollin65432.Backpack.CapturedSlimeTool (x3)  -  Client - LocalScript:109
+  23:55:14.287  DEBUG: hooking tool events for Players.combatcollin65432.Backpack.Basic Food 1  -  Client - LocalScript:109
+  23:55:14.756  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@0.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [GrandInvSer] [CS Debug] attrs@0.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"0f572249-63a9-480d-a6bd-b43c965747b4","PreserveOnServer":true,"SlimeId":"12698be9-7d14-4457-92bb-fc0f6d4c0382","SlimeItem":true,"ToolUid":"0f572249-63a9-480d-a6bd-b43c965747b4","RestoreStamp":1759445713.3945058}  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@0.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [GrandInvSer] [CS Debug] attrs@0.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"154fbc53-35fe-4349-a18f-c89a9a955d94","PreserveOnServer":true,"SlimeId":"c45c02ec-76fd-4cd2-8e61-7a71d681fc5f","SlimeItem":true,"ToolUid":"154fbc53-35fe-4349-a18f-c89a9a955d94","RestoreStamp":1759445713.3951736}  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@0.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [GrandInvSer] [CS Debug] attrs@0.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"b1465a35-5a53-41e5-b094-f3e5e4ed9451","PreserveOnServer":true,"SlimeId":"97cb353d-8efb-4f15-8e2c-e6db71ccbc2d","SlimeItem":true,"ToolUid":"b1465a35-5a53-41e5-b094-f3e5e4ed9451","RestoreStamp":1759445713.395748}  -  Server - GrandInventorySerializer:88
+  23:55:14.757  [FoodSer] [FT Debug] Basic Food 1 parent@0.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:3821
+  23:55:14.757  [FoodSer] [FT Debug] attrs@0.5s: {"ToolUniqueId":"e79370ab-c1f7-48f9-b21e-6e4b618d0fc6","ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"FoodId":"BasicFood","PreserveOnServer":true,"ToolUid":"e79370ab-c1f7-48f9-b21e-6e4b618d0fc6","RestoreStamp":1759445713.3968428}  -  Server - GrandInventorySerializer:3821
+  23:55:15.258  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:15.260  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:15  -  Server - GrandInventorySerializer:6194
+  23:55:15.261  [InvSerialize][176fffe9-f45a-469d-a9e3-9901b04a4ee4] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:15.261  [InvSerialize][176fffe9-f45a-469d-a9e3-9901b04a4ee4] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:15.261  [InvSerialize][176fffe9-f45a-469d-a9e3-9901b04a4ee4] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:15.262  [InvSerialize][176fffe9-f45a-469d-a9e3-9901b04a4ee4] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:15.262  [InvSerialize][176fffe9-f45a-469d-a9e3-9901b04a4ee4] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:15.755  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@1.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:15.755  [GrandInvSer] [CS Debug] attrs@1.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"0f572249-63a9-480d-a6bd-b43c965747b4","PreserveOnServer":true,"SlimeId":"12698be9-7d14-4457-92bb-fc0f6d4c0382","SlimeItem":true,"ToolUid":"0f572249-63a9-480d-a6bd-b43c965747b4","RestoreStamp":1759445713.3945058}  -  Server - GrandInventorySerializer:88
+  23:55:15.755  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@1.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:15.756  [GrandInvSer] [CS Debug] attrs@1.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"154fbc53-35fe-4349-a18f-c89a9a955d94","PreserveOnServer":true,"SlimeId":"c45c02ec-76fd-4cd2-8e61-7a71d681fc5f","SlimeItem":true,"ToolUid":"154fbc53-35fe-4349-a18f-c89a9a955d94","RestoreStamp":1759445713.3951736}  -  Server - GrandInventorySerializer:88
+  23:55:15.756  [GrandInvSer] [CS Debug] CapturedSlimeTool parent@1.5s = Players.combatcollin65432.Backpack  -  Server - GrandInventorySerializer:88
+  23:55:15.756  [GrandInvSer] [CS Debug] attrs@1.5s: {"ServerRestore":true,"OwnerUserId":52601646,"RecentlyPlacedSaved":1759474514,"ToolUniqueId":"b1465a35-5a53-41e5-b094-f3e5e4ed9451","PreserveOnServer":true,"SlimeId":"97cb353d-8efb-4f15-8e2c-e6db71ccbc2d","SlimeItem":true,"ToolUid":"b1465a35-5a53-41e5-b094-f3e5e4ed9451","RestoreStamp":1759445713.395748}  -  Server - GrandInventorySerializer:88
+  23:55:16.119  [GrowthPersist] Periodic stamp: scanned 2 slime models.  -  Server - SlimeCore:2311
+  23:55:20.008  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:55:20.008  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:55:20.012   ▶ [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.01s < 2.50s) (x2)  -  Server - SlimeCore:2311
+  23:55:20.279  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:20.281  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:20  -  Server - GrandInventorySerializer:6194
+  23:55:20.282  [InvSerialize][dc618128-3b5b-4f9a-a113-2a4a5b21303b] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:20.282  [InvSerialize][dc618128-3b5b-4f9a-a113-2a4a5b21303b] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:20.282  [InvSerialize][dc618128-3b5b-4f9a-a113-2a4a5b21303b] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:20.283  [InvSerialize][dc618128-3b5b-4f9a-a113-2a4a5b21303b] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:20.283  [InvSerialize][dc618128-3b5b-4f9a-a113-2a4a5b21303b] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:25.293  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:25.295  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:25  -  Server - GrandInventorySerializer:6194
+  23:55:25.296  [InvSerialize][991a3c8a-42c4-4f8f-a1b3-ac516259c34a] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:25.296  [InvSerialize][991a3c8a-42c4-4f8f-a1b3-ac516259c34a] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:25.296  [InvSerialize][991a3c8a-42c4-4f8f-a1b3-ac516259c34a] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:25.297  [InvSerialize][991a3c8a-42c4-4f8f-a1b3-ac516259c34a] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:25.297  [InvSerialize][991a3c8a-42c4-4f8f-a1b3-ac516259c34a] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:30.005  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:55:30.005  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:55:30.313  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:30.315  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:30  -  Server - GrandInventorySerializer:6194
+  23:55:30.316  [InvSerialize][261648b2-d7f2-49da-9a53-462225d2de2e] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:30.316  [InvSerialize][261648b2-d7f2-49da-9a53-462225d2de2e] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:30.316  [InvSerialize][261648b2-d7f2-49da-9a53-462225d2de2e] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:30.317  [InvSerialize][261648b2-d7f2-49da-9a53-462225d2de2e] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:30.317  [InvSerialize][261648b2-d7f2-49da-9a53-462225d2de2e] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:35.331  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:35.333  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:35  -  Server - GrandInventorySerializer:6194
+  23:55:35.334  [InvSerialize][8286757e-180c-4291-9b1b-ddfb3de5c876] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:35.334  [InvSerialize][8286757e-180c-4291-9b1b-ddfb3de5c876] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:35.334  [InvSerialize][8286757e-180c-4291-9b1b-ddfb3de5c876] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:35.335  [InvSerialize][8286757e-180c-4291-9b1b-ddfb3de5c876] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:35.335  [InvSerialize][8286757e-180c-4291-9b1b-ddfb3de5c876] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:35.894  GuiService:AddSelectionParent already has selection group with name PlayerlistGuiSelection, overwriting selection group.  -  Studio
+  23:55:40.004  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:55:40.004  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:55:40.350  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:40.352  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:40  -  Server - GrandInventorySerializer:6194
+  23:55:40.353  [InvSerialize][841a95a6-5623-4632-a2eb-24eebc816249] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:40.353  [InvSerialize][841a95a6-5623-4632-a2eb-24eebc816249] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:40.353  [InvSerialize][841a95a6-5623-4632-a2eb-24eebc816249] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:40.354  [InvSerialize][841a95a6-5623-4632-a2eb-24eebc816249] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:40.354  [InvSerialize][841a95a6-5623-4632-a2eb-24eebc816249] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:45.365  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:45.367  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:45  -  Server - GrandInventorySerializer:6194
+  23:55:45.368  [InvSerialize][4437eee6-057a-4fa2-8a24-6ba2e5e2e9c6] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:45.368  [InvSerialize][4437eee6-057a-4fa2-8a24-6ba2e5e2e9c6] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:45.369  [InvSerialize][4437eee6-057a-4fa2-8a24-6ba2e5e2e9c6] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:45.369  [InvSerialize][4437eee6-057a-4fa2-8a24-6ba2e5e2e9c6] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:45.369  [InvSerialize][4437eee6-057a-4fa2-8a24-6ba2e5e2e9c6] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:50.004  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:55:50.004  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:55:50.386  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:50.395  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:50  -  Server - GrandInventorySerializer:6194
+  23:55:50.396  [InvSerialize][6cb862a2-ff67-4d55-9c47-84b1cecba6eb] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:50.396  [InvSerialize][6cb862a2-ff67-4d55-9c47-84b1cecba6eb] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:50.396  [InvSerialize][6cb862a2-ff67-4d55-9c47-84b1cecba6eb] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:50.397  [InvSerialize][6cb862a2-ff67-4d55-9c47-84b1cecba6eb] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:50.397  [InvSerialize][6cb862a2-ff67-4d55-9c47-84b1cecba6eb] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:55.414  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:55:55.416  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:55:55  -  Server - GrandInventorySerializer:6194
+  23:55:55.417  [InvSerialize][5b08d9ee-9535-4f5e-9456-0c059ff98c97] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:55:55.417  [InvSerialize][5b08d9ee-9535-4f5e-9456-0c059ff98c97] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:55:55.417  [InvSerialize][5b08d9ee-9535-4f5e-9456-0c059ff98c97] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:55.418  [InvSerialize][5b08d9ee-9535-4f5e-9456-0c059ff98c97] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:55:55.418  [InvSerialize][5b08d9ee-9535-4f5e-9456-0c059ff98c97] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:55:56.431  Font family Comic Neue Angular failed to load: Temp read failed.  -  Studio
+  23:55:59.497  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.Basic Food 1 parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:55:59.498  ---- DEBUG: Resolved FoodDefinition for tool Basic Food 1  -  Client - LocalScript:86
+  23:55:59.498    AutoFeedCooldown = 1  -  Client - LocalScript:98
+  23:55:59.498    Charges = 1  -  Client - LocalScript:98
+  23:55:59.498    Rarity = Common  -  Client - LocalScript:98
+  23:55:59.498    FeedBufferBonus = 15  -  Client - LocalScript:98
+  23:55:59.498    Label = Basic Food  -  Client - LocalScript:98
+  23:55:59.498    ClientPromptRadius = 25  -  Client - LocalScript:98
+  23:55:59.498    AutoFeedNearby = false  -  Client - LocalScript:98
+  23:55:59.498    FullnessHideThreshold = 0.999  -  Client - LocalScript:98
+  23:55:59.499    RestoreFraction = 0.25  -  Client - LocalScript:98
+  23:55:59.499    Consumable = true  -  Client - LocalScript:98
+  23:55:59.499    VisualModel = SlimeFoodBasic  -  Client - LocalScript:98
+  23:55:59.499    ClientRemoveRadius = 10  -  Client - LocalScript:98
+  23:55:59.499    OnlyWhenNotFull = false  -  Client - LocalScript:98
+  23:55:59.499    RequireOwnership = false  -  Client - LocalScript:98
+  23:55:59.499    ClientActivationRadius = 10  -  Client - LocalScript:98
+  23:55:59.499    ShowFullnessPercent = false  -  Client - LocalScript:98
+  23:55:59.499  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:55:59.504  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=11.46  -  Client - LocalScript:72
+  23:55:59.504  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=7.70  -  Client - LocalScript:72
+  23:55:59.504  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:00.005  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:00.005  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:00.436  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:00.438  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:00  -  Server - GrandInventorySerializer:6194
+  23:56:00.439  [InvSerialize][fa0f74c1-59a5-4232-ac15-aa60b1b02905] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:00.439  [InvSerialize][fa0f74c1-59a5-4232-ac15-aa60b1b02905] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:00.439  [InvSerialize][fa0f74c1-59a5-4232-ac15-aa60b1b02905] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:00.440  [InvSerialize][fa0f74c1-59a5-4232-ac15-aa60b1b02905] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:00.440  [InvSerialize][fa0f74c1-59a5-4232-ac15-aa60b1b02905] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:02.272  [GrowthPersist] Periodic stamp: scanned 2 slime models.  -  Server - SlimeCore:2311
+  23:56:04.786  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.Basic Food 1  -  Client - LocalScript:120
+  23:56:05.445  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:05.448  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:05  -  Server - GrandInventorySerializer:6194
+  23:56:05.448  [InvSerialize][535c43fd-1ed6-4fc6-80a5-6352b3cd6067] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:05.449  [InvSerialize][535c43fd-1ed6-4fc6-80a5-6352b3cd6067] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:05.449  [InvSerialize][535c43fd-1ed6-4fc6-80a5-6352b3cd6067] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:05.450  [InvSerialize][535c43fd-1ed6-4fc6-80a5-6352b3cd6067] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:05.450  [InvSerialize][535c43fd-1ed6-4fc6-80a5-6352b3cd6067] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:10.004  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:10.005  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:10.463  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:10.465  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:10  -  Server - GrandInventorySerializer:6194
+  23:56:10.466  [InvSerialize][7d3ef3d6-ebcd-4e60-ac72-b1ac5e739286] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:10.466  [InvSerialize][7d3ef3d6-ebcd-4e60-ac72-b1ac5e739286] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:10.466  [InvSerialize][7d3ef3d6-ebcd-4e60-ac72-b1ac5e739286] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:10.467  [InvSerialize][7d3ef3d6-ebcd-4e60-ac72-b1ac5e739286] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:10.467  [InvSerialize][7d3ef3d6-ebcd-4e60-ac72-b1ac5e739286] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:13.363  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.Basic Food 1 parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:13.364  ---- DEBUG: Resolved FoodDefinition for tool Basic Food 1  -  Client - LocalScript:86
+  23:56:13.364    AutoFeedCooldown = 1  -  Client - LocalScript:98
+  23:56:13.364    Charges = 1  -  Client - LocalScript:98
+  23:56:13.364    Rarity = Common  -  Client - LocalScript:98
+  23:56:13.364    FeedBufferBonus = 15  -  Client - LocalScript:98
+  23:56:13.364    Label = Basic Food  -  Client - LocalScript:98
+  23:56:13.364    ClientPromptRadius = 25  -  Client - LocalScript:98
+  23:56:13.364    AutoFeedNearby = false  -  Client - LocalScript:98
+  23:56:13.364    FullnessHideThreshold = 0.999  -  Client - LocalScript:98
+  23:56:13.364    RestoreFraction = 0.25  -  Client - LocalScript:98
+  23:56:13.365    Consumable = true  -  Client - LocalScript:98
+  23:56:13.365    VisualModel = SlimeFoodBasic  -  Client - LocalScript:98
+  23:56:13.365    ClientRemoveRadius = 10  -  Client - LocalScript:98
+  23:56:13.365    OnlyWhenNotFull = false  -  Client - LocalScript:98
+  23:56:13.365    RequireOwnership = false  -  Client - LocalScript:98
+  23:56:13.365    ClientActivationRadius = 10  -  Client - LocalScript:98
+  23:56:13.365    ShowFullnessPercent = false  -  Client - LocalScript:98
+  23:56:13.365  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:13.370  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=30.93  -  Client - LocalScript:72
+  23:56:13.370  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=38.41  -  Client - LocalScript:72
+  23:56:13.370  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:15.479  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:15.481  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:15  -  Server - GrandInventorySerializer:6194
+  23:56:15.481  [InvSerialize][77b5144e-f027-4134-9a52-df4baefb0722] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:15.481  [InvSerialize][77b5144e-f027-4134-9a52-df4baefb0722] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:15.481  [InvSerialize][77b5144e-f027-4134-9a52-df4baefb0722] combatcollin65432 field=foodTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:15.482  [InvSerialize][77b5144e-f027-4134-9a52-df4baefb0722] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:15.482  [InvSerialize][77b5144e-f027-4134-9a52-df4baefb0722] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:15.760  [DebugFeedEcho] Remote arrived pl= combatcollin65432  slime= Slime  tool= Basic Food 1  slimeIsModel= true  -  Server - DebugFeedEcho:6
+  23:56:15.760  [FeedRemoteHandler] FeedSlime from combatcollin65432  -  Server - FeedLogger:20
+  23:56:15.761  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_InventoryService_Verified  -  Server - PlayerProfileService:68
+  23:56:15.777  DEBUG: Tool UNEQUIPPED (client): Basic Food 1  -  Client - LocalScript:120
+  23:56:16.486  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:16.488  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:16  -  Server - GrandInventorySerializer:6194
+  23:56:16.488  [InvSerialize][cb8cfd36-3a2d-4f98-aa75-e31689415cac] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:16.489  [InvSerialize][cb8cfd36-3a2d-4f98-aa75-e31689415cac] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:16.489  [InvSerialize][cb8cfd36-3a2d-4f98-aa75-e31689415cac] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:16.489  [InvSerialize][cb8cfd36-3a2d-4f98-aa75-e31689415cac] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:16.490  [InvSerialize][cb8cfd36-3a2d-4f98-aa75-e31689415cac] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:17.937  [FoodService] Feed combatcollin65432 Food=BasicFood +25% (0.00->0.25) consumed=true  -  Server - FoodService:252
+  23:56:20.007  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:20.007  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:21.502  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:21.504  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:21  -  Server - GrandInventorySerializer:6194
+  23:56:21.505  [InvSerialize][b774acf4-52d5-4a86-8ff7-3c9c7d65985a] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:21.505  [InvSerialize][b774acf4-52d5-4a86-8ff7-3c9c7d65985a] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:21.505  [InvSerialize][b774acf4-52d5-4a86-8ff7-3c9c7d65985a] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:21.506  [InvSerialize][b774acf4-52d5-4a86-8ff7-3c9c7d65985a] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:21.506  [InvSerialize][b774acf4-52d5-4a86-8ff7-3c9c7d65985a] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:26.523  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:26.527  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:26  -  Server - GrandInventorySerializer:6194
+  23:56:26.527  [InvSerialize][e6f76284-8092-4a76-bffa-5074cbb95d94] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:26.527  [InvSerialize][e6f76284-8092-4a76-bffa-5074cbb95d94] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:26.528  [InvSerialize][e6f76284-8092-4a76-bffa-5074cbb95d94] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:26.528  [InvSerialize][e6f76284-8092-4a76-bffa-5074cbb95d94] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:26.528  [InvSerialize][e6f76284-8092-4a76-bffa-5074cbb95d94] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:30.004  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:30.004  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:31.545  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:31.547  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:31  -  Server - GrandInventorySerializer:6194
+  23:56:31.547  [InvSerialize][8dea2140-c9e0-43e1-a561-1061c2e9144d] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:31.548  [InvSerialize][8dea2140-c9e0-43e1-a561-1061c2e9144d] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:31.548  [InvSerialize][8dea2140-c9e0-43e1-a561-1061c2e9144d] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:31.548  [InvSerialize][8dea2140-c9e0-43e1-a561-1061c2e9144d] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:31.549  [InvSerialize][8dea2140-c9e0-43e1-a561-1061c2e9144d] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:36.562  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:36.564  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:36  -  Server - GrandInventorySerializer:6194
+  23:56:36.565  [InvSerialize][40f8d0eb-9654-422b-8872-45f6272fd788] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:36.565  [InvSerialize][40f8d0eb-9654-422b-8872-45f6272fd788] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:36.565  [InvSerialize][40f8d0eb-9654-422b-8872-45f6272fd788] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:36.566  [InvSerialize][40f8d0eb-9654-422b-8872-45f6272fd788] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:36.566  [InvSerialize][40f8d0eb-9654-422b-8872-45f6272fd788] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:40.003  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:40.003  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:41.579  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:41.583  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:41  -  Server - GrandInventorySerializer:6194
+  23:56:41.584  [InvSerialize][ee0b95ea-96c0-439b-aa57-c7aa8a081ea0] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:41.584  [InvSerialize][ee0b95ea-96c0-439b-aa57-c7aa8a081ea0] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:41.584  [InvSerialize][ee0b95ea-96c0-439b-aa57-c7aa8a081ea0] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:41.585  [InvSerialize][ee0b95ea-96c0-439b-aa57-c7aa8a081ea0] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:41.585  [InvSerialize][ee0b95ea-96c0-439b-aa57-c7aa8a081ea0] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:46.595  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:46.597  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:46  -  Server - GrandInventorySerializer:6194
+  23:56:46.598  [InvSerialize][d7d5f161-e14d-47a0-88d1-94f49be258dd] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:46.598  [InvSerialize][d7d5f161-e14d-47a0-88d1-94f49be258dd] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:46.598  [InvSerialize][d7d5f161-e14d-47a0-88d1-94f49be258dd] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:46.599  [InvSerialize][d7d5f161-e14d-47a0-88d1-94f49be258dd] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:46.599  [InvSerialize][d7d5f161-e14d-47a0-88d1-94f49be258dd] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:50.005  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:56:50.006  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:56:50.288  [GrowthPersist] Periodic stamp: scanned 2 slime models.  -  Server - SlimeCore:2311
+  23:56:51.614  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:51.618  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:51  -  Server - GrandInventorySerializer:6194
+  23:56:51.619  [InvSerialize][66c1ac01-b228-4fbf-9604-614771c3d847] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:51.619  [InvSerialize][66c1ac01-b228-4fbf-9604-614771c3d847] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:51.619  [InvSerialize][66c1ac01-b228-4fbf-9604-614771c3d847] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:51.619  [InvSerialize][66c1ac01-b228-4fbf-9604-614771c3d847] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:51.620  [InvSerialize][66c1ac01-b228-4fbf-9604-614771c3d847] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:55.266  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:55.266  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:55.266    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:55.266  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:55.271  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=72.03  -  Client - LocalScript:72
+  23:56:55.271  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=89.07  -  Client - LocalScript:72
+  23:56:55.271  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:56.636  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:56:56.639  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:56:56  -  Server - GrandInventorySerializer:6194
+  23:56:56.639  [InvSerialize][d9a26138-8873-4e13-b47d-83c4801eb40f] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:56:56.639  [InvSerialize][d9a26138-8873-4e13-b47d-83c4801eb40f] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:56.640  [InvSerialize][d9a26138-8873-4e13-b47d-83c4801eb40f] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:56:56.640  [InvSerialize][d9a26138-8873-4e13-b47d-83c4801eb40f] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:56:56.640  [InvSerialize][d9a26138-8873-4e13-b47d-83c4801eb40f] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:56:56.753  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:56.997  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:56.998  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:56.998    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:56.998  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.001  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=79.17  -  Client - LocalScript:72
+  23:56:57.001  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=97.23  -  Client - LocalScript:72
+  23:56:57.001  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.109  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.110  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.110  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.110    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.110  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.115  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=77.37  -  Client - LocalScript:72
+  23:56:57.115  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=96.31  -  Client - LocalScript:72
+  23:56:57.115  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.241  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.241  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.241  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.241    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.242  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.246  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=76.27  -  Client - LocalScript:72
+  23:56:57.246  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=95.28  -  Client - LocalScript:72
+  23:56:57.247  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.343  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.343  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.343  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.343    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.343  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.348  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=74.61  -  Client - LocalScript:72
+  23:56:57.349  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=94.04  -  Client - LocalScript:72
+  23:56:57.349  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.439  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.440  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.440  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.440    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.440  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.443  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=72.90  -  Client - LocalScript:72
+  23:56:57.443  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=92.46  -  Client - LocalScript:72
+  23:56:57.443  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.568  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.568  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.569  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.569    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.569  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.572  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=71.00  -  Client - LocalScript:72
+  23:56:57.572  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=90.54  -  Client - LocalScript:72
+  23:56:57.572  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.651  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.651  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.651  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.651    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.652  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.655  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=69.70  -  Client - LocalScript:72
+  23:56:57.655  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=89.22  -  Client - LocalScript:72
+  23:56:57.655  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.786  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.786  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.786  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.786    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.786  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.791  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=67.73  -  Client - LocalScript:72
+  23:56:57.791  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=87.04  -  Client - LocalScript:72
+  23:56:57.791  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.854  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.855  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.855  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.855    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.855  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.858  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=66.62  -  Client - LocalScript:72
+  23:56:57.858  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=85.92  -  Client - LocalScript:72
+  23:56:57.859  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:57.984  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:57.985  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:57.985  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:57.985    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:57.985  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:57.988  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=64.42  -  Client - LocalScript:72
+  23:56:57.988  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19933333333333333  dist=83.99  -  Client - LocalScript:72
+  23:56:57.989  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.183  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.318  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.318  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.318    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.318  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.323  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=59.39  -  Client - LocalScript:72
+  23:56:58.323  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=78.99  -  Client - LocalScript:72
+  23:56:58.323  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.441  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.442  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.442  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.442    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.442  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.445  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=57.62  -  Client - LocalScript:72
+  23:56:58.445  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=77.16  -  Client - LocalScript:72
+  23:56:58.445  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.549  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.550  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.550  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.550    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.550  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.553  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=56.09  -  Client - LocalScript:72
+  23:56:58.553  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=75.58  -  Client - LocalScript:72
+  23:56:58.554  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.656  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.656  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.656  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.656    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.657  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.662  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=54.59  -  Client - LocalScript:72
+  23:56:58.662  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=74.03  -  Client - LocalScript:72
+  23:56:58.662  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.795  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.795  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.795  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.795    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.795  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.799  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=52.72  -  Client - LocalScript:72
+  23:56:58.799  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=72.06  -  Client - LocalScript:72
+  23:56:58.799  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:58.900  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:58.901  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:58.901  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:58.901    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:58.901  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:58.905  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=51.24  -  Client - LocalScript:72
+  23:56:58.905  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=70.12  -  Client - LocalScript:72
+  23:56:58.906  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:59.070  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:59.071  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:59.071  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:59.071    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:59.071  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:59.074  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=49.44  -  Client - LocalScript:72
+  23:56:59.074  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=68.25  -  Client - LocalScript:72
+  23:56:59.074  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:59.121  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:56:59.122  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:56:59.122  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:56:59.122    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:56:59.122  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:56:59.125  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=48.67  -  Client - LocalScript:72
+  23:56:59.125  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.19266666666666668  dist=67.61  -  Client - LocalScript:72
+  23:56:59.125  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:56:59.351  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:57:00.004  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:57:00.004  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:57:01.647  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:01.650  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:01  -  Server - GrandInventorySerializer:6194
+  23:57:01.650  [InvSerialize][d96f14a9-e59c-4ef6-bfcc-89952c20acfb] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:57:01.651  [InvSerialize][d96f14a9-e59c-4ef6-bfcc-89952c20acfb] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:01.651  [InvSerialize][d96f14a9-e59c-4ef6-bfcc-89952c20acfb] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:01.651  [InvSerialize][d96f14a9-e59c-4ef6-bfcc-89952c20acfb] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:01.651  [InvSerialize][d96f14a9-e59c-4ef6-bfcc-89952c20acfb] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:57:05.277  Inventory Update:  ▶ {...}  -  Client - dialogScript:93
+  23:57:05.277  Inventory Update:  ▶ {...}  -  Client - dialogScript:93
+  23:57:06.664  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:06.666  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:06  -  Server - GrandInventorySerializer:6194
+  23:57:06.667  [InvSerialize][96b3a253-1b4f-4d61-a82d-c6e01cea5409] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:57:06.667  [InvSerialize][96b3a253-1b4f-4d61-a82d-c6e01cea5409] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:06.667  [InvSerialize][96b3a253-1b4f-4d61-a82d-c6e01cea5409] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:06.668  [InvSerialize][96b3a253-1b4f-4d61-a82d-c6e01cea5409] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:06.668  [InvSerialize][96b3a253-1b4f-4d61-a82d-c6e01cea5409] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:57:08.102  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_Verified  -  Server - PlayerProfileService:68
+  23:57:08.112  DEBUG: hooking tool events for Players.combatcollin65432.Backpack.Egg  -  Client - LocalScript:109
+  23:57:08.112  [EggToolClient] Marked tool as ServerRestore/PreserveOnClient at startup  -  Client - EggToolTemplateClient:60
+  23:57:08.112  [EggToolClient] Client (v10.4-nocooldown) loaded for tool: Egg  -  Client - EggToolTemplateClient:60
+  23:57:08.677  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:08.679  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=1 worldEggs=1 time=23:57:08  -  Server - GrandInventorySerializer:6194
+  23:57:08.680  [InvSerialize][d5c7e2f7-e314-49e0-9e5a-7471239d5804] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:57:08.680  [InvSerialize][d5c7e2f7-e314-49e0-9e5a-7471239d5804] combatcollin65432 field=eggTools count=1 (raw=1)  -  Server - InventoryService:1277
+  23:57:08.680  [InvSerialize][d5c7e2f7-e314-49e0-9e5a-7471239d5804] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:08.681  [InvSerialize][d5c7e2f7-e314-49e0-9e5a-7471239d5804] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:08.681  [InvSerialize][d5c7e2f7-e314-49e0-9e5a-7471239d5804] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:57:10.003  [GrowthPersist] On-demand growth stamp complete for combatcollin65432 (slimes inspected=2)  -  Server - SlimeCore:2311
+  23:57:10.004  [GrowthPersist] Debounce: Ignore GrowthStampDirty for combatcollin65432 (0.00s < 2.50s)  -  Server - SlimeCore:2311
+  23:57:10.181  Inventory Update:  ▶ {...}  -  Client - dialogScript:93
+  23:57:10.181  Inventory Update:  ▶ {...}  -  Client - dialogScript:93
+  23:57:10.211  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.CapturedSlimeTool parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:57:10.211  ---- DEBUG: Resolved FoodDefinition for tool CapturedSlimeTool  -  Client - LocalScript:86
+  23:57:10.211    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:57:10.211  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:57:10.217  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=45.78  -  Client - LocalScript:72
+  23:57:10.217  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.17933333333333334  dist=21.19  -  Client - LocalScript:72
+  23:57:10.217  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:57:10.533  DEBUG: Tool UNEQUIPPED (client): Players.combatcollin65432.Backpack.CapturedSlimeTool  -  Client - LocalScript:120
+  23:57:10.534  [EggToolClient] Equipped: Egg  -  Client - EggToolTemplateClient:60
+  23:57:10.534  DEBUG: Tool EQUIPPED (client): Workspace.combatcollin65432.Egg parent now Workspace.combatcollin65432  -  Client - LocalScript:111
+  23:57:10.534  ---- DEBUG: Resolved FoodDefinition for tool Egg  -  Client - LocalScript:86
+  23:57:10.535    Could not resolve food def (module missing or resolve failed).  -  Client - LocalScript:94
+  23:57:10.535  ---- DEBUG: Listing Slime models (PrimaryPart, OwnerUserId, FedFraction, distance) ----  -  Client - LocalScript:58
+  23:57:10.538  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0  dist=48.90  -  Client - LocalScript:72
+  23:57:10.538  Slime: Workspace.Player1.Slime  PrimaryPart=Inner  OwnerUserId=52601646  Fed=0.17933333333333334  dist=22.20  -  Client - LocalScript:72
+  23:57:10.538  ---- DEBUG: Searching for existing FoodFeedPrompt prompts in Workspace ----  -  Client - LocalScript:49
+  23:57:11.016  [EggToolClient] FireServer Activated EggId c34db1b4-9fc7-4a75-87bf-fcd8ff437f95 at -610.5546875, 59.99718475341797, 590.1004028320312  -  Client - EggToolTemplateClient:60
+  23:57:11.016  [EggToolClient] Abort: local min interval MouseDown  -  Client - EggToolTemplateClient:60
+  23:57:11.023  [EggService][Debug] Egg parented to: Workspace.Player1  -  Server - EggService:2008
+  23:57:11.023  [EggService] PushSnapshot exporting count=2  -  Server - EggService:188
+  23:57:11.024  [EggService][Debug] Destroying egg tool after placement: Egg EggId: c34db1b4-9fc7-4a75-87bf-fcd8ff437f95 Parent: combatcollin65432  -  Server - EggService:2081
+  23:57:11.024  [EggService] Placed egg eggId=c34db1b4-9fc7-4a75-87bf-fcd8ff437f95 hatchIn=112s placed=2/3  -  Server - EggService:188
+  23:57:11.039  DEBUG: Tool UNEQUIPPED (client): Egg  -  Client - LocalScript:120
+  23:57:11.694  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:11.696  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=2 time=23:57:11  -  Server - GrandInventorySerializer:6194
+  23:57:11.697  [InvSerialize][b3ebbc02-6c72-471a-99cc-34728b63318e] combatcollin65432 field=worldSlimes count=2 (raw=2)  -  Server - InventoryService:1277
+  23:57:11.697  [InvSerialize][b3ebbc02-6c72-471a-99cc-34728b63318e] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:11.697  [InvSerialize][b3ebbc02-6c72-471a-99cc-34728b63318e] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:11.698  [InvSerialize][b3ebbc02-6c72-471a-99cc-34728b63318e] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:11.698  [InvSerialize][b3ebbc02-6c72-471a-99cc-34728b63318e] combatcollin65432 field=worldEggs count=2 (raw=2)  -  Server - InventoryService:1277
+  23:57:13.113  [EggService] [HatchSeq] Start eggId=7ad99157-ec64-47c5-af94-21077ea42a0e owner=52601646 placedNow=1  -  Server - EggService:188
+  23:57:13.114  [WS_DBG captureOriginalData(EggService)] model= Slime primary= Inner  -  Server - EggService:515
+  23:57:13.114  [EggService][RootPromotion] SlimeId=7ad99157-ec64-47c5-af94-21077ea42a0e PrimaryPart Inner -> Outer  -  Server - EggService:1624
+  23:57:13.115  [EggService][Visibility] SlimeId=7ad99157-ec64-47c5-af94-21077ea42a0e minPartAxis=0.0720 maxTransparency=0.40  -  Server - EggService:725
+  23:57:13.115  [EggService][Debug] destroyEggModel called for: Egg EggId: 7ad99157-ec64-47c5-af94-21077ea42a0e Reason: HatchComplete Parent: _EggGraveyard  -  Server - EggService:1365
+  23:57:13.115  [EggService] [Purge] Destroy egg EggId=7ad99157-ec64-47c5-af94-21077ea42a0e reason=HatchComplete path=Workspace._EggGraveyard.Egg  -  Server - EggService:188
+  23:57:13.115  [EggService] [PersistWorldSlime][Payload] id= 7ad99157-ec64-47c5-af94-21077ea42a0e json= {"SlimeId":"7ad99157-ec64-47c5-af94-21077ea42a0e","EyeColor":"#000000","py":60.21318435668945,"pz":586.369384765625,"BodyColor":"#64CC98","Size":0.18,"GrowthProgress":0.12429522212201834,"OwnerUserId":52601646,"EggId":"7ad99157-ec64-47c5-af94-21077ea42a0e","id":"7ad99157-ec64-47c5-af94-21077ea42a0e","CurrentSizeScale":0.18,"sz":0.18,"AccentColor":"#58B06E","Position":{"y":60.21318435668945,"x":-614.0692138671875,"z":586.369384765625},"Breed":"Basic","Timestamp":1759474633,"px":-614.0692138671875,"SlimeType":"Basic"}  -  Server - EggService:188
+  23:57:13.119  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_EggHatch_Verified  -  Server - PlayerProfileService:68
+  23:57:13.271  [EggService] [PersistWorldSlime][ReEnsure] Re-ensuring Entry_7ad99157-ec64-47c5-af94-21077ea42a0e for player combatcollin65432  -  Server - EggService:188
+  23:57:13.703  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:13.706  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:13  -  Server - GrandInventorySerializer:6194
+  23:57:13.706  [InvSerialize][0ecbebbf-1055-482d-8341-dc99fc4aef17] combatcollin65432 field=worldSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:13.707  [InvSerialize][0ecbebbf-1055-482d-8341-dc99fc4aef17] combatcollin65432 field=eggTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:13.707  [InvSerialize][0ecbebbf-1055-482d-8341-dc99fc4aef17] combatcollin65432 field=foodTools count=0 (raw=0)  -  Server - InventoryService:1277
+  23:57:13.707  [InvSerialize][0ecbebbf-1055-482d-8341-dc99fc4aef17] combatcollin65432 field=capturedSlimes count=3 (raw=3)  -  Server - InventoryService:1277
+  23:57:13.707  [InvSerialize][0ecbebbf-1055-482d-8341-dc99fc4aef17] combatcollin65432 field=worldEggs count=1 (raw=1)  -  Server - InventoryService:1277
+  23:57:14.260  [PersistSummary] combatcollin65432 coins=12256 captured=3 worldSlimes=3 worldEggs=1 eggTools=0 foodTools=0 dv=32675  -  Server - InitGameServices:527
+  23:57:14.647  [EggService] [EggService] Hatched egg -> slime (owner=52601646 persisted=true verifiedSave=true)  -  Server - EggService:188
+  23:57:14.650  [SlimeAI] Start called for slimeId=7ad99157-ec64-47c5-af94-21077ea42a0e  -  Server - SlimeAI:1114
+  23:57:15.207  Disconnect from 127.0.0.1|50910  -  Studio
+  23:57:15.216  [InitGameServices] Pre-exit persistence (orchestrator) triggered for combatcollin65432  -  Server - InitGameServices:18
+  23:57:15.216  [WorldAssetCleanup] PlayerRemoving: queued cleanup for userId=52601646  -  Server - WorldAssetCleanup:32
+  23:57:15.219  [GrowthPersist] FlushPlayerSlimesAndSave: player not found, stamping by userId 52601646  -  Server - SlimeCore:2311
+  23:57:15.219  [PreExitInventorySync] PlayerRemoving for combatcollin65432 userId= 52601646  -  Server - PreExitInventorySync:73
+  23:57:15.220  [GrandInvSer] UserId changed; registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:57:15.220  [WorldAssetCleanup] BindToClose: running final cleanup for online players (best-effort)  -  Server - WorldAssetCleanup:32
+  23:57:15.220  [InitGameServices] Flushing faction totals on shutdown...  -  Server - InitGameServices:495
+  23:57:16.754  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:16.756  [GrandInvSer] Registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:57:16.756  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:17.758  [PreExitInventorySync] PlayerProfileService queue wait [pre-exit-begin] for userId=52601646 (ok=true, drained=false)  -  Server - PreExitInventorySync:73
+  23:57:17.758  [PreExitInventorySync] Requested SlimeCore.GrowthService:FlushPlayerSlimes for 52601646  -  Server - PreExitInventorySync:73
+  23:57:17.760  [GrowthPersist] FlushPlayerSlimesAndSave: player not found, stamping by userId 52601646  -  Server - SlimeCore:2311
+  23:57:17.760  [PreExitInventorySync] GrowthPersistenceService.FlushPlayerSlimesAndSave returned: true  -  Server - PreExitInventorySync:73
+  23:57:17.799  [WorldAssetCleanup] Running cleanup for userId=52601646  -  Server - WorldAssetCleanup:32
+  23:57:17.800   ▶ [WorldAssetCleanup] Skipping preserved model: Workspace.Player1.Slime (Owner=52601646, Reason=PreserveOnServer) (x2)  -  Server - WorldAssetCleanup:32
+  23:57:17.800  [WorldAssetCleanup] Destroying model: Workspace.Player1.Egg (Owner=52601646)  -  Server - WorldAssetCleanup:32
+  23:57:17.800  [WorldAssetCleanup] Destroyed 1 instances, skipped 2 for userId=52601646  -  Server - WorldAssetCleanup:32
+  23:57:17.886  [PreExitInventorySync] Updated profile.inventory.worldSlimes growth fields from live models for 52601646  -  Server - PreExitInventorySync:73
+  23:57:17.887  [PreExitInventorySync] [PreExitDebug][Merge] userId=52601646 base(worldEggs=0,captured=3,eggTools=0,foodTools=0) payload(worldEggs=0,captured=0,eggTools=0,foodTools=0) merged(worldEggs=0,captured=3,eggTools=0,foodTools=0) time=23:57:17  -  Server - PreExitInventorySync:73
+  23:57:17.887  [PreExitInventorySync] InvMarkDirty: invoked MarkDirty with combatcollin65432  -  Server - PreExitInventorySync:73
+  23:57:17.887  [PreExitInventorySync] InventoryService.UpdateProfileInventory invoked for 52601646 (post-growth-flush, overrideEmptyGuard=true)  -  Server - PreExitInventorySync:73
+  23:57:20.405  [PreExitInventorySync] PlayerProfileService queue wait [post-update-profile] for userId=52601646 (ok=true, drained=false)  -  Server - PreExitInventorySync:73
+  23:57:20.405  [PreExitInventorySync] Pre-save summary userId=52601646 coins=12256 captured=3 world=3  -  Server - PreExitInventorySync:73
+  23:57:20.408  [GrandInvSer] Registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:57:20.408  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:20.410  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:20  -  Server - GrandInventorySerializer:6194
+  23:57:20.410  [InvSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=worldSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:20.411  [InvFinalSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=worldSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:20.411  [InvSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=eggTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:20.411  [InvFinalSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=eggTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:20.411  [InvSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=foodTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:20.411  [InvFinalSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=foodTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:20.411  [InvSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=capturedSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:20.411  [InvFinalSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=capturedSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:20.412  [InvSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=worldEggs count=1 (raw=1) (FINAL)  -  Server - InventoryService:1277
+  23:57:20.412  [InvFinalSerialize][d2ffff42-9cd6-488c-8cdb-457867dd6a1b] combatcollin65432 field=worldEggs count=1 (FINAL)  -  Server - InventoryService:1288
+  23:57:20.412  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_InventoryService_Verified  -  Server - PlayerProfileService:68
+  23:57:23.322  [GrandInvSer] Registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:57:23.323  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:23.324  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:23  -  Server - GrandInventorySerializer:6194
+  23:57:23.325  [InvSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=worldSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.325  [InvFinalSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=worldSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.325  [InvSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=eggTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.325  [InvFinalSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=eggTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.326  [InvSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=foodTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.326  [InvFinalSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=foodTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.326  [InvSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=capturedSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.326  [InvFinalSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=capturedSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.326  [InvSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=worldEggs count=1 (raw=1) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.327  [InvFinalSerialize][9606f9d7-2656-43e1-8e1c-d3086e3bcb17] combatcollin65432 field=worldEggs count=1 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.327  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_InventoryService_Verified  -  Server - PlayerProfileService:68
+  23:57:23.330  [GrandInvSer] Registered plot=Workspace.Player1 -> userId=0  -  Server - GrandInventorySerializer:88
+  23:57:23.331  [GrandInvSer] [safe_get_profile] candidate 'GetProfile(userId number)' succeeded (profile table)  -  Server - GrandInventorySerializer:88
+  23:57:23.333  [GrandInvDebug][Serialize[Final]] player=<nil> uid=0 capturedSlimes=3 eggTools=0 worldEggs=1 time=23:57:23  -  Server - GrandInventorySerializer:6194
+  23:57:23.334  [InvSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=worldSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.334  [InvFinalSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=worldSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.334  [InvSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=eggTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.334  [InvFinalSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=eggTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.334  [InvSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=foodTools count=0 (raw=0) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.334  [InvFinalSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=foodTools count=0 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.335  [InvSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=capturedSlimes count=3 (raw=3) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.335  [InvFinalSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=capturedSlimes count=3 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.335  [InvSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=worldEggs count=1 (raw=1) (FINAL)  -  Server - InventoryService:1277
+  23:57:23.335  [InvFinalSerialize][9b72a099-2ed2-4603-afde-ed1413a67239] combatcollin65432 field=worldEggs count=1 (FINAL)  -  Server - InventoryService:1288
+  23:57:23.335  [PlayerProfileService][INFO] ForceFullSaveNow invoked for userId 52601646 reason: SaveNowAndWait_InventoryService_Verified  -  Server - PlayerProfileService:68
+  23:57:24.986  [PreExitInventorySync] InventoryService.FinalizePlayer invoked for uid=52601646 result=true  -  Server - PreExitInventorySync:73
+  23:57:24.986  [PreExitInventorySync] Skipped module-level verified save because InventoryService.FinalizePlayer was used for uid= 52601646  -  Server - PreExitInventorySync:73
+  23:57:24.988  [PreExitInventorySync] Marked RecentlyPlacedSaved timestamp for owned models/tools for userId= 52601646  -  Server - PreExitInventorySync:73
+  23:57:27.997  [PreExitInventorySync] PlayerProfileService queue wait [post-finalize] for userId=52601646 (ok=true, drained=false)  -  Server - PreExitInventorySync:73
+  23:57:27.997  [PreExitInventorySync] PreExitInventorySync persistence complete (saved=true) for userId= 52601646  -  Server - PreExitInventorySync:73
+  23:57:45.208   ▶ Not running script because past shutdown deadline (x466)  -  Server

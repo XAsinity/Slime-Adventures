@@ -18,6 +18,36 @@ local RunService  = game:GetService("RunService")
 
 local PlotManager = {}
 
+local function tryRequire(name)
+	local candidates = {}
+	if script and script.Parent then table.insert(candidates, script.Parent) end
+	if script and script.Parent and script.Parent.Parent then table.insert(candidates, script.Parent.Parent) end
+	local SSS = game:GetService("ServerScriptService")
+	if SSS then
+		table.insert(candidates, SSS)
+		local modules = SSS:FindFirstChild("Modules")
+		if modules then table.insert(candidates, modules) end
+	end
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	if ReplicatedStorage then
+		table.insert(candidates, ReplicatedStorage)
+		local repModules = ReplicatedStorage:FindFirstChild("Modules")
+		if repModules then table.insert(candidates, repModules) end
+	end
+	for _, container in ipairs(candidates) do
+		local inst = container and container:FindFirstChild(name)
+		if inst and inst:IsA("ModuleScript") then
+			local ok, mod = pcall(function() return require(inst) end)
+			if ok and type(mod) == "table" then
+				return mod
+			end
+		end
+	end
+	return nil
+end
+
+local WorldAssetCleanup = tryRequire("WorldAssetCleanup")
+
 -- Config --------------------------------------------------------------------
 PlotManager.IndexAttribute = PlotManager.IndexAttribute or "Index"
 PlotManager.MaxPlayers = PlotManager.MaxPlayers or 6
@@ -29,6 +59,16 @@ PlotManager.Config = PlotManager.Config or {
 	NeutralPerPlayerSubfolders = true,
 	Debug = false,
 }
+
+if WorldAssetCleanup and type(WorldAssetCleanup.Configure) == "function" then
+	pcall(function()
+		WorldAssetCleanup.Configure({
+			IncludeNeutralOnLeave = PlotManager.Config.ClearNeutralFolderOnRelease,
+			NeutralFolderName = PlotManager.Config.NeutralFolderName,
+			NeutralPerPlayerSubfolders = PlotManager.Config.NeutralPerPlayerSubfolders,
+		})
+	end)
+end
 
 -- Public state (guarantee existence)
 PlotManager.Plots = PlotManager.Plots or {}        -- array of Model
@@ -353,6 +393,12 @@ function PlotManager:GetPlayerPlot(player)
 	return self.PlayerToPlot[player.UserId]
 end
 
+function PlotManager:GetPlotByUserId(userId)
+	local uid = tonumber(userId)
+	if not uid then return nil end
+	return self.PlayerToPlot[uid]
+end
+
 function PlotManager:AssignPlayer(player)
 	if not player or not player.UserId then return nil end
 
@@ -385,9 +431,34 @@ end
 
 function PlotManager:ClearPlot(plot, userId, options)
 	if not plot or not plot.Parent or not userId then return end
-	if not PlotManager.Config.ClearOwnedAssetsOnRelease then
+	local opts = options or {}
+	if opts.force ~= true and not PlotManager.Config.ClearOwnedAssetsOnRelease then
 		dprint(("ClearPlot skipped (config disabled) for userId=%d on plot=%s"):format(userId, plot.Name))
 		return
+	end
+	local cleanupOptions = {
+		neutral = opts.neutral,
+		neutralFolderName = opts.neutralFolderName,
+		neutralPerPlayerSubfolders = opts.neutralPerPlayerSubfolders,
+	}
+	if cleanupOptions.neutral == nil then
+		cleanupOptions.neutral = PlotManager.Config.ClearNeutralFolderOnRelease
+	end
+	cleanupOptions.neutralFolderName = cleanupOptions.neutralFolderName or PlotManager.Config.NeutralFolderName
+	cleanupOptions.neutralPerPlayerSubfolders = cleanupOptions.neutralPerPlayerSubfolders
+	if cleanupOptions.neutralPerPlayerSubfolders == nil then
+		cleanupOptions.neutralPerPlayerSubfolders = PlotManager.Config.NeutralPerPlayerSubfolders
+	end
+	if WorldAssetCleanup and type(WorldAssetCleanup.CleanupPlot) == "function" then
+		local ok = pcall(function()
+			WorldAssetCleanup.CleanupPlot(plot, userId, cleanupOptions)
+		end)
+		if ok then
+			dprint(("[ClearPlot] Cleared via WorldAssetCleanup for userId=%d on plot=%s"):format(userId, plot.Name))
+			return
+		else
+			warn("[PlotManager] WorldAssetCleanup.CleanupPlot failed; falling back to legacy clear")
+		end
 	end
 	local function clearOwnedAssetsInContainer(container)
 		if not container then return end
@@ -446,6 +517,15 @@ function PlotManager:ReleasePlayer(player)
 	if not player or not player.UserId then return end
 	local plot = self.PlayerToPlot[player.UserId]
 	if plot then
+		if WorldAssetCleanup and type(WorldAssetCleanup.ScheduleCleanup) == "function" then
+			pcall(function()
+				WorldAssetCleanup.ScheduleCleanup(player.UserId, plot, {
+					neutral = PlotManager.Config.ClearNeutralFolderOnRelease,
+					neutralFolderName = PlotManager.Config.NeutralFolderName,
+					neutralPerPlayerSubfolders = PlotManager.Config.NeutralPerPlayerSubfolders,
+				})
+			end)
+		end
 		-- Clear assets first (respects config inside ClearPlot)
 		self:ClearPlot(plot, player.UserId)
 		if plot.Parent then

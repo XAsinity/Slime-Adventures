@@ -36,8 +36,23 @@ local function ensureRemote(name)
 	return r
 end
 
+local function ensureRemoteFunction(name)
+	local inst = RemotesFolder:FindFirstChild(name)
+	if inst and not inst:IsA("RemoteFunction") then
+		inst:Destroy()
+		inst = nil
+	end
+	if not inst then
+		inst = Instance.new("RemoteFunction")
+		inst.Name = name
+		inst.Parent = RemotesFolder
+	end
+	return inst
+end
+
 local SellRequest = ensureRemote("SellSlimesRequest")
 local SellResult  = ensureRemote("SellSlimesResult")
+local StandingRequest = ensureRemoteFunction("RequestFactionStanding")
 
 ----------------------------------------------------------------
 -- PlayerProfileService persistence
@@ -149,26 +164,110 @@ local function buildPalette(cfg)
 	end
 end
 
+local function mirrorStandingAttribute(player, faction, value)
+	if not player or not player.SetAttribute then
+		return
+	end
+	pcall(function()
+		local attrName = "Standing_"..faction
+		local current = player:GetAttribute(attrName)
+		if current ~= value then
+			player:SetAttribute(attrName, value)
+		end
+	end)
+end
+
 -- Standing access (persisted via PlayerProfileService)
 local function getStanding(player, faction)
-	local profile = PlayerProfileService.GetProfile(player)
-	profile.stats = profile.stats or {}
-	profile.stats.standing = profile.stats.standing or {}
-	if profile.stats.standing[faction] == nil then
-		profile.stats.standing[faction] = FACTIONS[faction] and FACTIONS[faction].StandingInitial or 0
+	local profile = nil
+	if PlayerProfileService then
+		local ok, prof = pcall(function()
+			return PlayerProfileService.GetProfile(player)
+		end)
+		if ok and type(prof) == "table" then
+			profile = prof
+		end
+		if not profile and type(PlayerProfileService.WaitForProfile) == "function" then
+			local waitedOk, waitedProf = pcall(function()
+				return PlayerProfileService.WaitForProfile(player, 2)
+			end)
+			if waitedOk and type(waitedProf) == "table" then
+				profile = waitedProf
+			end
+		end
 	end
-	return profile.stats.standing[faction]
+	if profile then
+		local core = profile.core
+		if type(core) == "table" then
+			core.standings = core.standings or {}
+			local coreValue = core.standings[faction]
+			if type(coreValue) == "number" then
+				mirrorStandingAttribute(player, faction, coreValue)
+				return coreValue
+			end
+		end
+		profile.stats = profile.stats or {}
+		profile.stats.standing = profile.stats.standing or {}
+		local statsValue = profile.stats.standing[faction]
+		if type(statsValue) == "number" then
+			mirrorStandingAttribute(player, faction, statsValue)
+			return statsValue
+		end
+		local initial = FACTIONS[faction] and FACTIONS[faction].StandingInitial or 0
+		if profile.stats.standing[faction] == nil then
+			profile.stats.standing[faction] = initial
+		end
+		if core and core.standings then
+			core.standings[faction] = core.standings[faction] or initial
+		end
+		mirrorStandingAttribute(player, faction, initial)
+		return initial
+	end
+	local attrValue = nil
+	if player and player.GetAttribute then
+		local okAttr, v = pcall(function()
+			return player:GetAttribute("Standing_"..faction)
+		end)
+		if okAttr and type(v) == "number" then
+			attrValue = v
+		end
+	end
+	return attrValue or (FACTIONS[faction] and FACTIONS[faction].StandingInitial or 0)
 end
 
 local function setStanding(player, faction, value)
 	value = math.clamp(value, STANDING_CLAMP_MIN, STANDING_CLAMP_MAX)
-	local profile = PlayerProfileService.GetProfile(player)
-	profile.stats = profile.stats or {}
-	profile.stats.standing = profile.stats.standing or {}
-	profile.stats.standing[faction] = value
+	local profile = nil
+	if PlayerProfileService then
+		local ok, prof = pcall(function()
+			return PlayerProfileService.GetProfile(player)
+		end)
+		if ok and type(prof) == "table" then
+			profile = prof
+		end
+	end
+	if profile then
+		profile.core = profile.core or {}
+		profile.core.standings = profile.core.standings or {}
+		profile.core.standings[faction] = value
+		profile.stats = profile.stats or {}
+		profile.stats.standing = profile.stats.standing or {}
+		profile.stats.standing[faction] = value
+	end
+	if player and player.SetAttribute then
+		mirrorStandingAttribute(player, faction, value)
+	end
 	-- Persist standing update immediately (best-effort)
 	pcall(function() if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then PlayerProfileService.SaveNow(player, "StandingUpdate") end end)
 	return value
+end
+
+StandingRequest.OnServerInvoke = function(player, factionName)
+	factionName = tostring(factionName or "")
+	if factionName == "" then
+		return 0
+	end
+	return getStanding(player, factionName)
 end
 
 local function standingMultiplier(cfg, standing)

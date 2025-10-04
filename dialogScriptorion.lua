@@ -13,6 +13,7 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 
 local SellRequest = Remotes:WaitForChild("SellSlimesRequest")
 local SellResult  = Remotes:WaitForChild("SellSlimesResult")
+local StandingRequest = Remotes:FindFirstChild("RequestFactionStanding")
 
 local FACTION = "Orion"
 
@@ -74,7 +75,18 @@ local function fetchFactionTotal()
 end
 
 local function getStanding()
-	return player:GetAttribute("Standing_"..FACTION) or 0
+	local attrValue = player:GetAttribute("Standing_"..FACTION)
+	local rf = StandingRequest or Remotes:FindFirstChild("RequestFactionStanding")
+	if rf and rf:IsA("RemoteFunction") then
+		StandingRequest = rf
+		local ok, result = pcall(function()
+			return rf:InvokeServer(FACTION)
+		end)
+		if ok and type(result) == "number" then
+			return result
+		end
+	end
+	return attrValue or 0
 end
 
 local function liveUpdate(text)
@@ -144,8 +156,11 @@ dialog.responded:Connect(function(responseNum, dialogNum)
 
 		elseif responseNum == 4 then
 			-- My standing
-			local s = getStanding()
-			showInfoMessage(("Your standing is %.3f (%.0f%% efficiency alignment)."):format(s, s*100))
+			showInfoMessage("Calculating alignment metrics...")
+			task.spawn(function()
+				local s = getStanding()
+				showInfoMessage(("Your standing is %.3f (%.0f%% efficiency alignment)."):format(s, s*100))
+			end)
 
 		elseif responseNum == 5 then
 			-- Leave

@@ -49,6 +49,8 @@ local SizeRNG       = (SlimeCore and SlimeCore.SizeRNG)       or safeRequire("Si
 local GrowthScaling = (SlimeCore and SlimeCore.GrowthScaling) or safeRequire("GrowthScaling") or {}
 local SlimeMutation = (SlimeCore and SlimeCore.SlimeMutation) or safeRequire("SlimeMutation") or {}
 local SlimeAppearance = (SlimeCore and (SlimeCore.SlimeAppearance or SlimeCore.Appearance)) or safeRequire("SlimeAppearance") or {}
+local SlimeFactory   = (SlimeCore and SlimeCore.SlimeFactory) or safeRequire("SlimeFactory") or nil
+local SlimeTypeRegistry = (SlimeCore and SlimeCore.SlimeTypeRegistry) or safeRequire("SlimeTypeRegistry") or nil
 
 -- Ensure minimal helpers exist on fallbacks to avoid runtime nil errors
 if not ModelUtils.CleanPhysics then ModelUtils.CleanPhysics = function() end end
@@ -115,6 +117,8 @@ local Assets       = ReplicatedStorage:WaitForChild("Assets")
 local EggTemplate  = Assets:WaitForChild("Egg")
 local SlimeTemplate= Assets:WaitForChild("Slime")
 
+local DEFAULT_SLIME_TYPE = (SlimeTypeRegistry and SlimeTypeRegistry.GetDefaultType and SlimeTypeRegistry.GetDefaultType()) or "Basic"
+
 ----------------------------------------------------------
 -- CONFIG
 ----------------------------------------------------------
@@ -143,6 +147,10 @@ local HATCH_GUI_TEXTSTROKE_T        = 0.4
 local DEFAULT_HUNGER_DECAY          = (0.02 / 15)
 local MIN_PART_AXIS                 = 0.05
 local BODY_PART_CANDIDATES          = { "Outer","Inner","Body","Core","Main","Torso","Slime","Base" }
+local CORNER_SIGNS = {
+	Vector3.new(-1,-1,-1), Vector3.new(-1,-1, 1), Vector3.new(-1, 1,-1), Vector3.new(-1, 1, 1),
+	Vector3.new( 1,-1,-1), Vector3.new( 1,-1, 1), Vector3.new( 1, 1,-1), Vector3.new( 1, 1, 1),
+}
 local MIN_VISIBLE_START_SCALE       = 0.18
 local SPAWN_UPWARD_OFFSET           = 0.18
 local VISIBILITY_DEBUG              = true
@@ -186,6 +194,70 @@ local function dfail(reason, detail)
 	else
 		warn(("[EggService][PlaceFail][%s]"):format(tostring(reason)))
 	end
+end
+
+local function normalizeSlimeType(value)
+	if type(value) == "string" and value ~= "" then
+		return value
+	end
+	return DEFAULT_SLIME_TYPE
+end
+
+local function resolveTypeFromInstance(inst)
+	if not inst or type(inst.GetAttribute) ~= "function" then return nil end
+	local okType, storedType = pcall(function() return inst:GetAttribute("SlimeType") end)
+	if okType and type(storedType) == "string" and storedType ~= "" then
+		return storedType
+	end
+	local okBreed, storedBreed = pcall(function() return inst:GetAttribute("Breed") end)
+	if okBreed and type(storedBreed) == "string" and storedBreed ~= "" then
+		return storedBreed
+	end
+	return nil
+end
+
+local function cloneEggTemplateForType(slimeType)
+	slimeType = normalizeSlimeType(slimeType)
+	if SlimeTypeRegistry and type(SlimeTypeRegistry.ResolveEggTemplate) == "function" then
+		local template = SlimeTypeRegistry.ResolveEggTemplate(slimeType)
+		if template and template:IsA("Model") then
+			local ok, clone = pcall(function() return template:Clone() end)
+			if ok and clone then return clone end
+		end
+	end
+	local ok, fallbackClone = pcall(function() return EggTemplate:Clone() end)
+	if ok and fallbackClone then return fallbackClone end
+	return Instance.new("Model")
+end
+
+local function cloneSlimeTemplateForType(slimeType)
+	slimeType = normalizeSlimeType(slimeType)
+	if SlimeTypeRegistry and type(SlimeTypeRegistry.ResolveSlimeTemplate) == "function" then
+		local template = SlimeTypeRegistry.ResolveSlimeTemplate(slimeType)
+		if template and template:IsA("Model") then
+			local ok, clone = pcall(function() return template:Clone() end)
+			if ok and clone then return clone end
+		end
+	end
+	local ok, fallbackClone = pcall(function() return SlimeTemplate:Clone() end)
+	if ok and fallbackClone then return fallbackClone end
+	return Instance.new("Model")
+end
+
+local function applySlimeTypeAttributes(inst, slimeType)
+	if not inst then return DEFAULT_SLIME_TYPE end
+	local resolved = normalizeSlimeType(slimeType)
+	pcall(function()
+		inst:SetAttribute("SlimeType", resolved)
+		inst:SetAttribute("Breed", resolved)
+		if SlimeTypeRegistry and type(SlimeTypeRegistry.Get) == "function" then
+			local def = SlimeTypeRegistry.Get(resolved)
+			if def and type(def) == "table" and def.tier and inst:GetAttribute("Tier") == nil then
+				inst:SetAttribute("Tier", def.tier)
+			end
+		end
+	end)
+	return resolved
 end
 
 ----------------------------------------------------------
@@ -351,17 +423,135 @@ local function choosePrimary(model)
 	return nil
 end
 
+local function ensureOriginalBounds(model, primary)
+	if SlimeFactory and type(SlimeFactory._EnsureOriginalBounds) == "function" then
+		return SlimeFactory._EnsureOriginalBounds(model, primary)
+	end
+	if not model or not primary or not primary:IsA("BasePart") then return end
+	local lastApplied = model:GetAttribute("_LastAppliedSizeScale")
+	if type(lastApplied) ~= "number" or lastApplied <= 0 then
+		lastApplied = model:GetAttribute("OriginalBaseScale") or model:GetAttribute("CurrentSizeScale") or model:GetAttribute("StartSizeScale") or 1
+	end
+	local minY, maxY = nil, nil
+	for _,part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local relCF
+			if part == primary then
+				relCF = CFrame.new()
+			else
+				relCF = part:GetAttribute("OriginalRelCF")
+			end
+			if typeof(relCF) ~= "CFrame" then
+				local okDerive, derived = pcall(function() return primary.CFrame:ToObjectSpace(part.CFrame) end)
+				if okDerive and derived then
+					local basePos = derived.Position
+					if lastApplied ~= 0 then
+						basePos = basePos / lastApplied
+					end
+					local rx, ry, rz = derived:ToOrientation()
+					relCF = CFrame.new(basePos) * CFrame.fromOrientation(rx, ry, rz)
+					part:SetAttribute("OriginalRelCF", relCF)
+					part:SetAttribute("OriginalRelOffset", relCF.Position)
+				end
+			end
+			local origSize = part:GetAttribute("OriginalSize")
+			if not origSize then
+				local captured = part.Size
+				if lastApplied ~= 0 then
+					captured = captured / lastApplied
+				end
+				origSize = captured
+				part:SetAttribute("OriginalSize", origSize)
+			end
+			if typeof(relCF) == "CFrame" and origSize then
+				for _,sign in ipairs(CORNER_SIGNS) do
+					local cornerLocal = Vector3.new(origSize.X * 0.5 * sign.X, origSize.Y * 0.5 * sign.Y, origSize.Z * 0.5 * sign.Z)
+					local corner = relCF:PointToWorldSpace(cornerLocal)
+					local y = corner.Y
+					if minY == nil or y < minY then minY = y end
+					if maxY == nil or y > maxY then maxY = y end
+				end
+			end
+		end
+	end
+	if minY then model:SetAttribute("OriginalMinYOffset", minY) end
+	if maxY then model:SetAttribute("OriginalMaxYOffset", maxY) end
+	if minY and maxY then model:SetAttribute("OriginalVerticalSpan", maxY - minY) end
+end
+
+local function adjustModelHeightForScale(model, primary, oldScale, newScale)
+	if SlimeFactory and type(SlimeFactory._AdjustModelHeightForScale) == "function" then
+		return SlimeFactory._AdjustModelHeightForScale(model, primary, oldScale, newScale)
+	end
+	if not model or not primary or not primary:IsA("BasePart") then
+		return primary and primary.CFrame or nil
+	end
+	local originalMin = model:GetAttribute("OriginalMinYOffset")
+	if type(originalMin) ~= "number" then
+		return primary.CFrame
+	end
+	oldScale = (type(oldScale) == "number" and oldScale > 0) and oldScale or model:GetAttribute("_LastAppliedSizeScale") or model:GetAttribute("CurrentSizeScale") or model:GetAttribute("StartSizeScale") or 1
+	if type(newScale) ~= "number" or newScale <= 0 then newScale = oldScale end
+	local oldMin = originalMin * oldScale
+	local newMin = originalMin * newScale
+	local delta = oldMin - newMin
+	if math.abs(delta) < 1e-4 then
+		return primary.CFrame
+	end
+	local rootCF = primary.CFrame
+	local target = rootCF + (rootCF.UpVector * delta)
+	local ok = pcall(function()
+		model:PivotTo(target)
+	end)
+	if not ok then
+		pcall(function()
+			primary.CFrame = target
+		end)
+	end
+	return (model.PrimaryPart or primary).CFrame
+end
+
 local function captureOriginalData(model, primary)
+	pcall(function() print("[WS_DBG captureOriginalData(EggService)] model=", (model and model.Name) or "<nil>", "primary=", (primary and primary.Name) or "<nil>") end)
+	if not model or not primary then return end
+	local baseScale = model:GetAttribute("OriginalBaseScale") or model:GetAttribute("CurrentSizeScale") or model:GetAttribute("StartSizeScale") or 1
+	if type(baseScale) ~= "number" or baseScale <= 0 then
+		baseScale = 1
+	end
 	for _,part in ipairs(model:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part:SetAttribute("OriginalSize", part.Size)
 			if part == primary then
 				part:SetAttribute("OriginalRelCF", CFrame.new())
+				part:SetAttribute("OriginalRelOffset", Vector3.new(0,0,0))
+				part:SetAttribute("OriginalRelYaw", 0)
 			else
-				part:SetAttribute("OriginalRelCF", primary.CFrame:ToObjectSpace(part.CFrame))
+				local ok, rel = pcall(function()
+					if primary and primary:IsA("BasePart") then
+						return primary.CFrame:ToObjectSpace(part.CFrame)
+					end
+					return nil
+				end)
+				if ok and rel then
+					local rx, ry, rz = rel:ToOrientation()
+					local relCF = CFrame.new(rel.Position) * CFrame.fromOrientation(rx, ry, rz)
+					part:SetAttribute("OriginalRelCF", relCF)
+					part:SetAttribute("OriginalRelOffset", relCF.Position)
+					local yaw = nil
+					pcall(function() yaw = math.atan2(-rel.LookVector.X, -rel.LookVector.Z) end)
+					if yaw then part:SetAttribute("OriginalRelYaw", yaw) end
+				else
+					pcall(function() print("[WS_DBG captureOriginalData(EggService)] missing primary or ToObjectSpace failed for part=", part.Name) end)
+					part:SetAttribute("OriginalRelCF", nil)
+					part:SetAttribute("OriginalRelOffset", nil)
+					part:SetAttribute("OriginalRelYaw", nil)
+				end
 			end
 		end
 	end
+	model:SetAttribute("OriginalBaseScale", baseScale)
+	model:SetAttribute("_LastAppliedSizeScale", baseScale)
+	ensureOriginalBounds(model, primary)
 end
 
 local function computeSafeStartScale(model, desired)
@@ -378,9 +568,23 @@ local function computeSafeStartScale(model, desired)
 end
 
 local function applyInitialScale(model, primary, scale)
+	if not model or not primary or not primary:IsA("BasePart") then return end
+	if type(scale) ~= "number" or scale <= 0 then return end
+	ensureOriginalBounds(model, primary)
+	local oldScale = model:GetAttribute("_LastAppliedSizeScale")
+	if type(oldScale) ~= "number" or oldScale <= 0 then
+		oldScale = model:GetAttribute("OriginalBaseScale") or model:GetAttribute("CurrentSizeScale") or model:GetAttribute("StartSizeScale") or 1
+	end
 	for _,p in ipairs(model:GetDescendants()) do
 		if p:IsA("BasePart") then
 			local orig = p:GetAttribute("OriginalSize")
+			if not orig then
+				orig = p.Size
+				if oldScale ~= 0 then
+					orig = orig / oldScale
+				end
+				p:SetAttribute("OriginalSize", orig)
+			end
 			if orig then
 				local ns = orig * scale
 				p.Size = Vector3.new(
@@ -391,17 +595,44 @@ local function applyInitialScale(model, primary, scale)
 			end
 		end
 	end
-	local rootCF = primary.CFrame
+
+	local rootCF = adjustModelHeightForScale(model, primary, oldScale, scale)
+	if typeof(rootCF) ~= "CFrame" then
+		primary = model.PrimaryPart or primary
+		rootCF = (primary and primary.CFrame) or CFrame.new()
+	else
+		primary = model.PrimaryPart or primary
+	end
+
 	for _,p in ipairs(model:GetDescendants()) do
 		if p:IsA("BasePart") and p ~= primary then
-			local rel = p:GetAttribute("OriginalRelCF")
-			if rel then
-				local posRel = rel.Position * scale
-				local rotRel = rel - rel.Position
-				p.CFrame = rootCF * (CFrame.new(posRel) * rotRel)
+			local relCF = p:GetAttribute("OriginalRelCF")
+			if typeof(relCF) ~= "CFrame" then
+				local okDerive, derived = pcall(function() return primary.CFrame:ToObjectSpace(p.CFrame) end)
+				if okDerive and derived then
+					local currentScale = model:GetAttribute("CurrentSizeScale") or model:GetAttribute("StartSizeScale") or oldScale or 1
+					if currentScale ~= 0 then
+						local basePos = derived.Position / currentScale
+						local rx, ry, rz = derived:ToOrientation()
+						relCF = CFrame.new(basePos) * CFrame.fromOrientation(rx, ry, rz)
+					else
+						relCF = derived
+					end
+					p:SetAttribute("OriginalRelCF", relCF)
+					p:SetAttribute("OriginalRelOffset", relCF.Position)
+				end
+			end
+			if typeof(relCF) == "CFrame" then
+				local offset = relCF.Position * scale
+				local rx, ry, rz = relCF:ToOrientation()
+				local desired = rootCF * (CFrame.new(offset) * CFrame.fromOrientation(rx, ry, rz))
+				pcall(function() p.CFrame = desired end)
 			end
 		end
 	end
+
+	model:SetAttribute("CurrentSizeScale", scale)
+	model:SetAttribute("_LastAppliedSizeScale", scale)
 end
 
 local function initializeGrowthAttributes(slime, rng)
@@ -866,6 +1097,10 @@ local function persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
 		if primary then
 			local p = primary.Position
 			entry.Position = { x = tonumber(p.X) or 0, y = tonumber(p.Y) or 0, z = tonumber(p.Z) or 0 }
+			-- Also expose top-level px/py/pz (expected by GrandInventorySerializer)
+			entry.px = tonumber(p.X) or nil
+			entry.py = tonumber(p.Y) or nil
+			entry.pz = tonumber(p.Z) or nil
 		end
 	end
 
@@ -873,12 +1108,41 @@ local function persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
 	entry.BodyColor   = tostring(slime:GetAttribute("BodyColor") or "")
 	entry.AccentColor = tostring(slime:GetAttribute("AccentColor") or "")
 	entry.EyeColor    = tostring(slime:GetAttribute("EyeColor") or "")
-	entry.Breed       = tostring(slime:GetAttribute("Breed") or "")
+	entry.SlimeType   = tostring(slime:GetAttribute("SlimeType") or slime:GetAttribute("Breed") or DEFAULT_SLIME_TYPE)
+	entry.Breed       = tostring(slime:GetAttribute("Breed") or entry.SlimeType or "")
+
+	-- Persist canonical size keys expected by the serializer
+	local curScale = tonumber(slime:GetAttribute("CurrentSizeScale") or slime:GetAttribute("StartSizeScale")) or nil
+	if curScale then
+		entry.CurrentSizeScale = curScale
+		entry.sz = curScale
+	end
+
+	-- If slime has stored local restore offsets (set earlier during capture/restore fallback), expose them
+	pcall(function()
+		if type(slime.GetAttribute) == "function" then
+			local lpx = slime:GetAttribute("RestoreLpx")
+			local lpy = slime:GetAttribute("RestoreLpy")
+			local lpz = slime:GetAttribute("RestoreLpz")
+			if lpx ~= nil then entry.lpx = tonumber(lpx) or lpx end
+			if lpy ~= nil then entry.lpy = tonumber(lpy) or lpy end
+			if lpz ~= nil then entry.lpz = tonumber(lpz) or lpz end
+		end
+	end)
 
 	-- Debug: log the JSON-encoded payload we intend to persist (helps diagnose sanitizer strips)
 	local payloadJson = nil
 	pcall(function() payloadJson = HttpService:JSONEncode(entry) end)
 	dprint("[PersistWorldSlime][Payload] id=", sid, "json=", payloadJson)
+	-- Additional diagnostic: log any local/pivot attributes if present
+	pcall(function()
+		local lpx = (type(slime.GetAttribute) == "function") and slime:GetAttribute("RestoreLpx") or nil
+		local lpy = (type(slime.GetAttribute) == "function") and slime:GetAttribute("RestoreLpy") or nil
+		local lpz = (type(slime.GetAttribute) == "function") and slime:GetAttribute("RestoreLpz") or nil
+		if lpx or lpy or lpz then
+			pcall(function() print("[WS_DBG persistWorldSlime] SlimeId=", sid, "RestoreLocalPos=", tostring(lpx), tostring(lpy), tostring(lpz)) end)
+		end
+	end)
 
 	local added = false
 	-- Try InventoryService path (preferred for online player)
@@ -1259,7 +1523,8 @@ local function hatchEgg(worldEgg)
 	local eggPivotCF
 	pcall(function() eggPivotCF = worldEgg:GetPivot() end)
 
-	local slime = SlimeTemplate:Clone()
+	local slimeType = resolveTypeFromInstance(worldEgg) or DEFAULT_SLIME_TYPE
+	local slime = cloneSlimeTemplateForType(slimeType)
 	slime.Name = "Slime"
 	slime:SetAttribute("SlimeId", eggId)
 	for _,attr in ipairs({
@@ -1269,8 +1534,8 @@ local function hatchEgg(worldEgg)
 		slime:SetAttribute(attr, worldEgg:GetAttribute(attr))
 	end
 	slime:SetAttribute("GrowthCompleted", false)
-	slime:SetAttribute("MutationStage", 0)
 	slime:SetAttribute("AgeSeconds", 0)
+	applySlimeTypeAttributes(slime, slimeType)
 
 	pcall(function() ModelUtils.CleanPhysics(slime) end)
 	local primary = choosePrimary(slime)
@@ -1366,6 +1631,7 @@ local function hatchEgg(worldEgg)
 
 	-- Persist the created slime into the player's profile (primitive-only table)
 	local persisted_ok = false
+	local hatchVerifiedSaveOk = false
 	local okPersist, errPersist = pcall(function()
 		persisted_ok = persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
 	end)
@@ -1389,6 +1655,44 @@ local function hatchEgg(worldEgg)
 
 	-- Defensive: ensure egg inventory entries are removed after persist (final guarantee)
 	pcall(function() safeRemoveWorldEggForPlayer(ownerPlayer or ownerUserId, eggId) end)
+
+	-- Immediately request a verified profile save so leaving right after hatch does not race shutdown
+	if PlayerProfileService then
+		local saveTarget = ownerPlayer or ownerUserId
+		if saveTarget then
+			if type(PlayerProfileService.SaveNowAndWait) == "function" then
+				local okWait, waitRes = pcall(function()
+					return PlayerProfileService.SaveNowAndWait(saveTarget, 5, {
+						verified = true,
+						reason = "EggHatch",
+					})
+				end)
+				if okWait and waitRes then
+					hatchVerifiedSaveOk = true
+				else
+					if not okWait then
+						warn("[EggService] SaveNowAndWait failed during hatch:", tostring(waitRes))
+					else
+						warn("[EggService] SaveNowAndWait returned false during hatch for user", tostring(ownerUserId))
+					end
+				end
+			end
+			if (not hatchVerifiedSaveOk) and type(PlayerProfileService.ForceFullSaveNow) == "function" then
+				local okForce, forceRes = pcall(function()
+					return PlayerProfileService.ForceFullSaveNow(saveTarget, "EggHatch_ForceFull")
+				end)
+				if okForce and forceRes then
+					hatchVerifiedSaveOk = true
+				elseif not okForce then
+					warn("[EggService] ForceFullSaveNow errored during hatch:", tostring(forceRes))
+				end
+			end
+			if (not hatchVerifiedSaveOk) and type(PlayerProfileService.SaveNow) == "function" then
+				pcall(function() PlayerProfileService.SaveNow(saveTarget, "EggHatch_SaveFallback") end)
+			end
+		end
+	end
+	markEggPersistSucceeded = markEggPersistSucceeded or hatchVerifiedSaveOk
 
 	-- If PlayerDataService path exists, make sure server data service knows about the change
 	if PlayerDataService and ownerPlayer then
@@ -1429,8 +1733,8 @@ local function hatchEgg(worldEgg)
 		end
 	end)
 
-	dprint(("[EggService] Hatched egg -> slime (owner=%s persisted=%s)")
-		:format(tostring(ownerUserId), tostring(markEggPersistSucceeded)))
+	dprint(("[EggService] Hatched egg -> slime (owner=%s persisted=%s verifiedSave=%s)")
+		:format(tostring(ownerUserId), tostring(markEggPersistSucceeded), tostring(hatchVerifiedSaveOk)))
 
 	if RESIDUAL_PURGE_ENABLED then
 		purgeResidualEggModels(ownerUserId, eggId, "immediate")
@@ -1623,6 +1927,8 @@ local function ensureToolMetadata(tool, player)
 	if not tool:GetAttribute("OwnerUserId") then tool:SetAttribute("OwnerUserId", player.UserId) end
 	if not tool:GetAttribute("ServerIssued") then tool:SetAttribute("ServerIssued", true) end
 	if not tool:GetAttribute("EggId") then tool:SetAttribute("EggId", HttpService:GenerateGUID(false)) end
+	local toolType = resolveTypeFromInstance(tool)
+	applySlimeTypeAttributes(tool, toolType or DEFAULT_SLIME_TYPE)
 end
 
 ----------------------------------------------------------
@@ -1660,14 +1966,16 @@ local function placeEgg(player, hitCFrame, tool)
 	end
 
 	local eggId = tool:GetAttribute("EggId") or HttpService:GenerateGUID(false)
+	local slimeType = resolveTypeFromInstance(tool) or DEFAULT_SLIME_TYPE
 
-	local worldEgg = EggTemplate:Clone()
+	local worldEgg = cloneEggTemplateForType(slimeType)
 	worldEgg.Name = "Egg"
 	worldEgg:SetAttribute("EggId", eggId)
 	worldEgg:SetAttribute("OwnerUserId", player.UserId)
 	worldEgg:SetAttribute("Placed", true)
 	worldEgg:SetAttribute("PlacedAt", os.time())
 	worldEgg:SetAttribute("ManualHatch", MANUAL_HATCH_MODE)
+ 	slimeType = applySlimeTypeAttributes(worldEgg, slimeType)
 
 	local hatchTime = uniformHatchTime()
 	worldEgg:SetAttribute("HatchTime", hatchTime)

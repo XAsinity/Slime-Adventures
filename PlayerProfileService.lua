@@ -35,8 +35,9 @@ local PPS_DEBUG_UPDATEASYNC = CONFIG.Debug
 
 local profileCache     = {}
 local dirtyPlayers     = {}
-local saveScheduled    = {}
 local saveLocks        = {}
+local saveQueueState   = {}
+local serverClosing    = false
 local lastSaveResult   = {}
 local SAVE_DEBOUNCE_SECONDS = 0.35
 local PERIODIC_FLUSH_INTERVAL = 5
@@ -710,25 +711,117 @@ local function saveProfileInternal(userId, reason)
 	end
 end
 
-scheduleSave = function(userId, reason)
-	if not userId then return end
-	dirtyPlayers[userId] = true
-	if saveScheduled[userId] then
+local function ensureQueueState(userId)
+	local state = saveQueueState[userId]
+	if not state then
+		state = {
+			pending = 0,
+			running = false,
+			nextReason = nil,
+			active = false,
+		}
+		saveQueueState[userId] = state
+	end
+	return state
+end
+
+local function isQueueActive(userId)
+	local state = saveQueueState[userId]
+	if not state then return false end
+	return state.running or state.pending > 0 or state.nextReason ~= nil or state.active
+end
+
+local function startQueueWorker(userId, state)
+	if state.running then
 		return
 	end
-	saveScheduled[userId] = true
+	state.running = true
+	state.active = true
 	task.spawn(function()
-		task.wait(SAVE_DEBOUNCE_SECONDS)
-		saveScheduled[userId] = nil
-		local ok, err = saveProfileInternal(userId, reason or "Manual")
-		if not ok then
-			if err == "locked" then
-				task.wait(0.08)
-				pcall(function() saveProfileInternal(userId, reason or "ManualRetry") end)
+		while true do
+			if state.pending <= 0 and state.nextReason == nil then
+				break
 			end
+
+			local debounce = serverClosing and 0 or SAVE_DEBOUNCE_SECONDS
+			if debounce > 0 then
+				task.wait(debounce)
+			end
+
+			if state.pending > 0 then
+				state.pending = state.pending - 1
+			end
+
+			local reasonToUse = state.nextReason or "Manual"
+			state.nextReason = nil
+
+			local ok, err = saveProfileInternal(userId, reasonToUse)
+			if not ok and err == "locked" then
+				task.wait(0.08)
+				saveProfileInternal(userId, reasonToUse .. "_Retry")
+			end
+		end
+
+		state.running = false
+		if state.pending > 0 or state.nextReason ~= nil then
+			startQueueWorker(userId, state)
+		else
+			state.active = false
 		end
 	end)
 end
+
+scheduleSave = function(userId, reason)
+	if not userId then return end
+	dirtyPlayers[userId] = true
+	local state = ensureQueueState(userId)
+	state.pending = state.pending + 1
+	state.nextReason = reason or state.nextReason or "Manual"
+	startQueueWorker(userId, state)
+end
+
+local function awaitSaveQueue(userId, timeoutSeconds)
+	if not userId then return true end
+	timeoutSeconds = tonumber(timeoutSeconds) or 2
+	local start = os.clock()
+	while true do
+		if not isQueueActive(userId) then
+			return true
+		end
+		if (os.clock() - start) >= timeoutSeconds then
+			return false
+		end
+		task.wait(0.05)
+	end
+end
+
+local function awaitAllQueues(timeoutSeconds)
+	timeoutSeconds = tonumber(timeoutSeconds) or 4
+	local start = os.clock()
+	while true do
+		local anyActive = false
+		for uid, _ in pairs(saveQueueState) do
+			if isQueueActive(uid) then
+				anyActive = true
+				break
+			end
+		end
+		if not anyActive then
+			return true
+		end
+		if (os.clock() - start) >= timeoutSeconds then
+			return false
+		end
+		task.wait(0.05)
+	end
+end
+
+pcall(function()
+	game:BindToClose(function()
+		serverClosing = true
+		awaitAllQueues(6)
+	end)
+end)
 
 local function performVerifiedWrite(userId, snapshot, attempt)
 	local key = keyFor(userId)
@@ -1194,6 +1287,85 @@ function PlayerProfileService.SaveNow(...)
 	scheduleSave(userId, reason or "Manual")
 end
 
+
+function PlayerProfileService.SaveNowAndWait(...)
+	local playerOrId, timeoutSeconds, verifiedArg = stripSelfArg(...)
+	local verifiedOpts = nil
+	local verified = verifiedArg
+	if type(verifiedArg) == "table" then
+		verifiedOpts = verifiedArg
+		if verifiedArg.verified ~= nil then
+			verified = verifiedArg.verified and true or false
+		else
+			verified = true
+		end
+		if verifiedArg.timeoutSeconds ~= nil then
+			timeoutSeconds = verifiedArg.timeoutSeconds
+		end
+	elseif verifiedArg == nil then
+		verified = false
+	end
+	local userId = resolveUserId(playerOrId)
+	if not userId then
+		if type(playerOrId) == "table" and playerOrId.userId then
+			userId = tonumber(playerOrId.userId)
+		end
+	end
+	if not userId then
+		debug("SaveNowAndWait requested with invalid playerOrId:", tostring(playerOrId))
+		return false
+	end
+
+	timeoutSeconds = tonumber(timeoutSeconds) or 4
+	local reason = "SaveNowAndWait"
+	if verifiedOpts and verifiedOpts.reason then
+		reason = reason .. "_" .. tostring(verifiedOpts.reason)
+	end
+
+	if verified then
+		reason = reason .. "_Verified"
+		local forceOpts = nil
+		if verifiedOpts and (verifiedOpts.failFast ~= nil or verifiedOpts.dedupeWindow ~= nil or verifiedOpts.noFallback ~= nil) then
+			local failFastOpt = nil
+			if verifiedOpts.failFast ~= nil then
+				failFastOpt = verifiedOpts.failFast and true or false
+			end
+			local noFallbackOpt = nil
+			if verifiedOpts.noFallback ~= nil then
+				noFallbackOpt = verifiedOpts.noFallback and true or false
+			elseif failFastOpt ~= nil then
+				noFallbackOpt = failFastOpt
+			end
+			forceOpts = {
+				failFast = failFastOpt,
+				dedupeWindow = verifiedOpts.dedupeWindow,
+				noFallback = noFallbackOpt,
+			}
+		end
+		local ok = PlayerProfileService.ForceFullSaveNow(playerOrId, reason, forceOpts)
+		if ok then
+			return true
+		end
+		local done, success = WaitForSaveComplete(userId, timeoutSeconds)
+		if done then
+			return success and true or false
+		end
+		return false
+	else
+		local ok, err = saveProfileInternal(userId, reason)
+		if ok then
+			return true
+		end
+		if err == "locked" or err == "throttled" or err == "recent-failure" then
+			local done, success = WaitForSaveComplete(userId, timeoutSeconds)
+			if done then
+				return success and true or false
+			end
+		end
+		return false
+	end
+end
+
 function PlayerProfileService.ForceFullSaveNow(...)
 	local playerOrId, reason = stripSelfArg(...)
 	local opts = nil
@@ -1201,6 +1373,11 @@ function PlayerProfileService.ForceFullSaveNow(...)
 	if select("#", ...) >= 3 then
 		local maybeOpts = select(3, ...)
 		if type(maybeOpts) == "table" then opts = maybeOpts end
+	end
+
+	local skipFallback = false
+	if opts and opts.noFallback ~= nil then
+		skipFallback = opts.noFallback and true or false
 	end
 
 	local userId = resolveUserId(playerOrId)
@@ -1212,10 +1389,17 @@ function PlayerProfileService.ForceFullSaveNow(...)
 
 	info("ForceFullSaveNow invoked for userId", userId, "reason:", reason or "ForceFullSave")
 
+	-- ensure any pending debounced saves are flushed (best-effort) before we attempt a verified write
+	awaitSaveQueue(userId, 1.5)
+
 	-- If a verified save succeeded very recently, skip duplicate verified save attempts.
 	local now = os.clock()
+	local dedupeWindow = VERIFIED_SAVE_DEDUP_WINDOW
+	if opts and tonumber(opts.dedupeWindow) then
+		dedupeWindow = math.max(0, tonumber(opts.dedupeWindow))
+	end
 	local lastOk = lastVerifiedSaveTs[userId]
-	if lastOk and (now - lastOk) <= VERIFIED_SAVE_DEDUP_WINDOW then
+	if lastOk and (now - lastOk) <= dedupeWindow then
 		debug(("ForceFullSaveNow: skipping duplicate verified save for userId=%s within dedupe window (%.2fs elapsed)"):format(tostring(userId), now - lastOk))
 		-- ensure meta stamp exists and return success to callers expecting a synchronous true
 		local prof = profileCache[userId]
@@ -1236,7 +1420,11 @@ function PlayerProfileService.ForceFullSaveNow(...)
 		if saveLocks[userId] then
 			debug("ForceFullSaveNow aborted: another save in progress for userId", userId)
 			-- schedule a non-verified save and return false to avoid blocking callers during shutdown
-			scheduleSave(userId, reason or "ForceFullSave_EarlyAbort")
+			if not skipFallback then
+				scheduleSave(userId, reason or "ForceFullSave_EarlyAbort")
+			else
+				debug("ForceFullSaveNow skipping fallback schedule due to noFallback option for userId", userId)
+			end
 			return false
 		end
 	end
@@ -1267,8 +1455,15 @@ function PlayerProfileService.ForceFullSaveNow(...)
 	-- If we're being called from the InventoryService_VerifiedFallback (finalization flow),
 	-- use a short/fail-fast strategy: attempt a single verified write, and if it fails schedule an async save and return.
 	local isShutdownFallback = false
+	local explicitFailFast = opts and opts.failFast
 	if type(reason) == "string" and reason:find("InventoryService_VerifiedFallback", 1, true) then
 		isShutdownFallback = true
+	end
+	if explicitFailFast then
+		isShutdownFallback = true
+	end
+	if isShutdownFallback then
+		skipFallback = true
 	end
 
 	saveLocks[userId] = true
@@ -1325,9 +1520,13 @@ function PlayerProfileService.ForceFullSaveNow(...)
 		lastSaveResult[userId] = { ts = os.clock(), success = false }
 		fireSaveComplete(userId, false)
 		appendAuditRecord("verified_save_failed", { ts = os.time(), userId = userId, reason = reason or "", attempts = EXIT_SAVE_ATTEMPTS })
-		warn(("ForceFullSaveNow failed for userId=%s after attempts; scheduled async save"):format(tostring(userId)))
-		-- Ensure a fallback async save is scheduled so we don't lose data
-		scheduleSave(userId, "ForceFullSave_FallbackScheduled")
+		if not skipFallback then
+			warn(("ForceFullSaveNow failed for userId=%s after attempts; scheduled async save"):format(tostring(userId)))
+			-- Ensure a fallback async save is scheduled so we don't lose data
+			scheduleSave(userId, "ForceFullSave_FallbackScheduled")
+		else
+			warn(("ForceFullSaveNow failed for userId=%s after attempts; noFallback set so skipping async retry"):format(tostring(userId)))
+		end
 		return false
 	end
 end
@@ -1346,6 +1545,9 @@ end)
 
 PlayerProfileService.WaitForSaveComplete = WaitForSaveComplete
 PlayerProfileService.SaveNow = PlayerProfileService.SaveNow
+PlayerProfileService.SaveNowAndWait = PlayerProfileService.SaveNowAndWait
 PlayerProfileService.ForceFullSaveNow = PlayerProfileService.ForceFullSaveNow
+PlayerProfileService.AwaitSaveQueue = awaitSaveQueue
+PlayerProfileService.AwaitAllSaveQueues = awaitAllQueues
 
 return PlayerProfileService

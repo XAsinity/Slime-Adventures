@@ -61,6 +61,7 @@ ensureRemote("HatchEggRequest")
 ensureRemote("SlimePickupRequest")
 ensureRemote("SlimePickupResult")
 ensureRemote("FeedSlime")
+ensureRemote("FeedResult")
 
 -- Shop / inventory
 ensureRemote("PurchaseEgg")
@@ -398,17 +399,47 @@ end
 ----------------------------------------------------------------
 -- Prefer PreExitInventorySync for merging and saving. As a last step call GrandInventorySerializer.PreExitSync safely.
 if type(PreExitInventorySync) == "table" and type(PreExitInventorySync.Init) == "function" then
+	local function waitForPreExitFinal(player, timeout)
+		timeout = tonumber(timeout) or 1.25
+		local start = os.clock()
+		while os.clock() - start < timeout do
+			if not player then return false end
+			local finalizedAt = nil
+			local activeStamp = nil
+			pcall(function()
+				finalizedAt = player:GetAttribute("__PreExitInventorySyncFinalizedAt")
+				activeStamp = player:GetAttribute("__PreExitInventorySyncActive")
+			end)
+			if finalizedAt then
+				return true
+			end
+			if not activeStamp then
+				-- PreExit isn't active; allow a short grace window before falling back.
+				break
+			end
+			task.wait(0.05)
+		end
+		return false
+	end
+
 	Players.PlayerRemoving:Connect(function(player)
 		pcall(function()
 			log("Pre-exit persistence (orchestrator) triggered for", player.Name)
+			pcall(function()
+				if player and type(player.SetAttribute) == "function" then
+					player:SetAttribute("__PreExitInventorySyncActive", os.clock())
+				end
+			end)
 			local usedPexit = false
 			if type(PreExitInventorySync.RunNow) == "function" then
 				pcall(function() PreExitInventorySync.RunNow(player) end)
 				usedPexit = true
 			end
 
-			-- Also call GrandInventorySerializer.PreExitSync (safe)
-			if type(GrandInventorySerializer) == "table" and type(GrandInventorySerializer.PreExitSync) == "function" then
+			local preExitCompleted = waitForPreExitFinal(player, 1.5)
+
+			-- Only call GrandInventorySerializer.PreExitSync if PreExit flow did not complete in time.
+			if (not preExitCompleted) and type(GrandInventorySerializer) == "table" and type(GrandInventorySerializer.PreExitSync) == "function" then
 				local prof = nil
 				if PlayerProfileService and type(PlayerProfileService.GetProfile) == "function" then
 					pcall(function() prof = PlayerProfileService.GetProfile(player.UserId) end)
