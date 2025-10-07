@@ -980,7 +980,7 @@ function FoodService.GiveFood(player, foodId, amountOrOpts, opts)
 				tostring(tool.Name),
 				tostring(safeGetAttribute(tool, "Charges")),
 				amount
-			))
+				))
 		end
 		verifyReplication(player, tool)
 		table.insert(granted, tool)

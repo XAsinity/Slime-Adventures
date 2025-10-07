@@ -344,7 +344,22 @@ local function updatePreview()
 		previewModel.Parent = nil
 		return
 	end
-	previewModel:PivotTo(previewCFrame)
+
+	-- Preserve the template/model rotation when pivoting the preview into place.
+	-- Previously we called previewModel:PivotTo(previewCFrame) which loses the model's authored rotation
+	-- and could make eggs lay on their side. Extract the model pivot rotation and compose a pivot with
+	-- the desired position + template rotation.
+	local okPivot, modelPivot = pcall(function() return previewModel:GetPivot() end)
+	if okPivot and typeof(modelPivot) == "CFrame" then
+		local rx, ry, rz = modelPivot:ToOrientation()
+		local rotOnly = CFrame.fromOrientation(rx, ry, rz)
+		local targetPivot = CFrame.new(previewCFrame.Position) * rotOnly
+		pcall(function() previewModel:PivotTo(targetPivot) end)
+	else
+		-- fallback if GetPivot fails
+		pcall(function() previewModel:PivotTo(previewCFrame) end)
+	end
+
 	local color
 	if not previewValid then
 		color = COLOR_INVALID

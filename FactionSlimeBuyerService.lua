@@ -1,12 +1,13 @@
 -- FactionSlimeBuyerService
 -- Relays coin payouts and standing changes through PlayerProfileService for persistence.
 -- Improvements:
---  - More robust inventory-removal after sales (handles both ToolUniqueId and ToolUid attribute names).
---  - Always attempts to remove captured/world slime entries from the PlayerProfileService profile
---    even if PlayerProfileService.ApplySale reports success (defensive / idempotent).
---  - Verifies removal from the profile (best-effort) and retries once with a ForceFullSaveNow if necessary.
---  - All PlayerProfileService calls wrapped in pcall to avoid runtime errors when optional functions are absent.
---  - Keeps existing behavior: prefer atomic ApplySale if available; fallback to IncrementCoins + RemoveInventoryItem.
+--  - Prevent double-crediting by ensuring PlayerProfileService (ApplySale or IncrementCoins fallback)
+--    is the single source-of-truth for awarding player coins.
+--  - Only after awarding the player do we update the global faction totals (FactionTotalsService),
+--    which now no longer credits player coins itself.
+--  - Defensive removal and verified save logic retained.
+--  - Ensure factions are registered with CoreStatsService so standing values are initialized on profile restore.
+--  - Refresh player's visible coins (leaderstats / CoinsStored attribute) after awarding so UI shows up-to-date values.
 
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
@@ -130,6 +131,26 @@ do
 end
 
 ----------------------------------------------------------------
+-- OPTIONAL CoreStatsService (register factions + leaderstats bridge)
+----------------------------------------------------------------
+local CoreStatsService
+do
+	local ok, mod = pcall(function()
+		return require(ServerScriptService:WaitForChild("Modules"):FindFirstChild("CoreStatsService"))
+	end)
+	if ok then
+		CoreStatsService = mod
+	end
+end
+
+-- Register our factions with CoreStatsService so profile restores initialize standing fields
+if CoreStatsService and type(CoreStatsService.RegisterFaction) == "function" then
+	for fname,cfg in pairs(FACTIONS) do
+		pcall(function() CoreStatsService.RegisterFaction(fname, cfg.StandingInitial) end)
+	end
+end
+
+----------------------------------------------------------------
 -- UTIL
 ----------------------------------------------------------------
 local function dprint(cfg, ...)
@@ -175,6 +196,21 @@ local function mirrorStandingAttribute(player, faction, value)
 			player:SetAttribute(attrName, value)
 		end
 	end)
+end
+
+-- Small helper: update leaderstats UI and CoinsStored attribute from PlayerProfileService.GetCoins
+local function updateLeaderstatsForPlayer(player)
+	if not player then return end
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls then return end
+	local coinValue = ls:FindFirstChild("Coins") or ls:FindFirstChild("coins") or ls:FindFirstChild("CoinsValue")
+	if coinValue and (coinValue:IsA("IntValue") or coinValue:IsA("NumberValue")) then
+		local ok, val = pcall(function() return PlayerProfileService.GetCoins(player) end)
+		if ok and type(val) == "number" then
+			if coinValue.Value ~= val then coinValue.Value = val end
+			pcall(function() player:SetAttribute("CoinsStored", val) end)
+		end
+	end
 end
 
 -- Standing access (persisted via PlayerProfileService)
@@ -542,13 +578,6 @@ local function processSale(player, faction, toolList)
 		return false, "Nothing valuable."
 	end
 
-	-- Relay payout to FactionTotalsService if available (best-effort)
-	if FactionTotalsService and FactionTotalsService.AddPayout then
-		pcall(function()
-			FactionTotalsService.AddPayout(faction, totalPayout, player)
-		end)
-	end
-
 	-- === Prefer atomic ApplySale in PlayerProfileService ===
 	local applied = false
 	local applyErr = nil
@@ -565,7 +594,6 @@ local function processSale(player, faction, toolList)
 	end
 
 	-- Defensive removal: even if ApplySale succeeded, try to remove persisted entries by common keys.
-	-- This handles cases where ApplySale might not have removed items in some storage variants.
 	local didAttemptRemoval = false
 	pcall(function()
 		didAttemptRemoval = removeProfileEntries(player, soldToolUids, soldSlimeIds) or didAttemptRemoval
@@ -600,6 +628,19 @@ local function processSale(player, faction, toolList)
 			-- If IncrementCoins fails that's concerning, but we keep going (we attempted profile removals already)
 			warn("[FactionSlimeBuyerService] IncrementCoins failed:", tostring(newCoins))
 		end
+	end
+
+	-- Sync visible coins to player UI + attribute so leaderstats/CoinsStored reflect the new profile balance
+	pcall(function()
+		updateLeaderstatsForPlayer(player)
+	end)
+
+	-- At this point the player should have been awarded coins once (either ApplySale or IncrementCoins fallback).
+	-- Update faction totals now (best-effort). NOTE: FactionTotalsService no longer awards player coins.
+	if FactionTotalsService and FactionTotalsService.AddPayout then
+		pcall(function()
+			FactionTotalsService.AddPayout(faction, totalPayout, player)
+		end)
 	end
 
 	-- Now safely destroy tool instances and world models in the world

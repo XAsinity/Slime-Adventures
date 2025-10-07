@@ -1,20 +1,5 @@
--- MusicController.client.lua (v3.1 + Dynamic Folder Scan + StaticTitleTicker)
--- CHANGELOG v3.1:
---  * Auto-detects any Sound objects placed in ReplicatedStorage.DefaultSoundTrack (or ReplicatedStorage.Music / SoundService.DefaultSoundTrack fallback)
---    so newly added songs (e.g. "Slimy Storms Powered by UDIO Music") play WITHOUT editing MusicPlaylist module.
---  * Playlist module (MusicPlaylist) still supported; its BuildQueue() results are merged with folder sounds (deduplicated).
---  * Added prettifyName() to optionally shorten long licensing suffixes for the on-screen title.
---  * Defensive checks & logging if a track fails to load / is deleted mid-play.
---
--- Core design (unchanged):
---  * Per-track Sound.Volume = fade alpha (0..1) independent of user master volume.
---  * SoundGroup 'Music' Volume = user slider (targetVolume).
---  * fadeIn always tween track.Volume 0 -> 1; fadeOut 1 -> 0.
---  * Raising user volume after silence reveals the currently playing track instantly (no restart).
---
--- To add music now:
---   Drop a Sound into ReplicatedStorage.DefaultSoundTrack (preferred) or ReplicatedStorage.Music / SoundService.DefaultSoundTrack.
---   The script will detect it when the queue refills (end of current cycle) or immediately on first startup.
+-- MusicController.client.lua
+-- Full script; robustly waits on LoadingActive (creates fallback if missing) and crossfades in.
 
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
@@ -53,12 +38,12 @@ local MARQUEE_GAP          = 32
 
 -- Dynamic folder scanning
 local FOLDER_NAMES = {
-	"DefaultSoundTrack", -- primary (per your screenshot)
-	"Music",             -- alternate common name
+	"DefaultSoundTrack", -- primary
+	"Music",             -- alternate
 }
-local RESCAN_ON_QUEUE_REFILL = true   -- Rescan folder every time queue empties
+local RESCAN_ON_QUEUE_REFILL = true
 
-local TRIM_SUFFIXES = {               -- prettifyName: remove trailing license text in ticker
+local TRIM_SUFFIXES = {
 	" Powered by UDIO Music",
 	" - Powered by UDIO Music",
 	" (Powered by UDIO Music)",
@@ -79,7 +64,7 @@ end
 local currentSound
 local queue          = {}
 local queueIndex     = 0
-local targetVolume   = DEFAULT_VOLUME  -- user master volume
+local targetVolume   = DEFAULT_VOLUME
 local dragging       = false
 local suppressRemote = false
 
@@ -103,7 +88,7 @@ local marqueeToken       = 0
 -- Utility
 --------------------------------------------------
 local function dprint(...)
-	-- Set to true to debug local music controller
+	-- set to true to debug
 	-- print(LOG_PREFIX, ...)
 end
 
@@ -139,7 +124,7 @@ local function applyVolume(v, userInitiated)
 	musicGroup.Volume = targetVolume
 	setVolumeUI(targetVolume)
 
-	-- Safety: if track is internally silent (legacy edge) and user raises volume, normalize track alpha.
+	-- Safety: if track is internally silent and user raises volume, normalize track alpha.
 	if targetVolume > 0 and currentSound and currentSound.IsPlaying and currentSound.Volume < 0.01 then
 		currentSound.Volume = 1
 	end
@@ -198,12 +183,10 @@ local function refillQueue()
 		end
 	end
 
-	-- 2. Dynamic folder sounds (merge / dedupe by Instance)
+	-- 2. Dynamic folder sounds
 	local dyn = gatherFolderSounds()
 	local present = {}
-	for _,s in ipairs(newQueue) do
-		present[s] = true
-	end
+	for _,s in ipairs(newQueue) do present[s] = true end
 	for _,s in ipairs(dyn) do
 		if not present[s] then
 			table.insert(newQueue, s)
@@ -212,7 +195,7 @@ local function refillQueue()
 	end
 
 	if #newQueue == 0 then
-		warn(LOG_PREFIX, "No tracks found. Add Sounds to DefaultSoundTrack folder or ensure MusicPlaylist returns at least one track.")
+		warn(LOG_PREFIX, "No tracks found. Add Sounds to DefaultSoundTrack folder or ensure MusicPlaylist returns tracks.")
 	end
 
 	shuffle(newQueue)
@@ -240,7 +223,7 @@ local function cloneTrack(proto)
 	if not proto or not proto:IsA("Sound") then return nil end
 	local s = proto:Clone()
 	s.SoundGroup = musicGroup
-	s.Volume = 0 -- fade alpha
+	s.Volume = 0
 	s.Looped = false
 	s.Parent = SoundService
 	return s
@@ -390,7 +373,6 @@ local function playNext()
 		return
 	end
 	if not proto.Parent then
-		-- Source track got removed; skip
 		dprint("Prototype removed, skipping:", proto.Name)
 		return playNext()
 	end
@@ -407,7 +389,6 @@ local function playNext()
 		end
 	end)
 	newSound.Stopped:Connect(function()
-		-- Safety: If force-stopped externally, continue loop
 		if newSound == currentSound and newSound.TimePosition > 0.05 then
 			currentSound = nil
 			playNext()
@@ -573,7 +554,34 @@ else
 	applyVolume(DEFAULT_VOLUME, true)
 end
 
--- Initial track population
+-- Wait for LoadingActive to exist and be false before starting playback.
+-- This is robust to script ordering: Manager.lua creates LoadingActive at start.
+local loadingFlag = player:FindFirstChild("LoadingActive")
+if not loadingFlag then
+	-- wait a bit for Manager to create it
+	loadingFlag = player:WaitForChild("LoadingActive", 5)
+end
+
+if not loadingFlag then
+	-- fallback: if still not created, create a local flag and mark loading as finished so music can start.
+	loadingFlag = Instance.new("BoolValue")
+	loadingFlag.Name = "LoadingActive"
+	loadingFlag.Value = false
+	loadingFlag.Parent = player
+	dprint(LOG_PREFIX, "No LoadingActive found; created local fallback (false).")
+end
+
+-- If loading is active, wait until it becomes false.
+if loadingFlag.Value then
+	dprint(LOG_PREFIX, "LoadingActive present and true; waiting until false to start music.")
+	while loadingFlag.Value do
+		loadingFlag:GetPropertyChangedSignal("Value"):Wait()
+	end
+	-- small safety pause to let Manager start fade
+	task.wait(0.02)
+end
+
+-- Initial track population & start playback (only after loading finished)
 refillQueue()
 playNext()
 

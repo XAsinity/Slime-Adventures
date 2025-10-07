@@ -1,11 +1,11 @@
 -- FactionTotalsService
--- Now routes all per-player coin payouts through PlayerProfileService for up-to-date persistence
+-- Routes faction totals updates to data store and cross-server messaging.
+-- IMPORTANT: This service no longer awards coins directly to players.
+-- Per-player coin awarding must be handled by the caller (e.g., the sale flow via PlayerProfileService.ApplySale or IncrementCoins).
 
 local DataStoreService  = game:GetService("DataStoreService")
 local MessagingService  = game:GetService("MessagingService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local PlayerProfileService = require(ServerScriptService.Modules:WaitForChild("PlayerProfileService"))
 
 local REMOTES_FOLDER = ReplicatedStorage:WaitForChild("Remotes")
 local UPDATE_EVENT   = REMOTES_FOLDER:WaitForChild("FactionTotalsUpdate")
@@ -163,7 +163,8 @@ local function subscribe()
 end
 
 ----------------------------------------------------------------
--- Increment Logic (MODIFIED: relay to PlayerProfileService)
+-- Increment Logic (NOTE: This service only tracks faction totals now;
+-- per-player coin awarding MUST be handled by the caller to avoid duplicates)
 ----------------------------------------------------------------
 local function applyLocalIncrement(faction, amount, player)
 	if not validateFaction(faction) then
@@ -190,12 +191,8 @@ local function applyLocalIncrement(faction, amount, player)
 		flushFaction(faction)
 	end
 
-	-- Relay payout to PlayerProfileService for per-player persistence
-	if player and player:IsA("Player") then
-		PlayerProfileService.IncrementCoins(player, amount)
-		PlayerProfileService.SaveNow(player, "FactionPayout")
-		PlayerProfileService.ForceFullSaveNow(player, "FactionPayoutImmediate")
-	end
+	-- IMPORTANT: Do NOT award coins to the player here.
+	-- Per-player coin awarding should be done by the sale flow (PlayerProfileService.ApplySale or IncrementCoins fallback)
 end
 
 ----------------------------------------------------------------
@@ -244,10 +241,12 @@ end
 init()
 
 ----------------------------------------------------------------
--- Public API (MODIFIED: AddPayout now requires player)
+-- Public API
 ----------------------------------------------------------------
 local Service = {}
 
+-- AddPayout: record payout to global faction totals.
+-- Note: this function does NOT award the player's coins. Caller must award player coins separately.
 function Service.AddPayout(faction, amount, player)
 	applyLocalIncrement(faction, amount, player)
 end

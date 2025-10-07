@@ -128,7 +128,7 @@ local function cleanupOwnedInstancesIn(container, userId)
 					if preserved then
 						dprint(("Skipping preserved part: %s (Owner=%s, Reason=%s)")
 							:format(desc:GetFullName(), tostring(userId), tostring(attr)))
-							skipped = skipped + 1
+						skipped = skipped + 1
 					else
 						dprint(("Destroying part: %s (Owner=%s)")
 							:format(desc:GetFullName(), tostring(userId)))

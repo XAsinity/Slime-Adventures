@@ -9,6 +9,7 @@
 -- - Hardened sanitizeForDatastore with recursion depth / node count limits to avoid UpdateAsync transform stack overflows.
 -- - Fixed debug.shadow crash: captured original Lua debug library and use it for tracebacks.
 -- - Added PlayerProfileService.ApplySale for atomic sale application (coins + inventory removals + verified persist).
+-- - Added CoinsChanged BindableEvent + exported .CoinsChanged Event for consumers to subscribe to profile-driven coin updates.
 -- - Default CONFIG.Debug = false (no spam). Set CONFIG.Debug=true for verbose debug.
 -----------------------------------------------------------------------
 
@@ -209,6 +210,38 @@ do
 		return be
 	end)
 	if ok and ev then _SaveCompleteBindable = ev end
+end
+
+-- NEW: CoinsChanged bindable for profile-driven coin updates.
+-- Expose both the BindableEvent (CoinsChangedBindable) and the Event (CoinsChanged) for consumers.
+local CoinsChangedBindable = nil
+do
+	local ok, be = pcall(function()
+		local ev = Instance.new("BindableEvent")
+		ev.Name = "CoinsChanged"
+		local parent = ServerScriptService:FindFirstChild("Modules") or ServerScriptService
+		-- If a pre-existing BindableEvent exists, reuse it (keeps event stable across reloads)
+		local existing = parent:FindFirstChild("CoinsChanged")
+		if existing and existing:IsA("BindableEvent") then
+			return existing
+		end
+		ev.Parent = parent
+		return ev
+	end)
+	if ok and be then
+		CoinsChangedBindable = be
+	end
+end
+-- Public export: .CoinsChanged is the Event (so consumers can: PlayerProfileService.CoinsChanged:Connect(...))
+if CoinsChangedBindable then
+	PlayerProfileService.CoinsChangedBindable = CoinsChangedBindable
+	PlayerProfileService.CoinsChanged = CoinsChangedBindable.Event
+else
+	-- fallback no-op event-like table with Connect that does nothing
+	PlayerProfileService.CoinsChangedBindable = nil
+	PlayerProfileService.CoinsChanged = {
+		Connect = function() return { Disconnect = function() end } end
+	}
 end
 
 local function fireProfileReady(userId, profile)
@@ -1061,6 +1094,7 @@ function PlayerProfileService.SetCoins(playerOrId, amount, opts)
 	profile.core.coins = tonumber(amount) or 0
 	markDirty(userId)
 	local ply = Players:GetPlayerByUserId(userId)
+	-- Update UI & attribute asynchronously
 	if ply then
 		task.spawn(function()
 			if ply.SetAttribute then
@@ -1073,11 +1107,20 @@ function PlayerProfileService.SetCoins(playerOrId, amount, opts)
 			end
 		end)
 	end
+	-- Fire CoinsChanged event (best-effort)
+	pcall(function()
+		local newAmount = profile.core.coins
+		if CoinsChangedBindable then
+			-- Prefer to fire with Player instance when available
+			local pl = Players:GetPlayerByUserId(userId)
+			CoinsChangedBindable:Fire(pl or userId, newAmount)
+		end
+	end)
 	opts = opts or {}
 	if opts.saveNow then
 		PlayerProfileService.SaveNow(playerOrId, "SetCoinsImmediate")
 	end
-	return true
+	return true, profile.core.coins
 end
 
 function PlayerProfileService.IncrementCoins(playerOrId, delta, opts)
@@ -1106,6 +1149,13 @@ function PlayerProfileService.IncrementCoins(playerOrId, delta, opts)
 			end
 		end)
 	end
+	-- Fire CoinsChanged event (best-effort)
+	pcall(function()
+		if CoinsChangedBindable then
+			local pl = Players:GetPlayerByUserId(userId)
+			CoinsChangedBindable:Fire(pl or userId, newAmount)
+		end
+	end)
 	if opts and opts.saveNow then
 		PlayerProfileService.SaveNow(playerOrId, "IncrementCoinsImmediate")
 	end
@@ -1128,7 +1178,7 @@ function PlayerProfileService.AddInventoryItem(playerOrId, category, itemData)
 	end
 	local profile = PlayerProfileService.GetProfile(userId)
 	if not profile then
-		debug("AddInventoryItem: no profile for userId", tostring(userId))
+		debug("AddInventoryItem: no profile for userId", userId)
 		return false, "no profile"
 	end
 	profile.inventory = profile.inventory or defaultProfile(userId).inventory
@@ -1178,7 +1228,7 @@ function PlayerProfileService.RemoveInventoryItem(playerOrId, category, itemIdFi
 	end
 	local profile = PlayerProfileService.GetProfile(userId)
 	if not profile then
-		debug("RemoveInventoryItem: no profile for userId", tostring(userId))
+		debug("RemoveInventoryItem: no profile for userId", userId)
 		return false, "no profile"
 	end
 	profile.inventory = profile.inventory or defaultProfile(userId).inventory
@@ -1207,6 +1257,7 @@ function PlayerProfileService.ApplySale(...)
 	if not profile then return false, "no profile" end
 	profile.core = profile.core or {}
 	profile.core.coins = (profile.core.coins or 0) + payout
+
 	local function removeCapturedByUid(profileTbl, uid)
 		if not profileTbl or not profileTbl.inventory or not profileTbl.inventory.capturedSlimes then return end
 		local list = profileTbl.inventory.capturedSlimes
@@ -1236,6 +1287,16 @@ function PlayerProfileService.ApplySale(...)
 		pcall(removeWorldById, profile, sid)
 	end
 	markDirty(userId)
+
+	-- Fire CoinsChanged immediately so UI updates promptly (best-effort)
+	pcall(function()
+		local newAmount = profile.core.coins
+		if CoinsChangedBindable then
+			local pl = Players:GetPlayerByUserId(userId)
+			CoinsChangedBindable:Fire(pl or userId, newAmount)
+		end
+	end)
+
 	local ok = PlayerProfileService.ForceFullSaveNow(playerOrId, reason or "ApplySale_Verified")
 	if not ok then
 		PlayerProfileService.SaveNow(playerOrId, reason or "ApplySale_AsyncFallback")

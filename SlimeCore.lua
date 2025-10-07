@@ -1215,17 +1215,17 @@ do
 			rootCF = primary.CFrame
 		end
 
-			local anchorStates = {}
-			for _, p in ipairs(model:GetDescendants()) do
-				if typeof(p) == "Instance" and p:IsA("BasePart") then
-					anchorStates[p] = p.Anchored
-					p.Anchored = true
-					p.AssemblyLinearVelocity = Vector3.zero
-					p.AssemblyAngularVelocity = Vector3.zero
-				end
+		local anchorStates = {}
+		for _, p in ipairs(model:GetDescendants()) do
+			if typeof(p) == "Instance" and p:IsA("BasePart") then
+				anchorStates[p] = p.Anchored
+				p.Anchored = true
+				p.AssemblyLinearVelocity = Vector3.zero
+				p.AssemblyAngularVelocity = Vector3.zero
 			end
+		end
 
-			for _, p in ipairs(model:GetDescendants()) do
+		for _, p in ipairs(model:GetDescendants()) do
 			if typeof(p) == "Instance" and p:IsA("BasePart") and p ~= primary then
 				local relCF = p:GetAttribute("OriginalRelCF")
 				if typeof(relCF) ~= "CFrame" then
@@ -1255,11 +1255,11 @@ do
 
 		refreshLegacyWelds(model)
 
-				for part, wasAnchored in pairs(anchorStates) do
-					pcall(function()
-						part.Anchored = wasAnchored and true or false
-					end)
-				end
+		for part, wasAnchored in pairs(anchorStates) do
+			pcall(function()
+				part.Anchored = wasAnchored and true or false
+			end)
+		end
 
 		model:SetAttribute("CurrentSizeScale", scale)
 		model:SetAttribute("_LastAppliedSizeScale", scale)
@@ -1835,17 +1835,17 @@ do
 			end
 		end
 
-			local anchorStates = {}
-			for _,p in ipairs(slime:GetDescendants()) do
-				if typeof(p) == "Instance" and p:IsA("BasePart") then
-					anchorStates[p] = p.Anchored
-					p.Anchored = true
-					p.AssemblyLinearVelocity = Vector3.zero
-					p.AssemblyAngularVelocity = Vector3.zero
-				end
+		local anchorStates = {}
+		for _,p in ipairs(slime:GetDescendants()) do
+			if typeof(p) == "Instance" and p:IsA("BasePart") then
+				anchorStates[p] = p.Anchored
+				p.Anchored = true
+				p.AssemblyLinearVelocity = Vector3.zero
+				p.AssemblyAngularVelocity = Vector3.zero
 			end
+		end
 
-			for _,p in ipairs(slime:GetDescendants()) do
+		for _,p in ipairs(slime:GetDescendants()) do
 			if typeof(p) == "Instance" and p:IsA("BasePart") and p ~= primary then
 				local relCF = p:GetAttribute("OriginalRelCF")
 				if typeof(relCF) ~= "CFrame" then
@@ -1877,11 +1877,11 @@ do
 			refreshLegacyWelds(slime)
 		end
 
-				for part, wasAnchored in pairs(anchorStates) do
-					pcall(function()
-						part.Anchored = wasAnchored and true or false
-					end)
-				end
+		for part, wasAnchored in pairs(anchorStates) do
+			pcall(function()
+				part.Anchored = wasAnchored and true or false
+			end)
+		end
 
 		slime:SetAttribute("CurrentSizeScale", newScale)
 		slime:SetAttribute("_LastAppliedSizeScale", newScale)

@@ -922,7 +922,7 @@ local function safeRemoveWorldEggForPlayer(playerOrUser, eggId)
 			InventoryService.RemoveInventoryItem(ply, "worldEggs", "id", eggId, { immediate = true })
 			-- make sure inventory folder mirrors profile
 			if type(InventoryService.UpdateProfileInventory) == "function" then
-				InventoryService.UpdateProfileInventory(ply)
+				pcall(function() InventoryService.UpdateProfileInventory(ply) end)
 			end
 		end)
 	end
@@ -1287,7 +1287,7 @@ local function persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
 			pcall(function() safeRemoveWorldEggForPlayer(ownerPlayer or ownerUserId, eggId) end)
 
 			-- NEW: aggressively remove local Inventory.folder entry to avoid duplicate folder artifacts in Explorer
-			-- This is a defensive/local-only operation and does not alter persisted profile directly.
+			-- This is a defensive local-only operation and does not alter persisted profile directly.
 			if ownerPlayer then
 				pcall(function() removeInventoryEntryFolderWithRetries(ownerPlayer, "worldEggs", eggId) end)
 			else
@@ -1975,17 +1975,50 @@ local function placeEgg(player, hitCFrame, tool)
 	worldEgg:SetAttribute("Placed", true)
 	worldEgg:SetAttribute("PlacedAt", os.time())
 	worldEgg:SetAttribute("ManualHatch", MANUAL_HATCH_MODE)
- 	slimeType = applySlimeTypeAttributes(worldEgg, slimeType)
+	slimeType = applySlimeTypeAttributes(worldEgg, slimeType)
 
 	local hatchTime = uniformHatchTime()
 	worldEgg:SetAttribute("HatchTime", hatchTime)
 	worldEgg:SetAttribute("HatchAt", os.time() + hatchTime)
 
+	-- Replace the current placement math with this block (inside placeEgg after worldEgg is cloned)
 	local primary = choosePrimary(worldEgg)
 	if primary then
-		primary.CFrame = hitCFrame
-	end
+		local okModel, modelPivot = pcall(function() return worldEgg:GetPivot() end)
+		local okPrim, primCF = pcall(function() return primary.CFrame end)
+		if okModel and typeof(modelPivot) == "CFrame" and okPrim and typeof(primCF) == "CFrame" then
+			local okRel, relCF = pcall(function() return modelPivot:ToObjectSpace(primCF) end)
+			if okRel and typeof(relCF) == "CFrame" then
+				-- Get template/model rotation only (no translation)
+				local rx, ry, rz = modelPivot:ToOrientation()
+				local rotOnly = CFrame.fromOrientation(rx, ry, rz)
 
+				-- primary position relative to the model pivot (local offset)
+				local localPrimaryPos = relCF.Position
+
+				-- Rotate that local offset into world space using the template rotation
+				local worldOffset = rotOnly:VectorToWorldSpace(localPrimaryPos)
+
+				-- Desired world position for the primary (where the player clicked)
+				local desiredPrimPos = hitCFrame.Position
+
+				-- Compute pivot world position so that: pivotPos + rotatedLocalPrimaryPos == desiredPrimPos
+				local pivotWorldPos = desiredPrimPos - worldOffset
+
+				-- Build pivot with template rotation but positioned so primary sits at desiredPrimPos
+				local targetPivot = CFrame.new(pivotWorldPos) * rotOnly
+
+				-- Pivot the model there
+				pcall(function() worldEgg:PivotTo(targetPivot) end)
+			else
+				-- fallback to naive pivot (shouldn't normally be needed)
+				pcall(function() worldEgg:PivotTo(hitCFrame) end)
+			end
+		else
+			pcall(function() worldEgg:PivotTo(hitCFrame) end)
+		end
+	end
+	
 	local parentFolder = nil
 	local tries = 0
 	repeat
@@ -2109,6 +2142,8 @@ end
 
 -- Replace or insert this function into EggService.lua (place after registerEggModel / pushSnapshot definitions
 -- and before the final `return EggService` so those locals are available).
+-- Replace or insert this function into EggService.lua (it replaces the prior RestoreEggSnapshot)
+-- Replace the existing EggService.RestoreEggSnapshot(...) with this function.
 function EggService.RestoreEggSnapshot(userId, eggList)
 	if not eggList or type(eggList) ~= "table" or #eggList == 0 then return false end
 	local uid = tonumber(userId) or userId
@@ -2289,33 +2324,64 @@ function EggService.RestoreEggSnapshot(userId, eggList)
 				local py = entry and (entry.py or (entry.Position and entry.Position.y))
 				local pz = entry and (entry.pz or (entry.Position and entry.Position.z))
 				if px and py and pz then
-					local okPos, cf = pcall(function() return CFrame.new(tonumber(px) or 0, tonumber(py) or 0, tonumber(pz) or 0) end)
-					if okPos and cf then
-						pcall(function() prim.CFrame = cf end)
+					local okPos, posCF = pcall(function() return CFrame.new(tonumber(px) or 0, tonumber(py) or 0, tonumber(pz) or 0) end)
+					if okPos and posCF then
+						-- Preserve the template/model rotation when placing by position only.
+						-- Previously we called m:PivotTo(posCF) which lost the template rotation and caused eggs to lay on their side.
+						local okPivot, modelPivot = pcall(function() return m:GetPivot() end)
+						if okPivot and typeof(modelPivot) == "CFrame" then
+							-- Extract rotation from the model's pivot and apply it to the desired world position
+							local rx, ry, rz = modelPivot:ToOrientation()
+							local rotOnly = CFrame.fromOrientation(rx, ry, rz)
+							local targetPivot = CFrame.new(posCF.Position) * rotOnly
+							pcall(function() m:PivotTo(targetPivot) end)
+						else
+							-- fallback to pivoting to posCF if no model pivot available
+							pcall(function() m:PivotTo(posCF) end)
+						end
 					end
 				end
 			end
+
+			-- CRITICAL CHANGE: mark model preserved BEFORE parenting so poll/purge won't treat it as an orphan
+			local now = os.time()
+			pcall(function() m:SetAttribute("RecentlyPlacedSaved", true) end)
+			pcall(function() m:SetAttribute("RecentlyPlacedSavedAt", now) end)
+			pcall(function() m:SetAttribute("RestoredByGrandInvSer", true) end)
+			pcall(function() m:SetAttribute("PreserveOnServer", true) end)
+			pcall(function() m:SetAttribute("RestoreStamp", tick()) end)
 
 			-- parent to plotFolder if found, else to Workspace
 			local targetParent = plotFolder or Workspace
 			pcall(function() m.Parent = targetParent end)
 
-			-- set RecentlyPlacedSaved markers to avoid immediate cleanup/dedupe
-			local now = os.time()
-			pcall(function() m:SetAttribute("RecentlyPlacedSaved", true) end)
-			pcall(function() m:SetAttribute("RecentlyPlacedSavedAt", now) end)
-			pcall(function() m:SetAttribute("RestoredByGrandInvSer", true) end)
-
-			-- ensure PrimaryPart and an interaction object exist
+			-- Ensure PrimaryPart and an interaction object exist (after parenting to allow template-relative queries)
 			ensurePrimaryAndInteraction(m)
 
 			-- ensure EggService register sees it: call registerEggModel (module-local)
-			pcall(function() registerEggModel(m) end)
+			pcall(function()
+				registerEggModel(m)
+			end)
 
 			-- ensure we push a snapshot to EggSnapshot for consistency
 			pcall(function() pushSnapshot(m) end)
 
+			-- Defensive re-register + snapshot after short delays to reduce race windows
+			task.defer(function()
+				pcall(function()
+					registerEggModel(m)
+					pushSnapshot(m)
+				end)
+			end)
+			task.delay(0.25, function()
+				pcall(function()
+					registerEggModel(m)
+					pushSnapshot(m)
+				end)
+			end)
+
 			createdAny = true
+			dprint(("[RestoreEggSnapshot] restored eggId=%s parent=%s owner=%s"):format(tostring(eggId), tostring(targetParent and targetParent:GetFullName()), tostring(uid)))
 		end)
 	end
 
@@ -2332,63 +2398,15 @@ local function pollLoop()
 				updatePlayerAttr(rec.OwnerUserId)
 				removeSnapshotEntry(rec.OwnerUserId, egg:GetAttribute("EggId"))
 			else
-				if (not rec.LastGuiUpdate) or (now - rec.LastGuiUpdate >= HATCH_GUI_UPDATE_INTERVAL) then
-					local gui = egg:FindFirstChild(HATCH_TIMER_NAME)
-					if not gui then
-						local primary = egg.PrimaryPart or egg:FindFirstChildWhichIsA("BasePart")
-						if primary then
-							local billboard = Instance.new("BillboardGui")
-							billboard.Name = HATCH_TIMER_NAME
-							billboard.Size = HATCH_GUI_SIZE
-							billboard.AlwaysOnTop = true
-							billboard.MaxDistance = 0
-							billboard.StudsOffsetWorldSpace = Vector3.new(0,(primary.Size.Y)*0.5 + HATCH_GUI_OFFSET_Y,0)
-							billboard.Adornee = primary
-
-							local label = Instance.new("TextLabel")
-							label.Name = "TimeLabel"
-							label.BackgroundTransparency = 1
-							label.Size = UDim2.fromScale(1,1)
-							label.Font = HATCH_GUI_FONT
-							label.TextScaled = true
-							label.TextColor3 = HATCH_GUI_TEXTCOLOR
-							label.TextStrokeColor3 = HATCH_GUI_TEXTSTROKE
-							label.TextStrokeTransparency = HATCH_GUI_TEXTSTROKE_T
-							label.Text = ""
-							label.Parent = billboard
-
-							billboard.Parent = egg
-						end
-					end
-					local billboard = egg:FindFirstChild(HATCH_TIMER_NAME)
-					if billboard then
-						local label = billboard:FindFirstChild("TimeLabel")
-						if label then
-							local remaining = rec.HatchAt - now
-							if remaining <= 0 then
-								label.Text = MANUAL_HATCH_MODE and "Ready!" or "Hatching..."
-								label.TextColor3 = Color3.fromRGB(120,255,120)
-							else
-								local m = math.floor(remaining/60)
-								local s = math.floor(remaining%60)
-								if HATCH_TIME_DECIMALS > 0 then
-									label.Text = string.format("%02d:%02d.%d", m,s, math.floor((remaining - math.floor(remaining))*10))
-								else
-									label.Text = string.format("%02d:%02d", m, s)
-								end
-								if remaining <= HATCH_LOW_WARN_THRESHOLD and HATCH_FLASH_RATE then
-									local t = (math.sin(now * math.pi * HATCH_FLASH_RATE)+1)*0.5
-									label.TextColor3 = HATCH_GUI_TEXTCOLOR:Lerp(HATCH_WARN_COLOR, t)
-								else
-									label.TextColor3 = HATCH_GUI_TEXTCOLOR
-								end
-							end
-						end
-					end
-					rec.LastGuiUpdate = now
+				-- Defensive: remove any server-created hatch timer so we don't replicate timers to all clients.
+				-- Client-side LocalScript will render owner-only timers.
+				local existingGui = egg:FindFirstChild(HATCH_TIMER_NAME)
+				if existingGui then
+					pcall(function() existingGui:Destroy() end)
 				end
 
-				if (not MANUAL_HATCH_MODE) and AUTO_HATCH_WHEN_READY and rec.HatchAt <= now then
+				-- Server still handles auto-hatch when enabled
+				if (not MANUAL_HATCH_MODE) and AUTO_HATCH_WHEN_READY and rec.HatchAt and rec.HatchAt <= now then
 					hatchEgg(egg)
 				end
 			end
