@@ -1,26 +1,8 @@
 -- SlimeCore.lua
--- Fully consolidated module combining:
---   ModelUtils, ColorUtil, SlimeAppearance, SlimeConfig, SlimeMutation,
---   SlimeFactory, GrowthScaling, GrowthService, SlimeHungerService,
---   GrowthPersistenceService.
--- Added: syncModelGrowthIntoProfile to copy authoritative model attributes
---        into the cached PlayerProfile.inventory.worldSlimes entry and push
---        an inventory update so UI reflects growth changes in-session.
---
--- Usage:
---   local SlimeCore = require(path.to.SlimeCore)
---   SlimeCore.Init()                      -- starts Growth & Hunger loops
---   SlimeCore.GrowthPersistenceService:Init(orchestrator) -- init persistence orchestrator
---
--- Note: GrowthPersistenceService is decoupled and expects an orchestrator object
--- that implements MarkDirty(player, reason) and SaveNow(player, reason, opts).
--- This preserves no-circular-dependency behavior.
+-- Fully consolidated module combining various services and utilities.
 
 local SlimeCore = {}
 
-----------------------------------------------------------
--- External dependencies (expected to exist in Modules folder)
-----------------------------------------------------------
 local ModulesRoot = script.Parent
 local RNG = require(ModulesRoot:WaitForChild("RNG"))
 local SizeRNG = require(ModulesRoot:WaitForChild("SizeRNG"))
@@ -32,6 +14,7 @@ local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 
 local function getRestoreGraceUntil(slime)
 	if not slime or typeof(slime) ~= "Instance" then return nil end
@@ -51,6 +34,9 @@ local function isWithinRestoreGrace(slime, nowEpoch)
 	return getRestoreGraceRemaining(slime, nowEpoch) > 0
 end
 
+
+
+
 local function finalizeRestoreGraceIfExpired(slime, nowEpoch)
 	nowEpoch = nowEpoch or os.time()
 	local untilTs = getRestoreGraceUntil(slime)
@@ -62,6 +48,26 @@ local function finalizeRestoreGraceIfExpired(slime, nowEpoch)
 	end
 	return false
 end
+
+-- New helper: normalizeEpochFromMaybeTick
+-- Place this after the getRestoreGraceUntil / isWithinRestoreGrace helpers near the top of the file.
+-- New helper: normalizeEpochFromMaybeTick
+-- Place this after getRestoreGraceUntil / isWithinRestoreGrace helpers near the top of the file.
+local function normalizeEpochFromMaybeTick(value, nowEpoch)
+	nowEpoch = nowEpoch or os.time()
+	if type(value) ~= "number" then return nil end
+	-- Heuristic: epoch seconds are large (> ~1e8). If so, return as-is.
+	if value > 1e8 then return value end
+	-- Otherwise assume it's a tick()-style timestamp; convert using current tick() anchor.
+	local ok, currentTick = pcall(function() return tick() end)
+	if not ok or type(currentTick) ~= "number" then
+		-- If tick() isn't available for some reason, return now as a safe fallback.
+		return nowEpoch
+	end
+	-- Compute epoch = nowEpoch + (savedTick - currentTick)
+	return nowEpoch + (value - currentTick)
+end
+
 
 local BASE_WEIGHT_LBS = 15
 local MIN_SCALE = 0.05
@@ -159,9 +165,6 @@ local function ensureWeightAlignedMax(inst, currentMax, epsilon)
 	return currentMax
 end
 
-----------------------------------------------------------
--- ModelUtils
-----------------------------------------------------------
 local ModelUtils = {}
 do
 	local REMOVE_CLASSES = {
@@ -238,12 +241,9 @@ end
 SlimeCore.ModelUtils = ModelUtils
 SlimeCore.SlimeTypeRegistry = SlimeTypeRegistry
 
-
 local DEBUG = _G.DEBUG
 local dprint = _G.dprint or function(...) end
-----------------------------------------------------------
--- ColorUtil
-----------------------------------------------------------
+
 local ColorUtil = {}
 do
 	function ColorUtil.ColorToHex(c)
@@ -266,9 +266,6 @@ do
 end
 SlimeCore.ColorUtil = ColorUtil
 
-----------------------------------------------------------
--- SlimeAppearance
-----------------------------------------------------------
 local SlimeAppearance = {}
 do
 	SlimeAppearance.ColorFamilies = {
@@ -355,7 +352,7 @@ do
 				Color3.fromRGB(242,188,118),
 				Color3.fromRGB(255,210,130),
 			},
-			accents = {
+			acents = {
 				Color3.fromRGB(230,150,40),
 				Color3.fromRGB(240,168,72),
 				Color3.fromRGB(212,140,52),
@@ -575,12 +572,62 @@ do
 			MutatedEyes = mutatedEyes
 		}
 	end
+
+	-- Helper: estimate how "valuable" a color is by comparing to rarity palettes.
+	-- Returns a numeric multiplier (>= 0) and best match metadata.
+	SlimeAppearance._RarityValueMultiplier = {
+		Common    = 1.00,
+		Rare      = 1.06,
+		Epic      = 1.12,
+		Legendary = 1.25,
+	}
+
+	local function colorDistance(a, b)
+		if not a or not b then return math.huge end
+		local dr = a.R - b.R
+		local dg = a.G - b.G
+		local db = a.B - b.B
+		return math.sqrt(dr*dr + dg*dg + db*db)
+	end
+
+	function SlimeAppearance.EstimateColorRarityMultiplier(color3)
+		if typeof(color3) ~= "Color3" then return 1.0 end
+
+		local bestRarity = nil
+		local bestDist = math.huge
+
+		for rarityName, palette in pairs(SlimeAppearance.RarityPalettes) do
+			if palette and palette.bodies and type(palette.bodies) == "table" then
+				for _, paletteColor in ipairs(palette.bodies) do
+					local d = colorDistance(color3, paletteColor)
+					if d < bestDist then
+						bestDist = d
+						bestRarity = rarityName
+					end
+				end
+			end
+		end
+
+		if not bestRarity then
+			for famName, fam in pairs(SlimeAppearance.ColorFamilies) do
+				if fam and fam.bodies then
+					for _, paletteColor in ipairs(fam.bodies) do
+						local d = colorDistance(color3, paletteColor)
+						if d < bestDist then
+							bestDist = d
+							bestRarity = "Common"
+						end
+					end
+				end
+			end
+		end
+
+		local mult = SlimeAppearance._RarityValueMultiplier[bestRarity] or 1.0
+		return mult, bestRarity, bestDist
+	end
 end
 SlimeCore.SlimeAppearance = SlimeAppearance
 
-----------------------------------------------------------
--- SlimeConfig
-----------------------------------------------------------
 local SlimeConfig = {}
 do
 	SlimeConfig.AverageScaleBasic = 1.0
@@ -658,9 +705,6 @@ do
 end
 SlimeCore.SlimeConfig = SlimeConfig
 
-----------------------------------------------------------
--- GrowthScaling (integrated)
-----------------------------------------------------------
 local GrowthScaling = {}
 do
 	function GrowthScaling.SizeDurationFactor(tier, size_norm)
@@ -677,12 +721,10 @@ do
 end
 SlimeCore.GrowthScaling = GrowthScaling
 
-----------------------------------------------------------
--- SlimeMutation
-----------------------------------------------------------
 local SlimeMutation = {}
 do
 	local MAX_HISTORY = 25
+
 	local function getHistory(slime)
 		local raw = slime:GetAttribute("MutationHistory")
 		if not raw or raw == "" then return {} end
@@ -690,6 +732,7 @@ do
 		if ok and type(data) == "table" then return data end
 		return {}
 	end
+
 	local function setHistory(slime, tbl)
 		if type(tbl) == "table" and #tbl > MAX_HISTORY then
 			while #tbl > MAX_HISTORY do table.remove(tbl, 1) end
@@ -697,6 +740,7 @@ do
 		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, tbl)
 		if ok then slime:SetAttribute("MutationHistory", encoded) end
 	end
+
 	local function lowercaseMatchAny(name, patterns)
 		name = name:lower()
 		for _,pat in ipairs(patterns) do
@@ -745,27 +789,51 @@ do
 		return 1
 	end
 
+	local function tweenPartColor(part, targetColor, seconds)
+		if not part or not part.Parent then return end
+		seconds = tonumber(seconds) or 1.0
+		local ts = (rawget(_G, "TweenService")) or game:GetService("TweenService")
+		local ok, ti = pcall(function() return TweenInfo.new(math.max(0.01, seconds), Enum.EasingStyle.Quad, Enum.EasingDirection.Out) end)
+		if not ok then
+			pcall(function() part.Color = targetColor end)
+			return
+		end
+		local ok2, tween = pcall(function() return ts:Create(part, ti, { Color = targetColor }) end)
+		if ok2 and tween then
+			pcall(function() tween:Play() end)
+		else
+			pcall(function() part.Color = targetColor end)
+		end
+	end
+
 	local function applyColorMutation(slime, tierCfg, mutCfg, rng)
 		local mutable = gatherMutableParts(slime, tierCfg)
 		if #mutable == 0 then
 			return { valueMult = resolveValueMultiplier(mutCfg, "Color"), details = { parts = {} } }
 		end
+
 		local colorCfg = mutCfg.Color or {}
 		local jitterBase = tierCfg.MutationColorJitter or { H = 0.12, S = 0.18, V = 0.20 }
 		local h, s, v = resolveJitter(colorCfg.Jitter, jitterBase)
 		rng = getRaw(rng)
 		local mutateAll = RNG.Bool(colorCfg.MultiPartChance or 0.35, rng)
 		local mutatedParts = {}
+
+		local transitionSeconds = tonumber(colorCfg.TransitionSeconds) or tonumber(mutCfg.TransitionSeconds) or 1.2
+
 		if mutateAll then
 			for _,part in ipairs(mutable) do
-				part.Color = RNG.DriftColor(part.Color, h, s, v, rng)
+				local target = RNG.DriftColor(part.Color, h, s, v, rng)
+				pcall(function() tweenPartColor(part, target, transitionSeconds) end)
 				table.insert(mutatedParts, part.Name)
 			end
 		else
-			local target = mutable[RNG.Int(1, #mutable, rng)]
-			target.Color = RNG.DriftColor(target.Color, h * 1.15, s * 1.1, v * 1.1, rng)
-			table.insert(mutatedParts, target.Name)
+			local targetPart = mutable[RNG.Int(1, #mutable, rng)]
+			local targetColor = RNG.DriftColor(targetPart.Color, h * 1.15, s * 1.1, v * 1.1, rng)
+			pcall(function() tweenPartColor(targetPart, targetColor, transitionSeconds) end)
+			table.insert(mutatedParts, targetPart.Name)
 		end
+
 		return {
 			valueMult = resolveValueMultiplier(mutCfg, "Color"),
 			details = { parts = mutatedParts, mode = mutateAll and "spread" or "focus" },
@@ -790,15 +858,18 @@ do
 		local maxBoost = tonumber(range[2]) or minBoost
 		if maxBoost < minBoost then maxBoost = minBoost end
 		local boost = RNG.Float(minBoost, maxBoost, rng)
-		local currentMax = slime:GetAttribute("MaxSizeScale") or tierCfg.BaseMaxSizeRange and tierCfg.BaseMaxSizeRange[2] or 1
+
+		local currentMax = slime:GetAttribute("MaxSizeScale") or (tierCfg.BaseMaxSizeRange and tierCfg.BaseMaxSizeRange[2]) or 1
 		if currentMax <= 0 then currentMax = 1 end
 		local newMax = currentMax * boost
 		local cap = tonumber(tierCfg.AbsoluteMaxScaleCap) or math.huge
 		if newMax > cap then newMax = cap end
+
 		newMax = ensureWeightAlignedMax(slime, newMax, 1e-4)
 		slime:SetAttribute("MaxSizeScale", newMax)
 		slime:SetAttribute("MutationSizeBoost", (slime:GetAttribute("MutationSizeBoost") or 1) * (newMax / math.max(currentMax, 1e-4)))
-		if sizeCfg.AdjustCurrentScale ~= false then
+
+		if sizeCfg.AdjustCurrentScale == true then
 			local progress = math.clamp(tonumber(slime:GetAttribute("GrowthProgress")) or 0, 0, 1)
 			local startScale = tonumber(slime:GetAttribute("StartSizeScale")) or newMax
 			local eased = progress * progress * (3 - 2 * progress)
@@ -807,6 +878,7 @@ do
 			local refreshToken = (slime:GetAttribute("ForceScaleRefresh") or 0) + 1
 			slime:SetAttribute("ForceScaleRefresh", refreshToken)
 		end
+
 		return {
 			valueMult = resolveValueMultiplier(mutCfg, "Size"),
 			details = { boost = boost, newMax = newMax },
@@ -820,13 +892,17 @@ do
 		local mutatedParts = {}
 		local jitterPreset = physicalCfg.Jitter or { H = 0.22, S = 0.26, V = 0.26 }
 		local h, s, v = resolveJitter(jitterPreset, tierCfg.MutationColorJitter)
+		local transitionSeconds = tonumber(physicalCfg.TransitionSeconds) or 1.2
+
 		for _,part in ipairs(mutable) do
-			part.Color = RNG.DriftColor(part.Color, h, s, v, rng)
+			local target = RNG.DriftColor(part.Color, h, s, v, rng)
+			pcall(function() tweenPartColor(part, target, transitionSeconds) end)
 			if physicalCfg.NeonizeParts then
-				part.Material = Enum.Material.Neon
+				pcall(function() part.Material = Enum.Material.Neon end)
 			end
 			table.insert(mutatedParts, part.Name)
 		end
+
 		local highlight = slime:FindFirstChild("MutationHighlight")
 		if not highlight or not highlight:IsA("Highlight") then
 			highlight = Instance.new("Highlight")
@@ -839,6 +915,7 @@ do
 		highlight.FillTransparency = physicalCfg.HighlightTransparency or 0.18
 		highlight.OutlineColor = physicalCfg.HighlightOutlineColor or Color3.fromRGB(120, 135, 70)
 		highlight.OutlineTransparency = 0.05
+
 		return {
 			valueMult = resolveValueMultiplier(mutCfg, "Physical"),
 			details = { highlight = true, parts = mutatedParts },
@@ -923,6 +1000,7 @@ do
 			mutType = "Color"
 			handler = MUTATION_APPLIERS.Color
 		end
+
 		local result = nil
 		if handler then
 			local ok, payload = pcall(handler, slime, cfg, mutCfg, rawRng)
@@ -932,6 +1010,7 @@ do
 				warn(string.format("[SlimeMutation] Mutation handler '%s' failed: %s", tostring(mutType), tostring(payload)))
 			end
 		end
+
 		local appliedMult = (result and result.valueMult) or resolveValueMultiplier(mutCfg, mutType)
 		if type(appliedMult) ~= "number" or appliedMult <= 0 then appliedMult = 1 end
 		local currentMult = slime:GetAttribute("MutationValueMult") or 1
@@ -941,6 +1020,7 @@ do
 		if valueMultCap and combinedMult > valueMultCap then combinedMult = valueMultCap end
 		if combinedMult < 0.01 then combinedMult = 0.01 end
 		slime:SetAttribute("MutationValueMult", combinedMult)
+
 		local count = (slime:GetAttribute("MutationCount") or 0) + 1
 		slime:SetAttribute("MutationCount", count)
 		slime:SetAttribute("MutationLastType", mutType)
@@ -961,14 +1041,32 @@ do
 		setHistory(slime, hist)
 
 		SlimeMutation.RecomputeValueFull(slime)
+
+		do
+			local okCreate = pcall(function()
+				local rootFolder = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("Events")
+				if not rootFolder then
+					rootFolder = Instance.new("Folder")
+					rootFolder.Name = "Remotes"
+					rootFolder.Parent = ReplicatedStorage
+				end
+				local re = rootFolder:FindFirstChild("SlimeMutation")
+				if not re then
+					re = Instance.new("RemoteEvent")
+					re.Name = "SlimeMutation"
+					re.Parent = rootFolder
+				end
+				if re and re:IsA("RemoteEvent") then
+					pcall(function() re:FireAllClients(slime, { mutationType = mutType, valueMult = appliedMult }) end)
+				end
+			end)
+		end
+
 		return true
 	end
 end
 SlimeCore.SlimeMutation = SlimeMutation
 
-----------------------------------------------------------
--- SlimeFactory
-----------------------------------------------------------
 local SlimeFactory = {}
 do
 	local DEFAULT_TEMPLATE_PATH = { "Assets", "Slime" }
@@ -1126,7 +1224,6 @@ do
 	end
 
 	local function captureOriginalData(model, primary)
-		pcall(function() print("[WS_DBG captureOriginalData(SlimeCore)] model=", (model and model.Name) or "<nil>", "primary=", (primary and primary.Name) or "<nil>") end)
 		for _,part in ipairs(model:GetDescendants()) do
 			if typeof(part) == "Instance" and part:IsA("BasePart") then
 				part:SetAttribute("OriginalSize", part.Size)
@@ -1147,12 +1244,7 @@ do
 						local yaw = nil
 						pcall(function() yaw = math.atan2(-rel.LookVector.X, -rel.LookVector.Z) end)
 						if yaw then part:SetAttribute("OriginalRelYaw", yaw) end
-						pcall(function()
-							local sid = model.GetAttribute and model:GetAttribute("SlimeId") or "<nil>"
-							print("[WS_DBG captureOriginalData] SlimeId=", tostring(sid), "part=", part.Name, "OriginalRelOffset=", tostring(part:GetAttribute("OriginalRelOffset")), "OriginalRelYaw=", tostring(part:GetAttribute("OriginalRelYaw")))
-						end)
 					else
-						pcall(function() print("[WS_DBG captureOriginalData(SlimeCore)] missing primary or ToObjectSpace failed for part=", part.Name) end)
 						part:SetAttribute("OriginalRelOffset", nil)
 						part:SetAttribute("OriginalRelYaw", nil)
 					end
@@ -1182,7 +1274,6 @@ do
 		return math.max(desired, needed)
 	end
 
-	-- Replace SlimeFactory.applyScale with this implementation (keeps rotation, scales offsets)
 	local function applyScale(model, primary, scale)
 		if not scale or scale <= 0 then return end
 		ensureOriginalBounds(model, primary)
@@ -1314,6 +1405,7 @@ do
 		end
 	end
 
+	-- SlimeFactory.BuildNew + SlimeFactory.RestoreFromSnapshot (with debug traces)
 	function SlimeFactory.BuildNew(params)
 		params = params or {}
 		local resolvedType = nil
@@ -1402,7 +1494,6 @@ do
 
 		pcall(function() ModelUtils.AutoWeld(slime, primary) end)
 
-		-- Ensure persisted progress is initialized for newly created slimes so storage reflects current state.
 		slime:SetAttribute("PersistedGrowthProgress", slime:GetAttribute("GrowthProgress") or 0)
 		slime:SetAttribute("FactoryVisualReady", true)
 
@@ -1453,9 +1544,6 @@ do
 			ValuePerGrowth = pick(snapshot.ValuePerGrowth, snapshot.vg),
 			GrowthProgress = pick(snapshot.GrowthProgress, snapshot.gp),
 			FedFraction = pick(snapshot.FedFraction, snapshot.ff),
-			CurrentFullness = pick(snapshot.CurrentFullness, snapshot.cf),
-			LastHungerUpdate = pick(snapshot.LastHungerUpdate, snapshot.lu),
-			HungerDecayRate = pick(snapshot.HungerDecayRate, snapshot.hd),
 			CurrentSizeScale = pick(snapshot.CurrentSizeScale, snapshot.sz),
 			StartSizeScale = pick(snapshot.StartSizeScale, snapshot.st),
 			MaxSizeScale = pick(snapshot.MaxSizeScale, snapshot.mx),
@@ -1540,16 +1628,50 @@ do
 			graceSeconds = snapshot.RestoreGraceSeconds
 		end
 
+		-- Diagnostic: show what we received and will normalize
+		pcall(function()
+			local sid = tostring(slime:GetAttribute("SlimeId") or "<nil>")
+			dprint(("[RestoreDebug] RestoreFromSnapshot start sid=%s owner=%s"):format(sid, tostring(ownerId)))
+		end)
+
 		local storedHunger = slime:GetAttribute("LastHungerUpdate")
-		if storedHunger then slime:SetAttribute("_RestoreOriginalLastHungerUpdate", storedHunger) end
-		slime:SetAttribute("LastHungerUpdate", now)
-		local cf = slime:GetAttribute("CurrentFullness")
-		if cf ~= nil then slime:SetAttribute("FedFraction", cf) end
+		if type(storedHunger) == "number" then
+			-- Debug: log original stored hunger timestamp before normalization
+			pcall(function() dprint(("[RestoreDebug] sid=%s stored LastHungerUpdate (raw)=%s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(storedHunger))) end)
+
+			-- normalize tick()-style or epoch values into epoch seconds once and store the normalized value
+			local normalizedH = normalizeEpochFromMaybeTick(tonumber(storedHunger) or nil, now)
+			if normalizedH and type(normalizedH) == "number" then
+				slime:SetAttribute("_RestoreOriginalLastHungerUpdate", normalizedH)
+				pcall(function() dprint(("[RestoreDebug] sid=%s normalized LastHungerUpdate -> %s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(normalizedH))) end)
+			else
+				slime:SetAttribute("_RestoreOriginalLastHungerUpdate", storedHunger)
+				pcall(function() dprint(("[RestoreDebug] sid=%s kept non-numeric LastHungerUpdate as-is -> %s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(storedHunger))) end)
+			end
+		end
 
 		local storedGrowth = slime:GetAttribute("LastGrowthUpdate")
-		if storedGrowth then slime:SetAttribute("_RestoreOriginalLastGrowthUpdate", storedGrowth) end
-		slime:SetAttribute("LastGrowthUpdate", now)
+		if type(storedGrowth) == "number" then
+			-- Debug: log original stored growth timestamp before normalization
+			pcall(function() dprint(("[RestoreDebug] sid=%s stored LastGrowthUpdate (raw)=%s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(storedGrowth))) end)
 
+			local normalizedG = normalizeEpochFromMaybeTick(tonumber(storedGrowth) or nil, now)
+			if normalizedG and type(normalizedG) == "number" then
+				slime:SetAttribute("_RestoreOriginalLastGrowthUpdate", normalizedG)
+				pcall(function() dprint(("[RestoreDebug] sid=%s normalized LastGrowthUpdate -> %s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(normalizedG))) end)
+			else
+				slime:SetAttribute("_RestoreOriginalLastGrowthUpdate", storedGrowth)
+				pcall(function() dprint(("[RestoreDebug] sid=%s kept non-numeric LastGrowthUpdate as-is -> %s"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>"), tostring(storedGrowth))) end)
+			end
+		end
+
+		-- clear any persistent marker that suggests offline growth was previously applied on another server instance
+		pcall(function()
+			slime:SetAttribute("OfflineGrowthAppliedAt", nil)
+			dprint(("[RestoreDebug] sid=%s cleared OfflineGrowthAppliedAt"):format(tostring(slime:GetAttribute("SlimeId") or "<nil>")))
+		end)
+
+		-- set grace timer for restore behavior
 		slime:SetAttribute("_RestoreTimerGraceUntil", now + graceSeconds)
 		slime:SetAttribute("RestoreTimerGraceSeconds", graceSeconds)
 		slime:SetAttribute("RestoreTimerGraceAppliedAt", now)
@@ -1559,18 +1681,10 @@ do
 
 	SlimeFactory.CreateFromSnapshot = SlimeFactory.RestoreFromSnapshot
 	SlimeFactory.BuildFromSnapshot = SlimeFactory.RestoreFromSnapshot
-
-	-- Replacement SlimeFactory.RestoreFromSnapshot (full implementation above in BuildNew block for clarity)
-	-- Note: RestoreFromSnapshot implemented earlier in full above inside this block (function present).
-
 end
+
 SlimeCore.SlimeFactory = SlimeFactory
 
-
-
-----------------------------------------------------------
--- GrowthService
-----------------------------------------------------------
 local GrowthService = {}
 do
 	local CONFIG = {
@@ -1582,7 +1696,6 @@ do
 		DEBUG             = false,
 		DEBUG_INIT        = false,
 		HungerGrowthEnabled = true,
-
 		OFFLINE_GROWTH_ENABLED           = true,
 		OFFLINE_GROWTH_MAX_SECONDS       = 12 * 3600,
 		OFFLINE_GROWTH_VERBOSE           = true,
@@ -1592,19 +1705,17 @@ do
 		SECOND_PASS_REAPPLY_WINDOW       = 2.0,
 		DEFER_OFFLINE_APPLY_ONE_HEARTBEAT = false,
 		NON_REGRESS_SECOND_PASS_WINDOW   = 4.0,
-
 		OFFLINE_DEBUG                    = true,
 		OFFLINE_DEBUG_ATTR_SNAPSHOT      = true,
 		OFFLINE_DEBUG_TAG                = "[GrowthOffline]",
-
 		STAMP_DIRTY_DEBOUNCE             = 6,
 		MICRO_PROGRESS_THRESHOLD         = 0.005,
 		MICRO_DEBOUNCE_SECONDS           = 1.0,
 	}
 
-	local SlimeCache = {}            -- slime instance -> cache
-	local PendingOffline = {}        -- slime -> true
-	local lastStampDirtyByPlayer = {}-- userId -> epoch
+	local SlimeCache = {}
+	local PendingOffline = {}
+	local lastStampDirtyByPlayer = {}
 	local growthDirtyEvent = ReplicatedStorage:FindFirstChild("GrowthStampDirty")
 	if not growthDirtyEvent then
 		growthDirtyEvent = Instance.new("BindableEvent")
@@ -1612,9 +1723,9 @@ do
 		growthDirtyEvent.Parent = ReplicatedStorage
 	end
 
-	local lastPersistedProgress = {} -- slimeId -> floor
-	local microCumulative = {}       -- slimeId -> cum delta
-	local lastMicroStampByPlayer = {}-- userId -> epoch
+	local lastPersistedProgress = {}
+	local microCumulative = {}
+	local lastMicroStampByPlayer = {}
 	local refreshLegacyWelds = SlimeFactory._RefreshLegacyWelds
 
 	local function dprint(...) if CONFIG.DEBUG then print("[GrowthService]", ...) end end
@@ -1661,27 +1772,39 @@ do
 		end
 	end
 
+	-- Replace GrowthService.restoreOriginalOfflineTimestamps
+	-- (Find the existing function named restoreOriginalOfflineTimestamps in GrowthService and replace it with this.)
+	-- Replace GrowthService.restoreOriginalOfflineTimestamps with this implementation.
+	-- Find the existing function named restoreOriginalOfflineTimestamps in GrowthService and replace it.
 	local function restoreOriginalOfflineTimestamps(slime)
 		local restored = false
 		if not slime or not slime.Parent then return restored end
+
+		local now = os.time()
+
 		local originalGrowth = slime:GetAttribute("_RestoreOriginalLastGrowthUpdate")
 		if type(originalGrowth) == "number" then
+			-- Normalize values that might have been stored with tick()
+			local normalized = normalizeEpochFromMaybeTick(originalGrowth, now)
 			local prev = slime:GetAttribute("LastGrowthUpdate")
-			slime:SetAttribute("LastGrowthUpdate", originalGrowth)
+			slime:SetAttribute("LastGrowthUpdate", normalized)
 			slime:SetAttribute("_RestoreOriginalLastGrowthUpdate", nil)
 			restored = true
-			logOffline(slime, "restore_last_growth", {prev=prev, restored=originalGrowth})
+			logOffline(slime, "restore_last_growth", {prev=prev, restored=normalized})
 		end
+
 		local originalHunger = slime:GetAttribute("_RestoreOriginalLastHungerUpdate")
 		if type(originalHunger) == "number" then
+			local normalizedH = normalizeEpochFromMaybeTick(originalHunger, now)
 			local prev = slime:GetAttribute("LastHungerUpdate")
-			slime:SetAttribute("LastHungerUpdate", originalHunger)
+			slime:SetAttribute("LastHungerUpdate", normalizedH)
 			slime:SetAttribute("_RestoreOriginalLastHungerUpdate", nil)
-			logOffline(slime, "restore_last_hunger", {prev=prev, restored=originalHunger})
+			logOffline(slime, "restore_last_hunger", {prev=prev, restored=normalizedH})
 		end
+
 		return restored
 	end
-
+	
 	local function markStampDirty(slime, reason)
 		local uid = slime:GetAttribute("OwnerUserId")
 		if not uid then return end
@@ -1727,12 +1850,9 @@ do
 		end
 	end
 
-	-- Hunger multiplier: prefer SlimeCore.SlimeHungerService.GetHungerMultiplier if available,
-	-- otherwise fall back to default fed fraction formula.
 	local function hungerMultiplier(slime)
 		if not (CONFIG.HungerGrowthEnabled) then return 1 end
 		if isWithinRestoreGrace(slime) then return 1 end
-		-- prefer the unified hunger service exposed on SlimeCore if present
 		if SlimeCore and SlimeCore.SlimeHungerService and type(SlimeCore.SlimeHungerService.GetHungerMultiplier) == "function" then
 			local ok, val = pcall(function() return SlimeCore.SlimeHungerService.GetHungerMultiplier(slime) end)
 			if ok and type(val) == "number" then
@@ -1887,9 +2007,10 @@ do
 		slime:SetAttribute("_LastAppliedSizeScale", newScale)
 	end
 
-	-- Sync model attributes into the authoritative cached profile (player inventory) and push inventory update.
-	-- This is lazy/defensive: it requires PlayerProfileService/InventoryService at call time (pcall),
-	-- and marks the profile dirty and calls InventoryService.UpdateProfileInventory to update clients.
+	-- Replace GrowthService.syncModelGrowthIntoProfile
+	-- (Find the existing function named syncModelGrowthIntoProfile in GrowthService and replace it with this.)
+	-- Replace GrowthService.syncModelGrowthIntoProfile with this implementation.
+	-- Find the existing function named syncModelGrowthIntoProfile in GrowthService and replace it.
 	local function syncModelGrowthIntoProfile(slime)
 		if not slime or not slime.Parent then return end
 		local owner = nil
@@ -1900,7 +2021,6 @@ do
 		end)
 		if not owner or not sid then return end
 
-		-- require PlayerProfileService / InventoryService lazily (avoid module init cycles)
 		local PlayerProfileService = nil
 		local InventoryService = nil
 		local ok, svc = pcall(function() return require(ModulesRoot:WaitForChild("PlayerProfileService")) end)
@@ -1908,13 +2028,11 @@ do
 		local ok2, inv = pcall(function() return require(ModulesRoot:WaitForChild("InventoryService")) end)
 		if ok2 and inv then InventoryService = inv end
 
-		-- must have PPS to update cached profile; otherwise bail
 		if not PlayerProfileService or type(PlayerProfileService.GetProfile) ~= "function" then return end
 
 		local profile = nil
 		pcall(function() profile = PlayerProfileService.GetProfile(owner) end)
 		if not profile then
-			-- try a short WaitForProfile if available
 			if PlayerProfileService and type(PlayerProfileService.WaitForProfile) == "function" then
 				local okp, p = pcall(function() return PlayerProfileService.WaitForProfile(owner, 0.25) end)
 				if okp then profile = p end
@@ -1925,16 +2043,22 @@ do
 		profile.inventory = profile.inventory or {}
 		profile.inventory.worldSlimes = profile.inventory.worldSlimes or {}
 
-		-- gather model attrs
 		local gp = slime:GetAttribute("GrowthProgress")
 		local pgp = slime:GetAttribute("PersistedGrowthProgress")
 		local lgu = slime:GetAttribute("LastGrowthUpdate")
+		-- normalize LastGrowthUpdate if it is tick-based
+		if type(lgu) == "number" then
+			lgu = normalizeEpochFromMaybeTick(lgu, os.time())
+		end
 		local ts  = slime:GetAttribute("Timestamp") or lgu
 
-		-- hunger attributes
 		local cf = slime:GetAttribute("CurrentFullness")
 		local ff = slime:GetAttribute("FedFraction")
 		local lhu = slime:GetAttribute("LastHungerUpdate")
+		-- normalize LastHungerUpdate if it is tick-based
+		if type(lhu) == "number" then
+			lhu = normalizeEpochFromMaybeTick(lhu, os.time())
+		end
 		local hdr = slime:GetAttribute("HungerDecayRate")
 
 		local pos = nil
@@ -1955,7 +2079,6 @@ do
 					if ts  ~= nil then entry.Timestamp = ts; updated = true end
 					if pos then entry.Position = pos; updated = true end
 
-					-- hunger
 					if cf ~= nil then entry.CurrentFullness = cf; updated = true end
 					if ff ~= nil then entry.FedFraction = ff; updated = true end
 					if lhu ~= nil then entry.LastHungerUpdate = lhu; updated = true end
@@ -1974,7 +2097,6 @@ do
 			if lgu ~= nil then newEntry.LastGrowthUpdate = lgu end
 			if ts ~= nil then newEntry.Timestamp = ts end
 			if pos then newEntry.Position = pos end
-			-- hunger
 			if cf ~= nil then newEntry.CurrentFullness = cf end
 			if ff ~= nil then newEntry.FedFraction = ff end
 			if lhu ~= nil then newEntry.LastHungerUpdate = lhu end
@@ -1985,7 +2107,6 @@ do
 		end
 
 		if updated then
-			-- mark dirty and push inventory update (best-effort)
 			pcall(function() if PlayerProfileService.MarkDirty then PlayerProfileService.MarkDirty(owner) end end)
 			if InventoryService and type(InventoryService.UpdateProfileInventory) == "function" then
 				local ply = Players:GetPlayerByUserId(owner)
@@ -1994,19 +2115,33 @@ do
 		end
 	end
 
+	-- Replace GrowthService.computeOfflineDelta
+	-- (Find the existing function named computeOfflineDelta in GrowthService and replace it with this.)
+	-- Replace GrowthService.computeOfflineDelta with this implementation.
+	-- Find the existing function named computeOfflineDelta in GrowthService and replace it.
 	local function computeOfflineDelta(slime)
 		if not CONFIG.OFFLINE_GROWTH_ENABLED then
 			logOffline(slime, "detect_delta_result", {delta=0, reason="disabled"})
 			return 0
 		end
+
 		local now = os.time()
 		if isWithinRestoreGrace(slime, now) then
 			logOffline(slime, "detect_delta_result", {delta=0, reason="restore_grace"})
 			return 0
 		end
+
+		-- restore any original timestamps that were saved during RestoreFromSnapshot
 		restoreOriginalOfflineTimestamps(slime)
+
 		local last = slime:GetAttribute("LastGrowthUpdate")
+		-- Normalize LastGrowthUpdate if it was stored as tick()
+		if type(last) == "number" then
+			last = normalizeEpochFromMaybeTick(last, now)
+		end
+
 		logOffline(slime, "detect_delta_start", {now=now, last=last})
+
 		if not last or type(last) ~= "number" then
 			if CONFIG.INIT_OFFLINE_ASSUME_SECONDS > 0 then
 				local assumed = math.min(CONFIG.INIT_OFFLINE_ASSUME_SECONDS, CONFIG.OFFLINE_GROWTH_MAX_SECONDS)
@@ -2039,7 +2174,6 @@ do
 			if (not prior) or gp > prior then slime:SetAttribute("PersistedGrowthProgress", gp) end
 			local sid = slime:GetAttribute("SlimeId")
 			if sid then lastPersistedProgress[sid] = gp; microCumulative[sid] = 0 end
-			-- keep inventory/UI in sync: attempt to copy authoritative model attributes to profile
 			pcall(function() syncModelGrowthIntoProfile(slime) end)
 		end
 	end
@@ -2052,7 +2186,21 @@ do
 		markStampDirty(slime, stampReason or "finalize_stamp")
 	end
 
+	-- GrowthService: applyOfflineGrowth (updated marker + skip-guard)
+	-- Replace GrowthService.applyOfflineGrowth with this implementation (updated marker + skip-guard).
+	-- Find the existing function named applyOfflineGrowth in GrowthService and replace it.
 	local function applyOfflineGrowth(slime, offlineDelta, isReapply)
+		-- Guard: if we've already applied offline growth for this slime and this call is NOT an explicit reapply, skip.
+		local alreadyApplied = nil
+		pcall(function() alreadyApplied = slime:GetAttribute("OfflineGrowthAppliedAt") end)
+		if alreadyApplied and not isReapply then
+			pcall(function()
+				local sid = slime:GetAttribute("SlimeId") or "<nil>"
+				dprint(("[GrowthOffline] skip applyOfflineGrowth sid=%s already applied at=%s"):format(tostring(sid), tostring(alreadyApplied)))
+			end)
+			return 0
+		end
+
 		local sid = nil
 		if slime and slime.GetAttribute then
 			local ok, val = pcall(function() return slime:GetAttribute("SlimeId") end)
@@ -2136,7 +2284,7 @@ do
 							end
 						elseif decayWindow > 0 then
 							integral = integral + currentFed * decayWindow
-							decayUsed = decayWindow
+							decayUsed = decayUsed + decayWindow
 						end
 						decayBudget = math.max(decayBudget - decayUsed, 0)
 						local flatDuration = duration - math.min(duration, originalBudget)
@@ -2172,7 +2320,6 @@ do
 
 		if totalInc > 0 then
 			slime:SetAttribute("GrowthProgress", progress)
-			-- keep inventory/UI in sync for this immediate authoritative change
 			pcall(function() syncModelGrowthIntoProfile(slime) end)
 		end
 
@@ -2192,10 +2339,8 @@ do
 			end)
 		end
 
-		-- Persist progress immediately to reduce race with PreExit saves.
 		writePersistedProgress(slime)
 
-		-- Recompute visual scale and stats to keep model and attributes in sync after offline growth.
 		pcall(function()
 			local startScale = slime:GetAttribute("StartSizeScale") or 1
 			local maxScale = slime:GetAttribute("MaxSizeScale") or startScale
@@ -2222,7 +2367,6 @@ do
 			end
 		end)
 
-		-- Persist metadata and debug info
 		logOffline(slime, "apply_offline_after", {
 			progress_after=progress,
 			progress_inc=totalInc,
@@ -2234,9 +2378,15 @@ do
 			hunger_normal_mult=hungerNormalMultiplier
 		})
 
+		-- record that we applied offline growth now (helps detect/avoid duplicate reapplication)
+		pcall(function()
+			slime:SetAttribute("OfflineGrowthAppliedAt", os.time())
+			dprint(("[GrowthOffline] applied offline growth sid=%s delta=%.2f now=%s"):format(tostring(sid or "<nil>"), tonumber(offlineDelta) or 0, tostring(os.time())))
+		end)
+
 		return totalInc
 	end
-
+	
 	local function initCacheIfNeeded(slime)
 		local cache = SlimeCache[slime]
 		if cache and cache.initialized then return cache end
@@ -2369,7 +2519,6 @@ do
 			if progress ~= prevProgress then
 				slime:SetAttribute("GrowthProgress", progress)
 				tryMicroProgressStamp(slime, progress, prevProgress)
-				-- keep inventory/UI in sync for in-session growth changes
 				pcall(function() syncModelGrowthIntoProfile(slime) end)
 			end
 		end
@@ -2468,7 +2617,6 @@ do
 		end
 	end
 
-	-- Keep this method lightweight: explicitly write persisted progress + stamp dirty for pre-leave flow.
 	function GrowthService.FlushPlayerSlimes(userId)
 		for slime,_ in pairs(SlimeCache) do
 			if slime.Parent and slime:GetAttribute("OwnerUserId") == userId then
@@ -2482,9 +2630,6 @@ do
 end
 SlimeCore.GrowthService = GrowthService
 
-----------------------------------------------------------
--- SlimeHungerService
-----------------------------------------------------------
 local SlimeHungerService = {}
 do
 	local HUNGER = {
@@ -2718,15 +2863,10 @@ do
 end
 SlimeCore.SlimeHungerService = SlimeHungerService
 
--- Public helper for feeding slimes from other modules
 function SlimeCore.FeedSlime(slime, restoreFraction)
 	return SlimeCore.SlimeHungerService.Feed(slime, restoreFraction)
 end
 
-----------------------------------------------------------
--- GrowthPersistenceService (integrated, decoupled)
--- Call: SlimeCore.GrowthPersistenceService:Init(orchestrator)
-----------------------------------------------------------
 local GrowthPersistenceService = {}
 do
 	local Players_local = Players
@@ -2757,7 +2897,7 @@ do
 
 	local Orchestrator = nil
 	local lastPeriodicStamp = 0
-	local playerEventDebounce = {}   -- [player] = last event stamp os.clock()
+	local playerEventDebounce = {}
 	local running = true
 
 	local function dprint(...)
@@ -2947,16 +3087,12 @@ do
 end
 SlimeCore.GrowthPersistenceService = GrowthPersistenceService
 
-----------------------------------------------------------
--- Expose and init helper
-----------------------------------------------------------
 SlimeCore.RNG = RNG
 SlimeCore.SizeRNG = SizeRNG
 SlimeCore.SlimeAI = SlimeAI
 SlimeCore.ColorUtil = ColorUtil
 
 function SlimeCore.Init()
-	-- Start optional services (growth/hunger). Safe to call multiple times.
 	if SlimeCore.GrowthService and SlimeCore.GrowthService.Start then
 		pcall(function() SlimeCore.GrowthService.Start() end)
 	end

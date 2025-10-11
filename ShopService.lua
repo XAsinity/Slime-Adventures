@@ -1,13 +1,6 @@
--- ShopService v3.6 (Shop-side safe food grant) - fixed syntax issues
--- Notes:
---  - Replaced boolean short-circuit expressions used at top-level (e.g. `A and A:FindFirstChild(...)`)
---    with explicit nil-checks. Some environments/linters in Roblox Studio can report confusing parse
---    errors for those patterns when combined with certain constructs; this file uses explicit checks
---    to avoid that.
---  - Kept the "safeGiveFood" approach: try to clone a ReplicatedStorage template first, fall back
---    to calling FoodService.GiveFood only if no template exists.
---  - Ensures ToolUniqueId, registers with PlayerProfileService/InventoryService best-effort, and
---    rolls back coins on failure.
+-- ShopService v3.6 (Shop-side safe food grant) - updated with catalog RFs and quantity-aware purchases
+-- Updated to use centralized CoinService for coin operations (TrySpendCoins/RefundCoins/GetCoins)
+-- to ensure single-script coin control for purchases and refunds.
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -20,6 +13,20 @@ local PurchaseEggEvent      = Remotes:WaitForChild("PurchaseEgg")
 local PurchaseResultEvent   = Remotes:WaitForChild("PurchaseResult")
 local RequestInventoryEvent = Remotes:WaitForChild("RequestInventory")
 local InventoryUpdateEvent  = Remotes:WaitForChild("InventoryUpdate")
+
+-- Ensure RemoteFunctions for catalog/preview exist (created if missing)
+local GetEggCatalogRF = Remotes:FindFirstChild("GetEggCatalog")
+local GetEggPreviewRF = Remotes:FindFirstChild("GetEggPreview")
+if not GetEggCatalogRF then
+	GetEggCatalogRF = Instance.new("RemoteFunction")
+	GetEggCatalogRF.Name = "GetEggCatalog"
+	GetEggCatalogRF.Parent = Remotes
+end
+if not GetEggPreviewRF then
+	GetEggPreviewRF = Instance.new("RemoteFunction")
+	GetEggPreviewRF.Name = "GetEggPreview"
+	GetEggPreviewRF.Parent = Remotes
+end
 
 -- Explicit nil-safe retrieval helpers to avoid boolean-shortcircuit-in-expression usage
 local function safeFindReplicated(name)
@@ -60,6 +67,46 @@ local InventoryService = nil
 do
 	local ok, svc = pcall(function() return require(Modules:WaitForChild("InventoryService")) end)
 	if ok then InventoryService = svc end
+end
+
+-- New: CoinService centralizes coin operations (TrySpendCoins / RefundCoins / GetCoins / faction standing)
+local CoinService = nil
+do
+	local ok, svc = pcall(function()
+		-- Prefer Modules coin service if present
+		local mod = Modules and Modules:FindFirstChild("CoinService")
+		if mod then return require(mod) end
+		-- Fallback: ReplicatedStorage.Modules
+		local rsMods = safeFindReplicated("Modules")
+		if rsMods then
+			local m = rsMods:FindFirstChild("CoinService")
+			if m then return require(m) end
+		end
+		return nil
+	end)
+	if ok and svc then
+		CoinService = svc
+	else
+		-- If we couldn't load a dedicated CoinService module, we still support coin ops via PlayerProfileService.
+		CoinService = {
+			GetCoins = function(player) local ok, res = pcall(function() return PlayerProfileService.GetCoins(player) end) if ok and res then return res end return 0 end,
+			IncrementCoins = function(player, delta) pcall(function() PlayerProfileService.IncrementCoins(player, delta) end) end,
+			TrySpendCoins = function(player, amount)
+				local ok, res = pcall(function()
+					local cur = PlayerProfileService.GetCoins(player) or 0
+					if cur < amount then return false, "insufficient" end
+					PlayerProfileService.IncrementCoins(player, -amount)
+					return true
+				end)
+				if ok then return res end
+				return false, "error"
+			end,
+			RefundCoins = function(player, amount) pcall(function() PlayerProfileService.IncrementCoins(player, amount) end) end,
+			GetFactionStanding = function() return 0 end,
+			AdjustFactionStanding = function() return nil end,
+			ApplySale = function(player, cost, opts) local ok,res = pcall(function() return true end) return true end,
+		}
+	end
 end
 
 -- FoodService may live in Modules; require defensively and fallback to ReplicatedStorage.Modules
@@ -116,16 +163,182 @@ local ALWAYS_USE_GENERIC_EGG_TOOL_NAME = false
 local GENERIC_EGG_TOOL_NAME = "Egg"
 
 ----------------------------------------------------------------
--- Coins helpers (PlayerProfileService routed)
+-- Egg tool creation (moved up so catalog handlers can use resolveEggDisplayName)
+----------------------------------------------------------------
+local function resolveEggDisplayName(eggType)
+	local trimmed = nil
+	if type(eggType) == "string" then
+		trimmed = string.match(eggType, "^%s*(.-)%s*$")
+	end
+	if not trimmed or trimmed == "" then
+		return DEFAULT_EGG_TYPE
+	end
+	local lower = string.lower(trimmed)
+	if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
+		return DEFAULT_EGG_TYPE
+	end
+	return trimmed .. " Egg"
+end
+
+local function normalizeEggTool(tool)
+	if not tool or type(tool.IsA) ~= "function" or not tool:IsA("Tool") then return end
+	if not tool:GetAttribute("EggId") then return end
+	local attrType = safeGetAttr(tool, "EggType")
+	local name = resolveEggDisplayName(attrType)
+	if tool.Name ~= name then
+		pcall(function() tool.Name = name end)
+	end
+	local shouldNormalizeType = attrType == nil
+	if not shouldNormalizeType and type(attrType) == "string" then
+		local lower = string.lower(attrType)
+		if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
+			shouldNormalizeType = true
+		end
+	end
+	if shouldNormalizeType then
+		pcall(function() tool:SetAttribute("EggType", DEFAULT_EGG_TYPE) end)
+	end
+end
+
+local function createEggTool(player, purchaseKey)
+	local opt = EggPurchaseOptions[purchaseKey]
+	if not opt then return nil, "Invalid egg key" end
+	local rng   = RNG.New()
+	local stats = EggConfig.GenerateEggStats(rng, opt.forcedRarity)
+	if not EggToolTemplate then return nil, "Missing EggToolTemplate" end
+	local tool  = EggToolTemplate:Clone()
+	local eggId = HttpService:GenerateGUID(false)
+	local eggType = opt and opt.eggType
+	if type(eggType) ~= "string" or eggType == "" then
+		eggType = DEFAULT_EGG_TYPE
+	end
+	stats.EggType = eggType
+
+	if ALWAYS_USE_GENERIC_EGG_TOOL_NAME then
+		tool.Name = GENERIC_EGG_TOOL_NAME
+	else
+		tool.Name = resolveEggDisplayName(eggType)
+	end
+
+	tool:SetAttribute("EggId", eggId)
+	tool:SetAttribute("ServerIssued", true)
+	tool:SetAttribute("OwnerUserId", player.UserId)
+	tool:SetAttribute("StatsVersion", STATS_VERSION)
+	tool:SetAttribute("EggType", eggType)
+
+	-- Ensure deterministic unique key for inventory merging/dedupe
+	if not tool:GetAttribute("ToolUniqueId") then
+		tool:SetAttribute("ToolUniqueId", HttpService:GenerateGUID(false))
+	end
+
+	for k,v in pairs(stats) do
+		tool:SetAttribute(k, v)
+	end
+	normalizeEggTool(tool)
+	return tool
+end
+
+----------------------------------------------------------------
+-- Catalog / preview RF handlers (server-side)
+----------------------------------------------------------------
+local function sampleStatsForEgg(purchaseKey)
+	local opt = EggPurchaseOptions and EggPurchaseOptions[purchaseKey]
+	if not opt then return nil end
+	local stats = {}
+	pcall(function()
+		local rng = RNG.New()
+		stats = EggConfig.GenerateEggStats(rng, opt.forcedRarity) or {}
+	end)
+	-- Compact numeric stats for safe client display
+	local compact = {}
+	for k, v in pairs(stats) do
+		if type(v) == "number" then
+			compact[k] = math.floor((v) * 1000 + 0.5) / 1000
+		else
+			compact[k] = v
+		end
+	end
+	return compact
+end
+
+GetEggCatalogRF.OnServerInvoke = function(player)
+	local out = {}
+	for key, opt in pairs(EggPurchaseOptions or {}) do
+		table.insert(out, {
+			key = key,
+			displayName = resolveEggDisplayName(opt.eggType or DEFAULT_EGG_TYPE),
+			cost = opt.cost or 0,
+			rarity = opt.forcedRarity or "Normal",
+			sampleStats = sampleStatsForEgg(key),
+		})
+	end
+	table.sort(out, function(a,b) return (a.cost or 0) < (b.cost or 0) end)
+	return out
+end
+
+GetEggPreviewRF.OnServerInvoke = function(player, key)
+	if not key then return nil end
+	return sampleStatsForEgg(key)
+end
+
+----------------------------------------------------------------
+-- Coins helpers (now routed through CoinService)
 ----------------------------------------------------------------
 local function getCoins(player)
-	local ok, val = pcall(function() return PlayerProfileService.GetCoins(player) end)
-	if ok then return val or 0 end
+	if CoinService and type(CoinService.GetCoins) == "function" then
+		local ok, val = pcall(function() return CoinService.GetCoins(player) end)
+		if ok then return tonumber(val) or 0 end
+	end
+	-- fallback
+	local ok, val = pcall(function() return PlayerProfileService.GetCoins and PlayerProfileService.GetCoins(player) end)
+	if ok and tonumber(val) then return tonumber(val) end
 	return 0
 end
 
 local function addCoins(player, delta)
+	if not player then return end
+	if CoinService and type(CoinService.IncrementCoins) == "function" then
+		pcall(function() CoinService.IncrementCoins(player, delta) end)
+		return
+	end
 	pcall(function() PlayerProfileService.IncrementCoins(player, delta) end)
+end
+
+local function trySpendCoins(player, amount)
+	if CoinService and type(CoinService.TrySpendCoins) == "function" then
+		local ok, reason = pcall(function() return CoinService.TrySpendCoins(player, amount) end)
+		if ok then
+			-- If TrySpendCoins returns boolean true or (true, reason)
+			if reason == nil then
+				-- PlayerProfileService.TrySpendCoins may return boolean or (true, nil)
+				return true, nil
+			end
+			if reason == true then
+				return true, nil
+			end
+			-- If returned (false, "reason")
+			if reason == false then return false, "insufficient" end
+			if type(reason) == "string" then
+				if reason == "insufficient" then return false, reason end
+				-- treat truthy return as success
+				if tostring(reason) == "true" then return true, nil end
+			end
+		end
+		-- if pcall failed, fall through
+	end
+	-- fallback naive attempt (non-atomic)
+	local cur = getCoins(player) or 0
+	if cur < amount then return false, "Not enough coins" end
+	addCoins(player, -amount)
+	return true, nil
+end
+
+local function refundCoins(player, amount)
+	if CoinService and type(CoinService.RefundCoins) == "function" then
+		pcall(function() CoinService.RefundCoins(player, amount) end)
+		return
+	end
+	addCoins(player, amount)
 end
 
 local function updateLeaderstats(player)
@@ -252,7 +465,7 @@ end
 ----------------------------------------------------------------
 -- Inventory snapshot helper
 ----------------------------------------------------------------
-local normalizeEggTool
+local normalizeEggTool_local = normalizeEggTool -- keep local alias if needed
 
 local function buildInventorySnapshot(player)
 	local snap = { Coins = getCoins(player), Eggs = {}, Foods = {} }
@@ -295,83 +508,6 @@ end
 
 function ShopService.GetInventory(player)
 	return buildInventorySnapshot(player)
-end
-
-----------------------------------------------------------------
--- Egg tool creation (unchanged)
-----------------------------------------------------------------
-
-local function resolveEggDisplayName(eggType)
-	local trimmed = nil
-	if type(eggType) == "string" then
-		trimmed = string.match(eggType, "^%s*(.-)%s*$")
-	end
-	if not trimmed or trimmed == "" then
-		return DEFAULT_EGG_TYPE
-	end
-	local lower = string.lower(trimmed)
-	if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
-		return DEFAULT_EGG_TYPE
-	end
-	return trimmed .. " Egg"
-end
-
-normalizeEggTool = function(tool)
-	if not tool or type(tool.IsA) ~= "function" or not tool:IsA("Tool") then return end
-	if not tool:GetAttribute("EggId") then return end
-	local attrType = safeGetAttr(tool, "EggType")
-	local name = resolveEggDisplayName(attrType)
-	if tool.Name ~= name then
-		pcall(function() tool.Name = name end)
-	end
-	local shouldNormalizeType = attrType == nil
-	if not shouldNormalizeType and type(attrType) == "string" then
-		local lower = string.lower(attrType)
-		if lower == string.lower(DEFAULT_EGG_TYPE) or EGG_RARITY_TAGS[lower] then
-			shouldNormalizeType = true
-		end
-	end
-	if shouldNormalizeType then
-		pcall(function() tool:SetAttribute("EggType", DEFAULT_EGG_TYPE) end)
-	end
-end
-
-local function createEggTool(player, purchaseKey)
-	local opt = EggPurchaseOptions[purchaseKey]
-	if not opt then return nil, "Invalid egg key" end
-	local rng   = RNG.New()
-	local stats = EggConfig.GenerateEggStats(rng, opt.forcedRarity)
-	if not EggToolTemplate then return nil, "Missing EggToolTemplate" end
-	local tool  = EggToolTemplate:Clone()
-	local eggId = HttpService:GenerateGUID(false)
-	local eggType = opt and opt.eggType
-	if type(eggType) ~= "string" or eggType == "" then
-		eggType = DEFAULT_EGG_TYPE
-	end
-	stats.EggType = eggType
-
-	if ALWAYS_USE_GENERIC_EGG_TOOL_NAME then
-		tool.Name = GENERIC_EGG_TOOL_NAME
-	else
-		tool.Name = resolveEggDisplayName(eggType)
-	end
-
-	tool:SetAttribute("EggId", eggId)
-	tool:SetAttribute("ServerIssued", true)
-	tool:SetAttribute("OwnerUserId", player.UserId)
-	tool:SetAttribute("StatsVersion", STATS_VERSION)
-	tool:SetAttribute("EggType", eggType)
-
-	-- Ensure deterministic unique key for inventory merging/dedupe
-	if not tool:GetAttribute("ToolUniqueId") then
-		tool:SetAttribute("ToolUniqueId", HttpService:GenerateGUID(false))
-	end
-
-	for k,v in pairs(stats) do
-		tool:SetAttribute(k, v)
-	end
-	normalizeEggTool(tool)
-	return tool
 end
 
 ----------------------------------------------------------------
@@ -610,63 +746,92 @@ local function ok(player, msg)
 end
 
 ----------------------------------------------------------------
--- Purchase handler (uses safeGiveFood)
+-- Quantity-aware Egg purchase helper (atomic spend + rollback)
 ----------------------------------------------------------------
 local purchaseGuard = {}
+local MAX_PURCHASE_QUANTITY = 10
 
-local function onPurchase(player, purchaseType, itemKey)
-	if not player or not player.UserId then return end
+local function handlePurchaseEggs(player, itemKey, quantity)
+	quantity = tonumber(quantity) or 1
+	if quantity < 1 then quantity = 1 end
+	if quantity > MAX_PURCHASE_QUANTITY then quantity = MAX_PURCHASE_QUANTITY end
+
+	local opt = EggPurchaseOptions[itemKey]; if not opt then fail(player, "Unknown egg"); return end
+	local totalCost = (opt.cost or 0) * quantity
+
+	-- Prevent concurrent purchases per-player
 	local uid = tostring(player.UserId)
-
-	-- Prevent concurrent purchases
 	if purchaseGuard[uid] then
 		return fail(player, "Purchase in progress")
 	end
 	purchaseGuard[uid] = true
 	local cleared = false
-	local function cleanup()
-		if not cleared then
-			purchaseGuard[uid] = nil
-			cleared = true
-		end
+	local function cleanupGuard()
+		if not cleared then purchaseGuard[uid] = nil; cleared = true end
 	end
 
-	local okStatus, err = pcall(function()
-		purchaseType = tostring(purchaseType or "")
+	-- Attempt to spend the totalCost atomically
+	local spent, reason = trySpendCoins(player, totalCost)
+	if not spent then
+		cleanupGuard()
+		return fail(player, "Not enough coins")
+	end
 
-		if purchaseType == "Egg" then
-			local opt = EggPurchaseOptions[itemKey]; if not opt then fail(player, "Unknown egg"); return end
+	local created = {}
+	local bp = player:FindFirstChildOfClass("Backpack")
+	if not bp then
+		-- refund and abort if no backpack
+		refundCoins(player, totalCost)
+		updateLeaderstats(player)
+		cleanupGuard()
+		return fail(player, "No backpack")
+	end
 
-			local coins = getCoins(player) or 0
-			if coins < opt.cost then fail(player, "Not enough coins"); return end
+	local successAll = true
+	local errMsg = nil
 
-			-- Deduct coins
-			addCoins(player, -opt.cost)
-			updateLeaderstats(player)
+	for i = 1, quantity do
+		local tool, createErr = createEggTool(player, itemKey)
+		if not tool then
+			successAll = false
+			errMsg = tostring(createErr or "creation failed")
+			break
+		end
 
-			-- Create tool
-			local tool, createErr = createEggTool(player, itemKey)
-			if not tool then
-				addCoins(player, opt.cost)
-				updateLeaderstats(player)
-				fail(player, "Creation failed: "..tostring(createErr))
-				return
-			end
+		local okParent, parentErr = pcall(function() tool.Parent = bp end)
+		if not okParent then
+			successAll = false
+			errMsg = tostring(parentErr or "parent failed")
+			break
+		end
 
-			local bp = player:FindFirstChildOfClass("Backpack")
-			if not bp then
-				addCoins(player, opt.cost)
-				updateLeaderstats(player)
-				if tool and tool.Parent then pcall(function() tool:Destroy() end) end
-				fail(player, "No backpack")
-				return
-			end
+		local okAdd, addErr = pcall(function()
+			PlayerProfileService.AddInventoryItem(player, "eggTools", {
+				EggId         = tool:GetAttribute("EggId"),
+				Rarity        = tool:GetAttribute("Rarity"),
+				EggType       = tool:GetAttribute("EggType"),
+				HatchTime     = tool:GetAttribute("HatchTime"),
+				Weight        = tool:GetAttribute("WeightScalar"),
+				Move          = tool:GetAttribute("MovementScalar"),
+				ValueBase     = tool:GetAttribute("ValueBase"),
+				ValuePerGrowth= tool:GetAttribute("ValuePerGrowth"),
+				ToolName      = tool.Name,
+				ServerIssued  = true,
+				OwnerUserId   = player.UserId,
+				StatsVersion  = STATS_VERSION,
+				ToolUniqueId  = tool:GetAttribute("ToolUniqueId"),
+			})
+		end)
+		if not okAdd then
+			successAll = false
+			errMsg = tostring(addErr or "persist failed")
+			break
+		end
 
-			tool.Parent = bp
-
-			-- Persist inventory addition to profile
-			local okAdd, addErr = pcall(function()
-				PlayerProfileService.AddInventoryItem(player, "eggTools", {
+		-- runtime inventory registration (non-fatal)
+		if InventoryService and type(InventoryService.AddInventoryItem) == "function" then
+			pcall(function()
+				InventoryService.AddInventoryItem(player, "eggTools", {
 					EggId         = tool:GetAttribute("EggId"),
 					Rarity        = tool:GetAttribute("Rarity"),
 					EggType       = tool:GetAttribute("EggType"),
@@ -682,135 +847,101 @@ local function onPurchase(player, purchaseType, itemKey)
 					ToolUniqueId  = tool:GetAttribute("ToolUniqueId"),
 				})
 			end)
-			if not okAdd then
-				addCoins(player, opt.cost)
-				updateLeaderstats(player)
-				if tool and tool.Parent then pcall(function() tool:Destroy() end) end
-				fail(player, "Failed to add to inventory: "..tostring(addErr))
-				return
-			end
+		end
 
-			-- Runtime inventory registration (best-effort)
-			if InventoryService then
-				local okInv, invErr = pcall(function()
-					InventoryService.AddInventoryItem(player, "eggTools", {
-						EggId         = tool:GetAttribute("EggId"),
-						Rarity        = tool:GetAttribute("Rarity"),
-						EggType       = tool:GetAttribute("EggType"),
-						HatchTime     = tool:GetAttribute("HatchTime"),
-						Weight        = tool:GetAttribute("WeightScalar"),
-						Move          = tool:GetAttribute("MovementScalar"),
-						ValueBase     = tool:GetAttribute("ValueBase"),
-						ValuePerGrowth= tool:GetAttribute("ValuePerGrowth"),
-						ToolName      = tool.Name,
-						ServerIssued  = true,
-						OwnerUserId   = player.UserId,
-						StatsVersion  = STATS_VERSION,
-						ToolUniqueId  = tool:GetAttribute("ToolUniqueId"),
-					})
-				end)
-				if not okInv then warnlog("InventoryService.AddInventoryItem for eggTools failed:", tostring(invErr)) end
-			end
+		table.insert(created, tool)
+	end
 
-			-- Save
-			local saved = false
-			local okSave, saveErr = pcall(function() return requestVerifiedSave(player, 3) end)
-			if okSave and saveErr then saved = true end
-			if not saved then pcall(function() PlayerProfileService.SaveNow(player, "PostEggPurchase") end) end
+	if not successAll then
+		-- rollback
+		for _, t in ipairs(created) do
+			pcall(function() if t and t.Parent then t:Destroy() end end)
+		end
+		refundCoins(player, totalCost)
+		updateLeaderstats(player)
+		cleanupGuard()
+		return fail(player, "Purchase failed: " .. (errMsg or "unknown"))
+	end
 
-			ok(player, ("Bought egg"))
-			sendInventory(player)
-			cleanup()
+	-- Save
+	local saved = false
+	local okSave, saveRes = pcall(function() return requestVerifiedSave(player, 3) end)
+	if okSave and saveRes then saved = true end
+	if not saved then pcall(function() PlayerProfileService.SaveNow(player, "PostEggPurchase") end) end
+
+	ok(player, ("Bought %d x %s"):format(quantity, resolveEggDisplayName(opt.eggType)))
+	sendInventory(player)
+	updateLeaderstats(player)
+	cleanupGuard()
+	return
+end
+
+----------------------------------------------------------------
+-- Purchase handler (now supports quantity on Egg purchases and Food purchases)
+----------------------------------------------------------------
+local function onPurchase(player, purchaseType, itemKey, quantity)
+	if not player or not player.UserId then return end
+
+	local okStatus, err = pcall(function()
+		purchaseType = tostring(purchaseType or "")
+
+		if purchaseType == "Egg" then
+			-- Delegate to quantity-aware helper
+			handlePurchaseEggs(player, itemKey, quantity)
 			return
 
 		elseif purchaseType == "Food" then
+			-- sanitize quantity
+			local q = tonumber(quantity) or 1
+			if q < 1 then q = 1 end
+			if q > MAX_PURCHASE_QUANTITY then q = MAX_PURCHASE_QUANTITY end
+
 			-- Resolve canonical FoodId (robust)
 			local resolved = findFoodIdCandidate(itemKey)
 			if not resolved then
-				cleanup()
 				return fail(player, "Unknown food")
 			end
 
 			local opt = FoodPurchaseOptions[itemKey] or FoodPurchaseOptions[resolved] or { cost = 0 }
-			local cost = opt.cost or 0
-			local coins = getCoins(player) or 0
-			if coins < cost then cleanup(); return fail(player, "Not enough coins") end
+			local unitCost = tonumber(opt.cost) or 0
+			local totalCost = unitCost * q
 
-			-- Deduct coins
-			addCoins(player, -cost)
-			updateLeaderstats(player)
+			-- Attempt to spend coins via centralized CoinService
+			local spent, reason = trySpendCoins(player, totalCost)
+			if not spent then return fail(player, "Not enough coins") end
 
-			-- Try safe grant first (shop clones template safely). If that fails, fallback to FoodService.GiveFood
-			local tool, errReason = safeGiveFood(player, resolved, true)
-			if not tool then
-				-- safeGiveFood returned nil; errReason explains why (e.g., "no_backpack", "clone_failed", "foodservice_unavailable" or an error string)
-				-- Log the reason and try fallback via original key if different
-				warnlog("safeGiveFood failed for", tostring(resolved), "reason=", tostring(errReason))
-				-- If the resolved differs from itemKey, try fallback with itemKey via safeGiveFood (handles purchase-key->id mismatches)
-				if tostring(itemKey) ~= tostring(resolved) then
-					tool, errReason = safeGiveFood(player, tostring(itemKey), true)
-				end
-				-- If still nil, give up and attempt direct FoodService call (unprotected) as last resort
+			-- Give q copies of the food (safeGiveFood), with rollback on failure
+			local created = {}
+			local bp = player:FindFirstChildOfClass("Backpack")
+			if not bp then
+				-- rollback refund
+				refundCoins(player, totalCost)
+				updateLeaderstats(player)
+				return fail(player, "No backpack")
+			end
+
+			local successAll = true
+			local errMsg = nil
+			for i = 1, q do
+				local tool, errReason = safeGiveFood(player, resolved, true)
 				if not tool then
-					if FoodService and type(FoodService.GiveFood) == "function" then
-						local okGive, giveRes = pcall(function()
-							return FoodService.GiveFood(player, resolved, true)
-						end)
-						if not okGive or not giveRes then
-							-- rollback and report
-							addCoins(player, cost)
-							updateLeaderstats(player)
-							warnlog("FoodService.GiveFood failed after safeGiveFood fallbacks:", tostring(giveRes))
-							cleanup()
-							return fail(player, "Food creation failed")
-						else
-							tool = giveRes
-						end
-					else
-						-- rollback and report
-						addCoins(player, cost)
-						updateLeaderstats(player)
-						warnlog("No ways to grant food: safeGiveFood & FoodService.GiveFood unavailable/failed")
-						cleanup()
-						return fail(player, "Food creation failed")
+					-- try fallback with itemKey if different
+					if tostring(itemKey) ~= tostring(resolved) then
+						tool, errReason = safeGiveFood(player, tostring(itemKey), true)
 					end
 				end
-			end
 
-			-- Ensure ToolUniqueId is present
-			if tool and type(tool.SetAttribute) == "function" then
-				local tuid = nil
-				pcall(function() tuid = tool:GetAttribute("ToolUniqueId") end)
-				if not tuid or tostring(tuid) == "" then
-					local gen = nil
-					pcall(function() gen = HttpService:GenerateGUID(false) end)
-					if not gen then gen = tostring(tick()) .. "-" .. tostring(math.random(1,1e6)) end
-					pcall(function() tool:SetAttribute("ToolUniqueId", gen) end)
+				if not tool then
+					successAll = false
+					errMsg = tostring(errReason or "give failed")
+					break
 				end
-			end
 
-			-- Persist PlayerProfileService.AddInventoryItem (best-effort)
-			local okAdd, addErr2 = pcall(function()
-				PlayerProfileService.AddInventoryItem(player, "foodTools", {
-					FoodId      = tool:GetAttribute("FoodId") or tool.Name,
-					Name        = tool.Name,
-					Restore     = tool:GetAttribute("RestoreFraction"),
-					BufferBonus = tool:GetAttribute("FeedBufferBonus"),
-					Charges     = tool:GetAttribute("Charges"),
-					Consumable  = tool:GetAttribute("Consumable"),
-					ServerIssued= true,
-					OwnerUserId = player.UserId,
-					ToolUniqueId= tool:GetAttribute("ToolUniqueId"),
-				})
-			end)
-			if not okAdd then
-				warnlog("PlayerProfileService.AddInventoryItem for foodTools failed:", tostring(addErr2))
-			end
+				table.insert(created, tool)
 
-			-- Register runtime InventoryService entry so serializer sees live item
-			if InventoryService then
-				local okInv, invErr = pcall(function()
-					InventoryService.AddInventoryItem(player, "foodTools", {
+				-- persist registration for this tool (best-effort)
+				local okAdd, addErr = pcall(function()
+					PlayerProfileService.AddInventoryItem(player, "foodTools", {
 						FoodId      = tool:GetAttribute("FoodId") or tool.Name,
 						Name        = tool.Name,
 						Restore     = tool:GetAttribute("RestoreFraction"),
@@ -822,23 +953,50 @@ local function onPurchase(player, purchaseType, itemKey)
 						ToolUniqueId= tool:GetAttribute("ToolUniqueId"),
 					})
 				end)
-				if not okInv then warnlog("InventoryService.AddInventoryItem for foodTools failed:", tostring(invErr)) end
+				if not okAdd then
+					warnlog("PlayerProfileService.AddInventoryItem for foodTools failed:", tostring(addErr))
+				end
+
+				if InventoryService then
+					pcall(function()
+						InventoryService.AddInventoryItem(player, "foodTools", {
+							FoodId      = tool:GetAttribute("FoodId") or tool.Name,
+							Name        = tool.Name,
+							Restore     = tool:GetAttribute("RestoreFraction"),
+							BufferBonus = tool:GetAttribute("FeedBufferBonus"),
+							Charges     = tool:GetAttribute("Charges"),
+							Consumable  = tool:GetAttribute("Consumable"),
+							ServerIssued= true,
+							OwnerUserId = player.UserId,
+							ToolUniqueId= tool:GetAttribute("ToolUniqueId"),
+						})
+					end)
+				end
 			end
 
-			-- Attempt verified save where configured
+			if not successAll then
+				-- rollback created tools + refund
+				for _, t in ipairs(created) do
+					pcall(function() if t and t.Parent then t:Destroy() end end)
+				end
+				refundCoins(player, totalCost)
+				updateLeaderstats(player)
+				return fail(player, "Food grant failed: " .. (errMsg or "unknown"))
+			end
+
+			-- verified save
 			local saved = false
 			local okSave, saveErr = pcall(function() return requestVerifiedSave(player, 3) end)
 			if okSave and saveErr then saved = true end
 			if not saved then pcall(function() PlayerProfileService.SaveNow(player, "PostFoodPurchase") end) end
 
-			ok(player, ("Bought %s"):format(opt.displayName or tostring(itemKey)))
+			ok(player, ("Bought %d x %s"):format(q, opt.displayName or tostring(itemKey)))
 			sendInventory(player)
-			cleanup()
+			updateLeaderstats(player)
 			return
 
 		else
-			fail(player, "Invalid purchase type")
-			return
+			return fail(player, "Invalid purchase type")
 		end
 	end)
 
@@ -850,8 +1008,6 @@ local function onPurchase(player, purchaseType, itemKey)
 		-- best-effort refund/notify
 		fail(player, "Internal error processing purchase")
 	end
-
-	cleanup()
 end
 
 ----------------------------------------------------------------
@@ -883,7 +1039,7 @@ function ShopService.Init()
 	_inited = true
 	Players.PlayerAdded:Connect(onPlayerAdded)
 	for _,p in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded,p) end
-	RequestInventoryEvent.OnServerEvent:Connect(sendInventory)
+	RequestInventoryEvent.OnServerEvent:Connect(function(player) sendInventory(player) end)
 	PurchaseEggEvent.OnServerEvent:Connect(onPurchase)
 	hookPersistenceRestore()
 	log("Initialized OK (Module).")

@@ -138,9 +138,20 @@ local function warnLog(...)
 end
 
 --------------------------------------------------
--- ADD/REPLACE: Safe removal helpers
+-- ADD/REPLACE: Safe removal helpers (delegated to InventorySyncUtils when available)
 -- Placed here right after log helpers so they are available to other functions below.
 --------------------------------------------------
+local InventorySyncUtils = nil
+do
+	local ok, mod = pcall(function() return require(script.Parent:WaitForChild("InventorySyncUtils")) end)
+	if ok and type(mod) == "table" then
+		InventorySyncUtils = mod
+		dprint("InventorySyncUtils loaded.")
+	else
+		warn("[InvSvc] InventorySyncUtils not found or failed to require; using local fallbacks.")
+	end
+end
+
 local function _safeGetAttr(inst, name)
 	if not inst or type(inst.GetAttribute) ~= "function" then return nil end
 	local ok, v = pcall(function() return inst:GetAttribute(name) end)
@@ -149,25 +160,30 @@ local function _safeGetAttr(inst, name)
 end
 
 local function _inspectInstanceAttrs(inst)
-	local keys = {
-		"ToolUniqueId","ToolUid","ServerRestore","PreserveOnServer","PreserveOnClient",
-		"OwnerUserId","SlimeId","SlimeItem","FoodId","PersistentCaptured","PersistentFoodTool",
-		"RestoreStamp","RecentlyPlacedSaved","RecentlyPlacedSavedAt","RecentlyPlacedSavedBy",
-		"StagedByManager","RestoreBatchId","_RestoreGuard_Attempts"
-	}
-	local out = {}
-	for _,k in ipairs(keys) do
-		local ok, v = pcall(function() return inst:GetAttribute(k) end)
-		if ok then out[k] = v end
+	if InventorySyncUtils and InventorySyncUtils.inspectInstanceAttrs then
+		local ok, res = pcall(function() return InventorySyncUtils.inspectInstanceAttrs(inst) end)
+		if ok then return res end
 	end
+	-- fallback simple inspector
+	local out = {}
+	pcall(function()
+		if inst and inst.GetAttribute then
+			local attrs = inst:GetAttributes()
+			for k,v in pairs(attrs) do out[k] = v end
+		end
+	end)
 	return out
 end
 
 local function _looksLikeRestoredOrPersistent(inst)
+	if InventorySyncUtils and InventorySyncUtils.looksLikeRestoredOrPersistent then
+		local ok, res = pcall(function() return InventorySyncUtils.looksLikeRestoredOrPersistent(inst) end)
+		if ok then return res end
+	end
+	-- fallback heuristic
 	if not inst then return false end
 	if type(inst.GetAttribute) ~= "function" then return false end
-	if _safeGetAttr(inst, "ServerRestore") then return true end
-	if _safeGetAttr(inst, "PreserveOnServer") or _safeGetAttr(inst, "PreserveOnClient") then return true end
+	if _safeGetAttr(inst, "ServerRestore") or _safeGetAttr(inst, "PreserveOnServer") or _safeGetAttr(inst, "PreserveOnClient") then return true end
 	if _safeGetAttr(inst, "SlimeItem") or _safeGetAttr(inst, "SlimeId") then return true end
 	if _safeGetAttr(inst, "PersistentCaptured") or _safeGetAttr(inst, "PersistentFoodTool") then return true end
 	if _safeGetAttr(inst, "RestoreStamp") or _safeGetAttr(inst, "RecentlyPlacedSaved") or _safeGetAttr(inst, "RecentlyPlacedSavedAt") then
@@ -176,82 +192,30 @@ local function _looksLikeRestoredOrPersistent(inst)
 	return false
 end
 
--- safeRemoveOrDefer(inst, reason, opts)
--- - opts.grace: seconds to treat recent RestoreStamp/RecentlyPlacedSaved as protected (default 3)
--- - opts.force: true to force destructive Destroy() even if protected (use with caution)
--- Returns: success:boolean, code:string
 local function safeRemoveOrDefer(inst, reason, opts)
+	if InventorySyncUtils and InventorySyncUtils.safeRemoveOrDefer then
+		local ok, res1, res2 = pcall(function() return InventorySyncUtils.safeRemoveOrDefer(inst, reason, opts) end)
+		if ok then return res1, res2 end
+	end
+	-- fallback conservative detach/destroy
 	opts = opts or {}
-	local grace = (type(opts.grace) == "number" and opts.grace) or 3.0
-	local force = opts.force and true or false
-
-	if not inst or (typeof and typeof(inst) ~= "Instance") then
-		warn(("[InvSafe] safeRemoveOrDefer invalid instance (reason=%s)"):format(tostring(reason)))
-		return false, "invalid_instance"
-	end
-
-	-- Protect newly-restored / preserved / persistent objects unless forced.
-	local recentStamp = nil
-	pcall(function()
-		recentStamp = inst.GetAttribute and (inst:GetAttribute("RestoreStamp") or inst:GetAttribute("RecentlyPlacedSaved") or inst:GetAttribute("RecentlyPlacedSavedAt"))
-	end)
-	if not force then
-		-- If explicit flags present, skip
-		if _looksLikeRestoredOrPersistent(inst) then
-			-- If it's stamped, allow grace window check
-			if type(recentStamp) == "number" then
-				if (tick() - tonumber(recentStamp)) <= grace then
-					local attrs = _inspectInstanceAttrs(inst)
-					local okEnc, attrsJson = pcall(function() return HttpService:JSONEncode(attrs) end)
-					warn(("[InvSafe] SKIP removal (protected->recent) name=%s full=%s reason=%s attrs=%s")
-						:format(tostring(inst.Name), (pcall(function() return inst:GetFullName() end) and inst:GetFullName() or "<getfullname-err>"), tostring(reason), okEnc and attrsJson or tostring(attrs)))
-					warn(debug.traceback("[InvSafe] caller stack (skip):", 2))
-					return false, "skipped_protected_recent"
-				end
-			else
-				-- No numeric stamp but flagged -> skip
-				local attrs = _inspectInstanceAttrs(inst)
-				local okEnc, attrsJson = pcall(function() return HttpService:JSONEncode(attrs) end)
-				warn(("[InvSafe] SKIP removal (protected flag) name=%s full=%s reason=%s attrs=%s")
-					:format(tostring(inst.Name), (pcall(function() return inst:GetFullName() end) and inst:GetFullName() or "<getfullname-err>"), tostring(reason), okEnc and attrsJson or tostring(attrs)))
-				warn(debug.traceback("[InvSafe] caller stack (skip):", 2))
-				return false, "skipped_protected_flag"
-			end
-		end
-	end
-
-	-- Log removal attempt
-	local attrs = _inspectInstanceAttrs(inst)
-	local okEnc, attrsJson = pcall(function() return HttpService:JSONEncode(attrs) end)
-	warn(("[InvSafe] Removing instance name=%s full=%s reason=%s attrs=%s")
-		:format(tostring(inst.Name), (pcall(function() return inst:GetFullName() end) and inst:GetFullName() or "<getfullname-err>"), tostring(reason), okEnc and attrsJson or tostring(attrs)))
-	warn(debug.traceback("[InvSafe] caller stack (remove):", 2))
-
-	-- Try non-destructive parent detach first
 	local ok, err = pcall(function() inst.Parent = nil end)
 	if not ok then
-		warn(("[InvSafe] Parent=nil failed for %s err=%s; attempting Destroy()"):format(tostring(inst.Name), tostring(err)))
 		local ok2, err2 = pcall(function() inst:Destroy() end)
 		if not ok2 then
-			warn(("[InvSafe] Destroy() failed for %s err=%s"):format(tostring(inst.Name), tostring(err2)))
+			warn(("[InvSvc] safeRemoveOrDefer fallback Destroy failed for %s err=%s"):format(tostring(inst and inst.Name), tostring(err2)))
 			return false, "destroy_failed"
 		end
 		return true, "destroyed_fallback"
-	else
-		if opts.force then
-			local ok3, err3 = pcall(function() inst:Destroy() end)
-			if not ok3 then
-				warn(("[InvSafe] Forced Destroy() failed for %s err=%s"):format(tostring(inst.Name), tostring(err3)))
-				return false, "destroy_failed"
-			end
-			return true, "destroyed"
-		end
-		-- Detached successfully
-		return true, "detached"
 	end
+	if opts.force then
+		pcall(function() inst:Destroy() end)
+		return true, "destroyed"
+	end
+	return true, "detached"
 end
 
--- Expose for other local usage in this module
+-- Expose for other local usage in this module (compatibility)
 InventoryService._safeRemoveOrDefer = safeRemoveOrDefer
 InventoryService._looksLikeRestoredOrPersistent = _looksLikeRestoredOrPersistent
 InventoryService._inspectInstanceAttrs = _inspectInstanceAttrs
@@ -395,24 +359,96 @@ end
 -- Ensures profile.inventory tables are clean (no nil holes), coerces non-tables to empty tables,
 -- and trims accidental nils from lists. This is intentionally defensive and light-weight.
 --------------------------------------------------
+
 local function sanitizeInventoryOnProfile(profile)
 	if not profile or type(profile) ~= "table" then return end
+	-- Ensure inventory table exists and is a table
 	if not profile.inventory or type(profile.inventory) ~= "table" then
 		profile.inventory = {}
 		return
 	end
 
-	for field, v in pairs(profile.inventory) do
-		-- Only keep table values and coerce others to empty table
-		if type(v) ~= "table" then
-			profile.inventory[field] = {}
-		else
-			-- Rebuild as a dense array preserving non-nil entries
+	-- Defensive limits to avoid extremely deep / large transforms
+	local MAX_ENTRY_NODES = 2000
+	local nodeCount = 0
+
+	-- Helper: sanitize a single entry (shallow, safe)
+	local function sanitize_entry(entry)
+		if entry == nil then return nil end
+		local t = type(entry)
+		if t == "table" then
 			local out = {}
-			for _, item in ipairs(v) do
-				if item ~= nil then table.insert(out, item) end
+			for k, v in pairs(entry) do
+				-- keep only simple types or shallow-JSON-encoded tables to avoid recursion
+				local vt = type(v)
+				if vt == "string" or vt == "number" or vt == "boolean" then
+					out[k] = v
+				elseif vt == "table" then
+					-- shallow-encode nested tables if small
+					local ok, enc = pcall(function() return HttpService:JSONEncode(v) end)
+					if ok and enc and #enc < 1000 then
+						out[k] = enc
+					else
+						-- skip overly large nested structures
+					end
+				else
+					-- fallback to tostring for userdata/instances/other
+					local ok, s = pcall(function() return tostring(v) end)
+					if ok and s then out[k] = s end
+				end
 			end
-			profile.inventory[field] = out
+			-- If nothing meaningful, return nil so caller can skip this entry
+			if next(out) then return out end
+			return nil
+		elseif t == "string" or t == "number" or t == "boolean" then
+			return entry
+		elseif t == "userdata" then
+			-- attempt to convert common Instance -> table of attributes or tostring fallback
+			local ok, tbl = pcall(function()
+				local obj = {}
+				if entry.GetAttribute then
+					local attrs = entry:GetAttributes()
+					for k,v in pairs(attrs) do obj[k] = v end
+				end
+				-- child value objects
+				local c = entry:FindFirstChild("SlimeId") or entry:FindFirstChild("ToolUniqueId") or entry:FindFirstChild("ToolUid")
+				if c and c.Value ~= nil then obj.id = c.Value end
+				return next(obj) and obj or tostring(entry)
+			end)
+			if ok and tbl then return tbl end
+			return nil
+		else
+			-- other types -> stringify if safe
+			local ok, s = pcall(function() return tostring(entry) end)
+			if ok and s then return s end
+			return nil
+		end
+	end
+
+	local canonicalFields = { "eggTools", "foodTools", "worldEggs", "worldSlimes", "capturedSlimes" }
+	for _, fname in ipairs(canonicalFields) do
+		local list = profile.inventory[fname]
+		if type(list) ~= "table" then
+			profile.inventory[fname] = {}
+		else
+			local out = {}
+			for _, entry in ipairs(list) do
+				-- enforce global node budget
+				nodeCount = nodeCount + 1
+				if nodeCount > MAX_ENTRY_NODES then
+					-- stop processing further entries; keep what we have
+					break
+				end
+				local ok, cleaned = pcall(sanitize_entry, entry)
+				if ok and cleaned ~= nil then
+					table.insert(out, cleaned)
+				else
+					-- skip malformed entry
+				end
+				-- keep arrays reasonably bounded (safety net)
+				if #out >= 5000 then break end
+			end
+			profile.inventory[fname] = out
 		end
 	end
 end
@@ -471,7 +507,13 @@ local function jsonEncodeSafe(value)
 end
 
 -- Utility: search for a Tool instance owned by player with matching identifier
+-- Delegate to InventorySyncUtils when available, otherwise fall back to a minimal scan.
 local function findToolForPlayerById(player, id)
+	if InventorySyncUtils and InventorySyncUtils.findToolForPlayerById then
+		local ok, res = pcall(function() return InventorySyncUtils.findToolForPlayerById(player, id) end)
+		if ok then return res end
+	end
+
 	if not player or not id then return nil end
 	local function matches(tool, idVal)
 		if not tool then return false end
@@ -2021,8 +2063,29 @@ end
 
 --------------------------------------------------
 -- New helper: Ensure an Entry_<id> folder exists under a player's field folder
+-- Delegate to InventorySyncUtils when available; otherwise fallback to inline behavior.
 --------------------------------------------------
 function InventoryService.EnsureEntryHasId(playerOrId, fieldName, idValue, payloadTable)
+	if InventorySyncUtils and InventorySyncUtils.ensureEntryHasId then
+		local ok, res1, res2 = pcall(function() return InventorySyncUtils.ensureEntryHasId(playerOrId, fieldName, idValue, payloadTable) end)
+		-- Try to keep folder visuals & profile in sync after delegation
+		local ply = resolvePlayer(playerOrId)
+		if ply then
+			local st = PlayerState[ply]
+			if st and st.fields and st.fields[fieldName] and st.fields[fieldName].list then
+				pcall(function() updateInventoryFolder(ply, fieldName, st.fields[fieldName].list) end)
+			end
+			pcall(function() InventoryService.UpdateProfileInventory(ply) end)
+			pcall(function() PlayerProfileService.SaveNow(ply, "EnsureEntryHasId") end)
+		end
+		if ok then
+			return res1, res2
+		else
+			return false, "ensure_entry_err"
+		end
+	end
+
+	-- Fallback inline behavior (simplified copy of previous logic)
 	local ply = resolvePlayer(playerOrId)
 	if not ply then return false, "no player" end
 	fieldName = canonicalizeFieldName(fieldName) or fieldName
@@ -2038,7 +2101,6 @@ function InventoryService.EnsureEntryHasId(playerOrId, fieldName, idValue, paylo
 	if fieldName == "worldEggs" or fieldName == "eggTools" then
 		payloadTable.eggId = payloadTable.eggId or payloadTable.id
 	else
-		-- ensure we don't accidentally propagate eggId onto non-egg entries
 		payloadTable.eggId = nil
 	end
 
@@ -2078,7 +2140,6 @@ function InventoryService.EnsureEntryHasId(playerOrId, fieldName, idValue, paylo
 					data.Name = ENTRY_DATA_VALUE_NAME
 					data.Parent = entry
 				end
-				-- ensure payloadTable has canonical id and only eggId for egg fields
 				payloadTable = payloadTable or {}
 				payloadTable.id = tostring(payloadTable.id or canonicalId)
 				if fieldName == "worldEggs" or fieldName == "eggTools" then
@@ -2114,7 +2175,6 @@ function InventoryService.EnsureEntryHasId(playerOrId, fieldName, idValue, paylo
 		data.Name = ENTRY_DATA_VALUE_NAME
 		payloadTable = payloadTable or {}
 		payloadTable.id = tostring(payloadTable.id or canonicalId)
-		-- Only set eggId for egg categories
 		if fieldName == "worldEggs" or fieldName == "eggTools" then
 			payloadTable.eggId = payloadTable.eggId or payloadTable.id
 		else
@@ -2679,69 +2739,10 @@ local function onPlayerRemoving(player)
 	end)
 end
 
-
 --foodtool removel sequence begin
 
 function InventoryService.FindToolForPlayerById(player, id)
-	if not player or not id then return nil end
-	local function matches(tool, idVal)
-		if not tool then return false end
-		if type(tool.GetAttribute) == "function" then
-			local ok, tu = pcall(function() return tool:GetAttribute("ToolUniqueId") end)
-			if ok and tu and tostring(tu) == tostring(idVal) then return true end
-			local ok2, tu2 = pcall(function() return tool:GetAttribute("ToolUid") end)
-			if ok2 and tu2 and tostring(tu2) == tostring(idVal) then return true end
-			local ok3, sid = pcall(function() return tool:GetAttribute("SlimeId") end)
-			if ok3 and sid and tostring(sid) == tostring(idVal) then return true end
-		end
-		-- check child Value objects fallback
-		local child = tool:FindFirstChild("ToolUniqueId") or tool:FindFirstChild("ToolUid")
-		if child and child.Value and tostring(child.Value) == tostring(idVal) then return true end
-		local child2 = tool:FindFirstChild("SlimeId") or tool:FindFirstChild("slimeId")
-		if child2 and child2.Value and tostring(child2.Value) == tostring(idVal) then return true end
-		-- name fallback
-		if tostring(tool.Name) == tostring(idVal) then return true end
-		return false
-	end
-
-	-- check Backpack and Character first (fast, common)
-	local containers = {}
-	pcall(function() table.insert(containers, player:FindFirstChildOfClass("Backpack")) end)
-	pcall(function() if player.Character then table.insert(containers, player.Character) end end)
-
-	-- add a ServerStorage / workspace scan fallback (tools sometimes stored in ServerStorage)
-	local ss = game:GetService("ServerStorage")
-	if ss then pcall(function() table.insert(containers, ss) end) end
-
-	-- scan descendants of the chosen containers
-	for _, parent in ipairs(containers) do
-		if parent and type(parent.GetDescendants) == "function" then
-			for _, inst in ipairs(parent:GetDescendants()) do
-				if inst and type(inst.IsA) == "function" and inst:IsA("Tool") then
-					local ok, res = pcall(function() return matches(inst, id) end)
-					if ok and res then return inst end
-				end
-			end
-		end
-	end
-
-	-- final fallback: scan workspace for any tool owned by this user (rare)
-	pcall(function()
-		for _, inst in ipairs(workspace:GetDescendants()) do
-			if inst and type(inst.IsA) == "function" and inst:IsA("Tool") then
-				local ok, res = pcall(function() return matches(inst, id) end)
-				if ok and res then
-					-- ensure this tool seems owned by player (attribute or parent)
-					local ownerOk, owner = pcall(function() return inst:GetAttribute("OwnerUserId") end)
-					if ownerOk and tostring(owner) == tostring(player.UserId) then
-						return inst
-					end
-				end
-			end
-		end
-	end)
-
-	return nil
+	return findToolForPlayerById(player, id)
 end
 
 -- Safely remove or defer removal of a Tool instance.
@@ -2751,54 +2752,27 @@ end
 --   opts (table)    : optional { force = boolean, grace = seconds }
 -- Returns true on success or false + message.
 function InventoryService._safeRemoveOrDefer(tool, reason, opts)
+	-- Delegate to InventorySyncUtils.safeRemoveTool if available
+	if InventorySyncUtils and InventorySyncUtils.safeRemoveTool then
+		local ok, res = pcall(function() return InventorySyncUtils.safeRemoveTool(tool, reason, opts) end)
+		if ok then return res end
+	end
+
+	-- Minimal fallback if InventorySyncUtils not available
 	opts = opts or {}
 	local force = opts.force or false
-	local grace = tonumber(opts.grace) or 0.25
-
 	if not tool or type(tool.IsA) ~= "function" or not tool:IsA("Tool") then
 		return false, "invalid_tool"
 	end
-
-	-- If the tool is marked ServerRestore/PreserveOnServer, be conservative: unparent and mark RecentlyPlacedSaved then schedule destroy.
-	local isPreserved = false
-	pcall(function()
-		if type(tool.GetAttribute) == "function" and (tool:GetAttribute("ServerRestore") or tool:GetAttribute("PreserveOnServer") or tool:GetAttribute("PersistentFoodTool")) then
-			isPreserved = true
-		end
-	end)
-
-	-- Attempt to detach first
-	local detached = false
-	pcall(function()
-		if tool.Parent then
-			tool.Parent = nil
-			detached = true
-		end
-	end)
-
-	-- If force or not preserved, destroy after small grace to allow replication to settle
-	if force or not isPreserved then
-		task.delay(grace, function()
-			pcall(function()
-				if tool and tool.Parent then tool.Parent = nil end
-			end)
-			pcall(function() if tool and tool.Destroy then tool:Destroy() end end)
-		end)
+	-- try detach then destroy later
+	pcall(function() if tool.Parent then tool.Parent = nil end end)
+	if force then
+		pcall(function() if tool.Destroy then tool:Destroy() end end)
 		return true
 	end
-
-	-- If preserved, mark RecentlyPlacedSaved and schedule a deferred destroy (longer grace)
-	pcall(function()
-		if type(tool.SetAttribute) == "function" then
-			tool:SetAttribute("RecentlyPlacedSaved", os.time())
-			tool:SetAttribute("RecentlyPlacedSavedAt", os.time())
-		end
-	end)
-	task.delay(math.max(0.5, grace * 4), function()
-		pcall(function()
-			if tool and tool.Parent then tool.Parent = nil end
-			pcall(function() if tool and tool.Destroy then tool:Destroy() end end)
-		end)
+	task.delay(0.25, function()
+		pcall(function() if tool.Parent then tool.Parent = nil end end)
+		pcall(function() if tool.Destroy then tool:Destroy() end end)
 	end)
 	return true
 end

@@ -1,15 +1,10 @@
 -- PlotManager (Robust, auto-initializing)
--- Version: 2.3
--- Behaviors:
---  - Automatically Init()s on require (defensive)
---  - Recursively discovers plot Models in Workspace by:
---      - name pattern Player%d+ OR
---      - attribute IsPlot=true OR
---      - attributes Index/PlotIndex/PlayerIndex
---  - Sorts discovered plots by Index (number parsed from name or Index attribute) for deterministic assignment
---  - Assigns already-connected players immediately and hooks PlayerAdded/CharacterAdded/PlayerRemoving
---  - Defensive/idempotent: safe to call Init repeatedly or to call Init without a bound self
---  - Provides placement API (RegisterPlacement, RemovePlacement, etc.) similar to the prior module
+-- Version: 2.6 (force teleport on assign, zone attribute mirroring, explicit registration, assignment lock, per-user assign serialization)
+-- Notes:
+--  - Adds ForceTeleportOnAssign: teleports player to their plot spawn immediately after assignment (not only on CharacterAdded)
+--  - Mirrors assignment to a plot's SlimeZone (AssignedUserId/ZoneOccupied) when enabled
+--  - Optional explicit plot registration via PlotManager:RegisterPlot(...) and a BindableEvent "RegisterPlot"
+--  - Stronger attribute normalization & discovery remain
 
 local Players     = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -58,7 +53,31 @@ PlotManager.Config = PlotManager.Config or {
 	NeutralFolderName = "Slimes",
 	NeutralPerPlayerSubfolders = true,
 	Debug = false,
+	SpawnAssignmentWaitSeconds = 1.5,
+	SpawnAssignmentReattempts = 2,
+	SpawnAssignmentCheckInterval = 0.05,
 }
+if PlotManager.Config.MirrorZoneAttributes == nil then
+	PlotManager.Config.MirrorZoneAttributes = true
+else
+	PlotManager.Config.MirrorZoneAttributes = PlotManager.Config.MirrorZoneAttributes and true or false
+end
+if PlotManager.Config.AllowExplicitRegistration == nil then
+	PlotManager.Config.AllowExplicitRegistration = true
+else
+	PlotManager.Config.AllowExplicitRegistration = PlotManager.Config.AllowExplicitRegistration and true or false
+end
+if PlotManager.Config.UseExplicitRegistrationOnly == nil then
+	PlotManager.Config.UseExplicitRegistrationOnly = false
+else
+	PlotManager.Config.UseExplicitRegistrationOnly = PlotManager.Config.UseExplicitRegistrationOnly and true or false
+end
+-- NEW: force teleport immediately after assignment
+if PlotManager.Config.ForceTeleportOnAssign == nil then
+	PlotManager.Config.ForceTeleportOnAssign = true
+else
+	PlotManager.Config.ForceTeleportOnAssign = PlotManager.Config.ForceTeleportOnAssign and true or false
+end
 
 if WorldAssetCleanup and type(WorldAssetCleanup.Configure) == "function" then
 	pcall(function()
@@ -70,12 +89,16 @@ if WorldAssetCleanup and type(WorldAssetCleanup.Configure) == "function" then
 	end)
 end
 
--- Public state (guarantee existence)
-PlotManager.Plots = PlotManager.Plots or {}        -- array of Model
+-- Public state
+PlotManager.Plots = PlotManager.Plots or {}               -- array of Model
 PlotManager.PlayerToPlot = PlotManager.PlayerToPlot or {} -- map userId -> Model
 
--- Internal placement storage
+-- Internal placement storage (for user-placed models tracked via RegisterPlacement)
 local placements = {}
+
+-- Handshake keys
+local ATTR_PLOT_ASSIGNED_NAME = "PlotAssignedName"
+local ATTR_PLOT_ASSIGNED_AT = "PlotAssignedAt"
 
 -- Utilities -----------------------------------------------------------------
 local function dprint(...)
@@ -127,7 +150,120 @@ local function tagPlot(plotModel, index)
 	end
 end
 
--- Recursively discover plots anywhere in Workspace
+-- Normalize plot attributes
+local function normalizePlotAttributes(plotModel)
+	if not plotModel or not plotModel:IsA("Model") then return end
+	local function safeGetAttr(k) local ok,v = pcall(function() return plotModel:GetAttribute(k) end) if ok then return v end return nil end
+	local function safeSetAttr(k, v) pcall(function() plotModel:SetAttribute(k, v) end) end
+
+	local assigned = safeGetAttr("AssignedUserId") or safeGetAttr("AssignedUid") or safeGetAttr("AssignedUser") or nil
+	local userIdAttr = safeGetAttr("UserId") or safeGetAttr("OwnerUserId") or safeGetAttr("User") or nil
+	local persistent = safeGetAttr("AssignedPersistentId") or safeGetAttr("PersistentId") or safeGetAttr("OwnerPersistentId") or nil
+
+	local uid = assigned and (tonumber(assigned) or assigned) or (userIdAttr and (tonumber(userIdAttr) or userIdAttr)) or nil
+	if uid then
+		local num = tonumber(uid) or uid
+		safeSetAttr("UserId", num)
+		safeSetAttr("AssignedUserId", num)
+		safeSetAttr("OwnerUserId", num)
+	end
+	if persistent then
+		safeSetAttr("AssignedPersistentId", tostring(persistent))
+		safeSetAttr("PersistentId", tostring(persistent))
+	end
+end
+
+-- SlimeZone helpers (inlined)
+local function _findZonePart(plotModel)
+	if not plotModel then return nil end
+	-- Prefer explicit "Spawn" first (so plates named Spawn are honored)
+	local spawn = plotModel:FindFirstChild("Spawn")
+	if spawn and spawn:IsA("BasePart") then return spawn end
+	-- Then prefer "SlimeZone"
+	local zone = plotModel:FindFirstChild("SlimeZone")
+	if zone and zone:IsA("BasePart") then return zone end
+	for _, d in ipairs(plotModel:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "Spawn" or d.Name == "SlimeZone") then
+			return d
+		end
+	end
+	for _, d in ipairs(plotModel:GetDescendants()) do
+		if d:IsA("BasePart") then return d end
+	end
+	return nil
+end
+
+local function _ensureZoneDefaults(zone)
+	if not zone then return end
+	pcall(function()
+		if zone:GetAttribute("AssignedUserId") == nil then zone:SetAttribute("AssignedUserId", 0) end
+		if zone:GetAttribute("AssignedPersistentId") == nil then zone:SetAttribute("AssignedPersistentId", "") end
+		if zone:GetAttribute("ZoneOccupied") == nil then zone:SetAttribute("ZoneOccupied", false) end
+	end)
+end
+
+PlotManager.Zone = PlotManager.Zone or {}
+
+function PlotManager.Zone.ReserveIfAvailable(plotModel, userId, persistentId)
+	if not plotModel then return false, "no-plot" end
+	local zone = _findZonePart(plotModel)
+	if not zone then return false, "no-zone" end
+	_ensureZoneDefaults(zone)
+	local cur = tonumber(zone:GetAttribute("AssignedUserId")) or 0
+	if cur ~= 0 then return false, "occupied" end
+	pcall(function()
+		zone:SetAttribute("AssignedUserId", tonumber(userId) or 0)
+		zone:SetAttribute("AssignedPersistentId", persistentId and tostring(persistentId) or "")
+		zone:SetAttribute("AssignedAt", os.time())
+		zone:SetAttribute("ZoneOccupied", (userId and userId ~= 0) and true or false)
+	end)
+	pcall(function()
+		plotModel:SetAttribute("AssignedUserId", tonumber(userId) or 0)
+		plotModel:SetAttribute("AssignedPersistentId", persistentId and tostring(persistentId) or "")
+		plotModel:SetAttribute("PlotAssignedAt", os.time())
+	end)
+	return true
+end
+
+function PlotManager.Zone.ForceAssign(plotModel, userId, persistentId)
+	if not plotModel then return false, "no-plot" end
+	local zone = _findZonePart(plotModel)
+	if zone then
+		pcall(function()
+			zone:SetAttribute("AssignedUserId", tonumber(userId) or 0)
+			zone:SetAttribute("AssignedPersistentId", persistentId and tostring(persistentId) or "")
+			zone:SetAttribute("AssignedAt", os.time())
+			zone:SetAttribute("ZoneOccupied", (userId and userId ~= 0) and true or false)
+		end)
+	end
+	pcall(function()
+		plotModel:SetAttribute("AssignedUserId", tonumber(userId) or 0)
+		plotModel:SetAttribute("AssignedPersistentId", persistentId and tostring(persistentId) or "")
+		plotModel:SetAttribute("PlotAssignedAt", os.time())
+	end)
+	return true
+end
+
+function PlotManager.Zone.ClearAssignment(plotModel)
+	if not plotModel then return false, "no-plot" end
+	local zone = _findZonePart(plotModel)
+	if zone then
+		pcall(function()
+			zone:SetAttribute("AssignedUserId", 0)
+			zone:SetAttribute("AssignedPersistentId", "")
+			zone:SetAttribute("AssignedAt", nil)
+			zone:SetAttribute("ZoneOccupied", false)
+		end)
+	end
+	pcall(function()
+		plotModel:SetAttribute("AssignedUserId", 0)
+		plotModel:SetAttribute("AssignedPersistentId", "")
+		plotModel:SetAttribute("PlotAssignedAt", nil)
+	end)
+	return true
+end
+
+-- Discovery -----------------------------------------------------------------
 local function discoverPlotsRecursive()
 	local found = {}
 
@@ -142,15 +278,11 @@ local function discoverPlotsRecursive()
 				local idxAttr = child:GetAttribute(PlotManager.IndexAttribute) or child:GetAttribute("PlotIndex") or child:GetAttribute("PlayerIndex")
 
 				if nameMatch or isPlotAttr or idxAttr then
-					-- determine index
 					local idxNum = nil
 					if tonumber(idxAttr) then
 						idxNum = tonumber(idxAttr)
 					elseif nameMatch and tonumber(nameMatch) then
 						idxNum = tonumber(nameMatch)
-					else
-						-- fallback: use next available index (will be sorted later)
-						idxNum = nil
 					end
 					table.insert(found, { model = child, index = idxNum })
 				end
@@ -161,7 +293,6 @@ local function discoverPlotsRecursive()
 
 	rec(Workspace)
 
-	-- If none found by attributes/pattern, consider direct children PlayerN names as last resort
 	if #found == 0 then
 		for _,child in ipairs(Workspace:GetChildren()) do
 			if child:IsA("Model") and type(child.Name) == "string" then
@@ -173,7 +304,6 @@ local function discoverPlotsRecursive()
 		end
 	end
 
-	-- Assign indexes where missing: use order of discovery and fill gaps
 	local nextIdx = 1
 	for _,rec in ipairs(found) do
 		if not rec.index then
@@ -190,20 +320,19 @@ local function discoverPlotsRecursive()
 		end
 	end
 
-	-- Sort by index ascending
 	table.sort(found, function(a,b) return (a.index or 0) < (b.index or 0) end)
 
-	-- Build plots array
 	local plots = {}
 	for _,rec in ipairs(found) do
 		tagPlot(rec.model, rec.index)
+		normalizePlotAttributes(rec.model)
 		table.insert(plots, rec.model)
 	end
 
 	return plots
 end
 
--- Internal helpers for placement bookkeeping
+-- Placement bookkeeping (for systems that opt-in to it) ---------------------
 local function ensureBucket(userId)
 	local bucket = placements[userId]
 	if not bucket then
@@ -213,11 +342,50 @@ local function ensureBucket(userId)
 	return bucket
 end
 
+local function setPlotAssignedOnPlayer(player, plot)
+	if not player then return end
+	pcall(function()
+		if player.SetAttribute then
+			player:SetAttribute(ATTR_PLOT_ASSIGNED_NAME, plot and plot.Name or nil)
+			player:SetAttribute(ATTR_PLOT_ASSIGNED_AT, plot and os.time() or nil)
+		end
+	end)
+end
+
+-- Assignment locks and per-user assign guard --------------------------------
+local _assignmentLocks = setmetatable({}, { __mode = "k" })
+local function acquirePlotLock(plot)
+	if not plot then return false end
+	if _assignmentLocks[plot] then return false end
+	_assignmentLocks[plot] = true
+	return true
+end
+local function releasePlotLock(plot)
+	if plot then _assignmentLocks[plot] = nil end
+end
+
+local _assignInFlight = {}
+local function acquireUserAssign(userId)
+	if not userId then return false end
+	if _assignInFlight[userId] then return false end
+	_assignInFlight[userId] = true
+	return true
+end
+local function releaseUserAssign(userId)
+	if userId then _assignInFlight[userId] = nil end
+end
+
 -- Public API ---------------------------------------------------------------
 function PlotManager:GetPlotOrigin(plot)
 	if not plot then return nil end
+	-- Prefer "Spawn", then "SlimeZone"
+	local spawn = plot:FindFirstChild("Spawn")
+	if spawn and spawn:IsA("BasePart") then return spawn end
 	local direct = plot:FindFirstChild("SlimeZone")
 	if direct and direct:IsA("BasePart") then return direct end
+	for _,d in ipairs(plot:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "Spawn" or d.Name == "SlimeZone") then return d end
+	end
 	for _,d in ipairs(plot:GetDescendants()) do
 		if d:IsA("BasePart") then return d end
 	end
@@ -236,6 +404,28 @@ function PlotManager:LocalToWorld(plot, localCF)
 	return origin.CFrame * localCF
 end
 
+-- Explicit registration API
+function PlotManager:RegisterPlot(plotModel, index)
+	if not plotModel or not plotModel:IsA("Model") then return false end
+	tagPlot(plotModel, index)
+	normalizePlotAttributes(plotModel)
+	pcall(function() plotModel:SetAttribute("IsPlot", true) end)
+	for _, m in ipairs(self.Plots) do
+		if m == plotModel then
+			return true
+		end
+	end
+	table.insert(self.Plots, plotModel)
+	table.sort(self.Plots, function(a,b)
+		local ai = tonumber(a:GetAttribute(self.IndexAttribute)) or math.huge
+		local bi = tonumber(b:GetAttribute(self.IndexAttribute)) or math.huge
+		return ai < bi
+	end)
+	dprint(("RegisterPlot: %s (Index=%s)"):format(plotModel.Name, tostring(index or plotModel:GetAttribute(self.IndexAttribute) or "?")))
+	return true
+end
+
+-- Placement helpers (unchanged API)
 function PlotManager:RegisterPlacement(player, modelOrCF, kind, extra)
 	if not player or not player:IsA("Player") then
 		return nil, nil, "InvalidPlayer"
@@ -371,6 +561,40 @@ function PlotManager:ReanchorAll(player)
 	end
 end
 
+-- Spawn helpers -------------------------------------------------------------
+function PlotManager:FindSpawnPart(plotModel)
+	if not plotModel then return nil end
+	local spawnPart = plotModel:FindFirstChild("Spawn")
+	if spawnPart and spawnPart:IsA("BasePart") then
+		return spawnPart
+	end
+	local zone = plotModel:FindFirstChild("SlimeZone")
+	if zone and zone:IsA("BasePart") then
+		return zone
+	end
+	for _, d in ipairs(plotModel:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "Spawn" or d.Name == "SlimeZone") then return d end
+	end
+	for _, d in ipairs(plotModel:GetDescendants()) do
+		if d:IsA("BasePart") then return d end
+	end
+	return nil
+end
+
+function PlotManager:_teleportPlayerToPlotSpawn(player, plot)
+	if not player or not plot then return end
+	local character = player.Character
+	if not character then return end
+	local hrp = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 3)
+	if not hrp then return end
+	local spawnPart = self:FindSpawnPart(plot)
+	if not spawnPart then return end
+	pcall(function()
+		hrp.CFrame = spawnPart.CFrame + Vector3.new(0, 3, 0)
+	end)
+	dprint(("[SPAWN_DEBUG] Player %s (uid=%s) teleported to plot=%s spawn"):format(player.Name, tostring(player.UserId), plot.Name))
+end
+
 -- Plot assignment -----------------------------------------------------------
 local function debugPlotAssignment(player, plot)
 	if plot then
@@ -381,10 +605,7 @@ local function debugPlotAssignment(player, plot)
 			player.UserId
 			))
 	else
-		warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)",
-			player.Name,
-			player.UserId
-			))
+		warn(string.format("[PlotManager][DEBUG] No available plot for player '%s' (UserId=%d)", player.Name, player.UserId))
 	end
 end
 
@@ -399,33 +620,277 @@ function PlotManager:GetPlotByUserId(userId)
 	return self.PlayerToPlot[uid]
 end
 
-function PlotManager:AssignPlayer(player)
-	if not player or not player.UserId then return nil end
+function PlotManager:GetPlotByPersistentId(persistentId)
+	if persistentId == nil then return nil end
+	for _,plot in ipairs(self.Plots) do
+		if plot and plot.Parent then
+			local pid = plot:GetAttribute("AssignedPersistentId") or plot:GetAttribute("PersistentId")
+			if pid ~= nil and tostring(pid) == tostring(persistentId) then
+				return plot
+			end
+		end
+	end
+	return nil
+end
 
-	-- If already assigned and plot still valid, return it
-	local existing = self.PlayerToPlot[player.UserId]
-	if existing and existing.Parent and existing:GetAttribute("Occupied") then
-		debugPlotAssignment(player, existing)
-		return existing
+function PlotManager:FindPlotForUserWithFallback(playerOrUserId, persistentId)
+	local userId = nil
+	local playerObj = nil
+	if typeof(playerOrUserId) == "Instance" and playerOrUserId:IsA("Player") then
+		playerObj = playerOrUserId
+		userId = playerOrUserId.UserId
+		persistentId = persistentId or (playerOrUserId.GetAttribute and playerOrUserId:GetAttribute("PersistentId"))
+	else
+		userId = tonumber(playerOrUserId)
 	end
 
-	-- Try to find an unoccupied plot
-	for _, plot in ipairs(self.Plots) do
-		if plot and plot.Parent and not plot:GetAttribute("Occupied") then
-			plot:SetAttribute("Occupied", true)
-			plot:SetAttribute("UserId", player.UserId)
-			self.PlayerToPlot[player.UserId] = plot
-			if player.SetAttribute and plot:GetAttribute(self.IndexAttribute) then
-				pcall(function() player:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute)) end)
-			end
-			dprint(("Assigned %s to plot %s"):format(player.Name, plot.Name))
-			debugPlotAssignment(player, plot)
-			return plot
+	if not persistentId and playerObj and playerObj.GetAttribute then
+		pcall(function()
+			local pid = playerObj:GetAttribute("PersistentId")
+			if pid and type(pid) == "string" then persistentId = pid end
+		end)
+	end
+
+	if not persistentId and playerObj then
+		local pps = tryRequire("PlayerProfileService")
+		if pps and type(pps.GetOrAssignPersistentId) == "function" then
+			local ok, pid = pcall(function() return pps.GetOrAssignPersistentId(playerObj) end)
+			if ok and pid then persistentId = pid end
 		end
 	end
 
-	-- No plot available
-	debugPlotAssignment(player, nil)
+	local candidates = {}
+	for _,plot in ipairs(self.Plots) do
+		if plot and plot.Parent then
+			local assignedUid = plot:GetAttribute("AssignedUserId")
+			local plotUid = plot:GetAttribute("UserId")
+			local assignedPid = plot:GetAttribute("AssignedPersistentId") or plot:GetAttribute("PersistentId")
+
+			if assignedUid and userId and tonumber(assignedUid) == tonumber(userId) then
+				table.insert(candidates, {plot=plot, score=100, reason="AssignedUserId"})
+			elseif assignedPid and persistentId and tostring(assignedPid) == tostring(persistentId) then
+				table.insert(candidates, {plot=plot, score=95, reason="AssignedPersistentId"})
+			elseif plotUid and userId and tonumber(plotUid) == tonumber(userId) then
+				table.insert(candidates, {plot=plot, score=90, reason="UserId"})
+			else
+				local foundOwner = false
+				for _,desc in ipairs(plot:GetDescendants()) do
+					if desc.GetAttribute then
+						local o = desc:GetAttribute("OwnerUserId")
+						if o and userId and tonumber(o) == tonumber(userId) then
+							table.insert(candidates, {plot=plot, score=50, reason="OwnerUserId"})
+							foundOwner = true
+							break
+						end
+					end
+				end
+				if not foundOwner and playerObj and plot:GetAttribute(self.IndexAttribute) and playerObj.GetAttribute and playerObj:GetAttribute("PlotIndex") then
+					local pidx = playerObj:GetAttribute("PlotIndex")
+					local midx = plot:GetAttribute(self.IndexAttribute)
+					if pidx and midx and tonumber(pidx) == tonumber(midx) then
+						table.insert(candidates, {plot=plot, score=40, reason="PlotIndexMatch"})
+					end
+				end
+			end
+		end
+	end
+
+	if #candidates == 0 and playerObj and playerObj.GetAttribute and playerObj:GetAttribute("PlotIndex") then
+		local wantIdx = playerObj:GetAttribute("PlotIndex")
+		for _,plot in ipairs(self.Plots) do
+			if plot and plot.Parent then
+				local pidx = plot:GetAttribute(self.IndexAttribute)
+				if pidx and tonumber(pidx) == tonumber(wantIdx) then
+					table.insert(candidates, {plot=plot, score=30, reason="NameIndexFallback"})
+				end
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+
+	for _,c in ipairs(candidates) do
+		if self:GetPlotOrigin(c.plot) then
+			c.score = c.score + 5
+		end
+	end
+
+	table.sort(candidates, function(a,b)
+		if a.score == b.score then
+			local ai = a.plot:GetAttribute(PlotManager.IndexAttribute) or 0
+			local bi = b.plot:GetAttribute(PlotManager.IndexAttribute) or 0
+			return ai < bi
+		end
+		return a.score > b.score
+	end)
+
+	return candidates[1].plot
+end
+
+function PlotManager:WaitForPlotAssignment(player, timeoutSeconds)
+	if not player then return nil end
+	if type(timeoutSeconds) ~= "number" then timeoutSeconds = PlotManager.Config.SpawnAssignmentWaitSeconds or 1.5 end
+	local start = os.clock()
+	if not player.GetAttribute then return nil end
+	local assigned = nil
+	pcall(function() assigned = player:GetAttribute(ATTR_PLOT_ASSIGNED_NAME) end)
+	while (not assigned) and (os.clock() - start) < timeoutSeconds do
+		task.wait(PlotManager.Config.SpawnAssignmentCheckInterval or 0.05)
+		pcall(function() assigned = player:GetAttribute(ATTR_PLOT_ASSIGNED_NAME) end)
+	end
+	return assigned
+end
+
+function PlotManager:AssignPlayer(player)
+	if not player or not player.UserId then return nil end
+	local userId = player.UserId
+
+	local gotUserLock = acquireUserAssign(userId)
+	if not gotUserLock then
+		local waitStart = os.clock()
+		while _assignInFlight[userId] and (os.clock() - waitStart) < 0.5 do
+			task.wait(0.03)
+		end
+		releaseUserAssign(userId)
+		return self.PlayerToPlot[userId]
+	end
+
+	local ok, result = pcall(function()
+		local existing = self.PlayerToPlot[userId]
+		if existing and existing.Parent and existing:GetAttribute("Occupied") then
+			normalizePlotAttributes(existing)
+			setPlotAssignedOnPlayer(player, existing)
+			debugPlotAssignment(player, existing)
+			if PlotManager.Config.MirrorZoneAttributes then
+				pcall(function() PlotManager.Zone.ForceAssign(existing, userId, existing:GetAttribute("AssignedPersistentId")) end)
+			end
+			if PlotManager.Config.ForceTeleportOnAssign then
+				task.defer(function() self:_teleportPlayerToPlotSpawn(player, existing) end)
+			end
+			return existing
+		end
+
+		local persistentId = nil
+		pcall(function() persistentId = (player.GetAttribute and player:GetAttribute("PersistentId")) end)
+
+		local preMarked = self:FindPlotForUserWithFallback(player, persistentId)
+		if preMarked and preMarked.Parent then
+			if acquirePlotLock(preMarked) then
+				local successAssign = false
+				local occupied = preMarked:GetAttribute("Occupied")
+				local ownerId = preMarked:GetAttribute("UserId")
+				if (not occupied) or tonumber(ownerId) == tonumber(userId) then
+					preMarked:SetAttribute("Occupied", true)
+					preMarked:SetAttribute("UserId", userId)
+					pcall(function() preMarked:SetAttribute("AssignedUserId", userId) end)
+					pcall(function() preMarked:SetAttribute("OwnerUserId", userId) end)
+					if persistentId then
+						pcall(function() preMarked:SetAttribute("AssignedPersistentId", tostring(persistentId)) end)
+					end
+
+					normalizePlotAttributes(preMarked)
+
+					self.PlayerToPlot[userId] = preMarked
+					if player.SetAttribute and preMarked:GetAttribute(self.IndexAttribute) then
+						pcall(function() player:SetAttribute("PlotIndex", preMarked:GetAttribute(self.IndexAttribute)) end)
+					end
+					setPlotAssignedOnPlayer(player, preMarked)
+					if PlotManager.Config.MirrorZoneAttributes then
+						pcall(function() PlotManager.Zone.ForceAssign(preMarked, userId, persistentId) end)
+					end
+					if PlotManager.Config.ForceTeleportOnAssign then
+						task.defer(function() self:_teleportPlayerToPlotSpawn(player, preMarked) end)
+					end
+					dprint(("Assigned (pre-marked) %s to plot %s"):format(player.Name, preMarked.Name))
+					debugPlotAssignment(player, preMarked)
+					successAssign = true
+				end
+				releasePlotLock(preMarked)
+
+				if successAssign and (not persistentId) then
+					pcall(function()
+						local pps = tryRequire("PlayerProfileService")
+						if pps and type(pps.GetOrAssignPersistentId) == "function" then
+							local ok2, pid = pcall(function() return pps.GetOrAssignPersistentId(player) end)
+							if ok2 and pid then
+								persistentId = pid
+								pcall(function() preMarked:SetAttribute("AssignedPersistentId", tostring(pid)) end)
+								if PlotManager.Config.MirrorZoneAttributes then
+									pcall(function() PlotManager.Zone.ForceAssign(preMarked, userId, pid) end)
+								end
+							end
+						end
+					end)
+					return preMarked
+				end
+				if successAssign then return preMarked end
+			end
+		end
+
+		for _, plot in ipairs(self.Plots) do
+			if plot and plot.Parent then
+				if not plot:GetAttribute("Occupied") then
+					if acquirePlotLock(plot) then
+						local assigned = false
+						local occNow = plot:GetAttribute("Occupied")
+						if not occNow then
+							local quickPid = nil
+							pcall(function() quickPid = (player.GetAttribute and player:GetAttribute("PersistentId")) end)
+							plot:SetAttribute("Occupied", true)
+							plot:SetAttribute("UserId", userId)
+							plot:SetAttribute("OwnerUserId", userId)
+							pcall(function() plot:SetAttribute("AssignedUserId", userId) end)
+							if quickPid then
+								pcall(function() plot:SetAttribute("AssignedPersistentId", tostring(quickPid)) end)
+							end
+
+							normalizePlotAttributes(plot)
+
+							self.PlayerToPlot[userId] = plot
+							if player.SetAttribute and plot:GetAttribute(self.IndexAttribute) then
+								pcall(function() player:SetAttribute("PlotIndex", plot:GetAttribute(self.IndexAttribute)) end)
+							end
+							setPlotAssignedOnPlayer(player, plot)
+							if PlotManager.Config.MirrorZoneAttributes then
+								pcall(function() PlotManager.Zone.ForceAssign(plot, userId, quickPid) end)
+							end
+							if PlotManager.Config.ForceTeleportOnAssign then
+								task.defer(function() self:_teleportPlayerToPlotSpawn(player, plot) end)
+							end
+							dprint(("Assigned %s to plot %s"):format(player.Name, plot.Name))
+							debugPlotAssignment(player, plot)
+							assigned = true
+						end
+						releasePlotLock(plot)
+
+						if assigned then
+							pcall(function()
+								local pps = tryRequire("PlayerProfileService")
+								if pps and type(pps.GetOrAssignPersistentId) == "function" then
+									local ok2, pid = pcall(function() return pps.GetOrAssignPersistentId(player) end)
+									if ok2 and pid then
+										pcall(function() plot:SetAttribute("AssignedPersistentId", tostring(pid)) end)
+										if PlotManager.Config.MirrorZoneAttributes then
+											pcall(function() PlotManager.Zone.ForceAssign(plot, userId, pid) end)
+										end
+									end
+								end
+							end)
+							return plot
+						end
+					end
+				end
+			end
+		end
+
+		debugPlotAssignment(player, nil)
+		return nil
+	end)
+
+	releaseUserAssign(userId)
+	if ok then return result end
 	return nil
 end
 
@@ -445,7 +910,6 @@ function PlotManager:ClearPlot(plot, userId, options)
 		cleanupOptions.neutral = PlotManager.Config.ClearNeutralFolderOnRelease
 	end
 	cleanupOptions.neutralFolderName = cleanupOptions.neutralFolderName or PlotManager.Config.NeutralFolderName
-	cleanupOptions.neutralPerPlayerSubfolders = cleanupOptions.neutralPerPlayerSubfolders
 	if cleanupOptions.neutralPerPlayerSubfolders == nil then
 		cleanupOptions.neutralPerPlayerSubfolders = PlotManager.Config.NeutralPerPlayerSubfolders
 	end
@@ -483,7 +947,6 @@ function PlotManager:ClearPlot(plot, userId, options)
 
 	clearOwnedAssetsInContainer(plot)
 
-	local opts = options or {}
 	local doNeutral = opts.neutral
 	if doNeutral == nil then
 		doNeutral = PlotManager.Config.ClearNeutralFolderOnRelease
@@ -526,84 +989,140 @@ function PlotManager:ReleasePlayer(player)
 				})
 			end)
 		end
-		-- Clear assets first (respects config inside ClearPlot)
 		self:ClearPlot(plot, player.UserId)
 		if plot.Parent then
 			plot:SetAttribute("Occupied", false)
 			plot:SetAttribute("UserId", 0)
+			pcall(function() plot:SetAttribute("AssignedUserId", nil) end)
+			pcall(function() plot:SetAttribute("AssignedPersistentId", nil) end)
+			pcall(function() plot:SetAttribute("OwnerUserId", nil) end)
+			if PlotManager.Config.MirrorZoneAttributes then
+				pcall(function() PlotManager.Zone.ClearAssignment(plot) end)
+			end
 		end
 	end
+	if player and player.SetAttribute then
+		pcall(function()
+			player:SetAttribute(ATTR_PLOT_ASSIGNED_NAME, nil)
+			player:SetAttribute(ATTR_PLOT_ASSIGNED_AT, nil)
+		end)
+	end
 	self.PlayerToPlot[player.UserId] = nil
-	placements[player.UserId] = nil -- Clear placement records
+	placements[player.UserId] = nil
 	dprint(("Released plot for %s"):format(player.Name))
 end
 
 -- Character spawn -----------------------------------------------------------
-function PlotManager:FindSpawnPart(plotModel)
-	if not plotModel then return nil end
-	local spawnPart = plotModel:FindFirstChild("Spawn")
-	if spawnPart and spawnPart:IsA("BasePart") then
-		return spawnPart
-	end
-	for _, d in ipairs(plotModel:GetDescendants()) do
-		if d:IsA("BasePart") then return d end
-	end
-	return nil
-end
-
 function PlotManager:OnCharacterAdded(player, character)
-	local plot = self:GetPlayerPlot(player)
-	if not plot then
+	local userId = player and player.UserId
+	-- Slightly longer, more robust wait
+	local reattempts = (PlotManager.Config.SpawnAssignmentReattempts or 2) + 1
+	local timeout = tonumber(PlotManager.Config.SpawnAssignmentWaitSeconds) or 1.5
+	local interval = PlotManager.Config.SpawnAssignmentCheckInterval or 0.05
+
+	local function checkAssignmentConsistent()
+		local plot = self:GetPlayerPlot(player)
+		if not plot then return false, nil end
+		local pname = nil
+		pcall(function() pname = (player.GetAttribute and player:GetAttribute(ATTR_PLOT_ASSIGNED_NAME)) end)
+		if pname and pname == plot.Name and plot:GetAttribute("Occupied") then
+			return true, plot
+		end
+		local pidx = nil
+		pcall(function() pidx = (player.GetAttribute and player:GetAttribute("PlotIndex")) end)
+		local midx = plot:GetAttribute(self.IndexAttribute)
+		if pidx and midx and tonumber(pidx) == tonumber(midx) and plot:GetAttribute("Occupied") then
+			return true, plot
+		end
+		return false, plot
+	end
+
+	local finalPlot = nil
+	for attempt = 1, reattempts do
+		local start = os.clock()
+		repeat
+			local ok2, plot = checkAssignmentConsistent()
+			if ok2 and plot then
+				finalPlot = plot
+				break
+			end
+			task.wait(interval)
+		until (os.clock() - start) >= timeout
+
+		if finalPlot then break end
 		pcall(function() self:AssignPlayer(player) end)
-		plot = self:GetPlayerPlot(player)
-		if not plot then
-			dprint(("OnCharacterAdded: no plot for %s; spawn will use default spawn"):format(player.Name))
-			return
-		end
 	end
-	local spawnPart = self:FindSpawnPart(plot)
-	if spawnPart then
-		local hrp = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
-		if hrp then
-			pcall(function() hrp.CFrame = spawnPart.CFrame + Vector3.new(0, 3, 0) end)
-		end
+
+	if not finalPlot then
+		local ok3, plot = checkAssignmentConsistent()
+		if ok3 then finalPlot = plot end
 	end
+
+	if not finalPlot then
+		pcall(function() self:AssignPlayer(player) end)
+		finalPlot = self:GetPlayerPlot(player)
+	end
+
+	if not finalPlot then
+		dprint(("OnCharacterAdded: no plot for %s; spawn will use default spawn"):format(player.Name))
+		return
+	end
+
+	-- Teleport now (also happens on assign if ForceTeleportOnAssign)
+	self:_teleportPlayerToPlotSpawn(player, finalPlot)
 end
 
 -- Initialization ------------------------------------------------------------
 function PlotManager:Init()
-	-- Make safe if invoked without colon (self == nil)
 	if not self then self = PlotManager end
-
 	if self._initialized then
 		dprint("Init() already called; skipping.")
 		return self
 	end
 	self._initialized = true
 
-	-- Ensure tables exist
 	self.Plots = self.Plots or {}
 	self.PlayerToPlot = self.PlayerToPlot or {}
 
-	-- Discover plots (recursive)
-	local ok, plots = pcall(discoverPlotsRecursive)
-	if not ok then
-		warn("[PlotManager] discoverPlotsRecursive failed:", plots)
-		plots = {}
+	if PlotManager.Config.UseExplicitRegistrationOnly then
+		self.Plots = {}
+		dprint("Plot discovery skipped (UseExplicitRegistrationOnly=true). Awaiting RegisterPlot calls.")
+	else
+		local ok, plots = pcall(discoverPlotsRecursive)
+		if not ok then
+			warn("[PlotManager] discoverPlotsRecursive failed:", plots)
+			plots = {}
+		end
+		self.Plots = plots or {}
 	end
-	self.Plots = plots or {}
+
+	for _, p in ipairs(self.Plots) do
+		pcall(function() normalizePlotAttributes(p) end)
+	end
+
+	if PlotManager.Config.AllowExplicitRegistration then
+		local SSS = game:GetService("ServerScriptService")
+		local modulesFolder = SSS:FindFirstChild("Modules") or SSS
+		local be = modulesFolder:FindFirstChild("RegisterPlot")
+		if not be then
+			local created = Instance.new("BindableEvent")
+			created.Name = "RegisterPlot"
+			created.Parent = modulesFolder
+			be = created
+		end
+		be.Event:Connect(function(model, idx)
+			pcall(function() self:RegisterPlot(model, idx) end)
+		end)
+	end
 
 	dprint(("PlotManager initialized. Plots discovered: %d"):format(#self.Plots))
 
-	-- Hook PlayerAdded and PlayerRemoving
 	Players.PlayerAdded:Connect(function(player)
 		pcall(function()
 			if not self.PlayerToPlot[player.UserId] then
 				local assigned = self:AssignPlayer(player)
-				if not assigned then
-					if player.SetAttribute then
-						pcall(function() player:SetAttribute("PlotIndex", 0) end)
-					end
+				if not assigned and player.SetAttribute then
+					pcall(function() player:SetAttribute("PlotIndex", 0) end)
 				end
 			else
 				local plot = self.PlayerToPlot[player.UserId]
@@ -627,7 +1146,6 @@ function PlotManager:Init()
 		end)
 	end)
 
-	-- Assign plots for players already connected
 	for _,pl in ipairs(Players:GetPlayers()) do
 		pcall(function()
 			if not self.PlayerToPlot[pl.UserId] then
@@ -644,14 +1162,18 @@ function PlotManager:Init()
 		end)
 	end
 
+	function PlotManager.SyncPlotAttributes()
+		for _, plot in ipairs(PlotManager.Plots) do
+			pcall(function() normalizePlotAttributes(plot) end)
+		end
+		dprint("SyncPlotAttributes: normalized attributes for all discovered plots")
+	end
+
 	return self
 end
 
--- Auto-init on require (server-side). This ensures module self-initializes even if loader didn't call Init.
--- Only auto-init when running on server (ServerScriptService); avoid running in client contexts.
 local function autoInitIfServer()
 	if RunService:IsServer() then
-		-- Defer slightly to allow other modules that run immediately on require to finish (helps ordering races)
 		task.defer(function()
 			pcall(function() PlotManager:Init() end)
 		end)

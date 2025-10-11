@@ -310,6 +310,39 @@ local function ensureGraveyard()
 	return existing
 end
 
+-- Add a local we_getPlotOrigin helper to avoid referencing an undefined global.
+-- This function attempts a few resolution strategies:
+-- 1) If a global we_getPlotOrigin exists (possibly provided by another module), call it.
+-- 2) Look for a "SlimeZone" BasePart on the provided plot Model.
+-- 3) Scan descendants for a BasePart named "SlimeZone" and return it.
+local function we_getPlotOrigin(plot)
+	-- 1) global hook if present
+	local globalFn = rawget(_G, "we_getPlotOrigin")
+	if type(globalFn) == "function" then
+		local ok, res = pcall(globalFn, plot)
+		if ok and res ~= nil then
+			return res
+		end
+	end
+
+	-- 2) direct attribute on plot
+	if plot and type(plot.FindFirstChild) == "function" then
+		local ok, z = pcall(function() return plot:FindFirstChild("SlimeZone") end)
+		if ok and z and z:IsA("BasePart") then
+			return z
+		end
+
+		-- 3) search descendants for a BasePart named SlimeZone
+		for _, d in ipairs(plot:GetDescendants()) do
+			if d and d:IsA("BasePart") and tostring(d.Name) == "SlimeZone" then
+				return d
+			end
+		end
+	end
+
+	return nil
+end
+
 ----------------------------------------------------------
 -- SNAPSHOT HELPERS
 ----------------------------------------------------------
@@ -765,8 +798,8 @@ local function ensureInventoryEntryHasId(player, eggId, payloadTable)
 			elseif not data.Value or data.Value == "" then
 				shouldSet = true
 			else
-				local ok2, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
-				if not ok2 or type(t) ~= "table" or (not t.id and not t.eggId) then
+				local ok, t = pcall(function() return HttpService:JSONDecode(data.Value) end)
+				if not ok or type(t) ~= "table" or (not t.id and not t.eggId) then
 					shouldSet = true
 				end
 			end
@@ -832,6 +865,8 @@ end
 
 -- New helper: aggressively remove any local Entry_<id> folder(s) under player's Inventory.worldEggs
 -- This is a defensive/local-only cleanup to avoid leftover folder visibility/race artifacts in the runtime Inventory folder.
+-- New: aggressively remove any local Entry_<id> folder(s) under player's Inventory.worldEggs
+-- Place this after ensureInventoryEntryHasId (new helper)
 local function removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
 	if not player or not id or not folderName then return end
 	local ok, inv = pcall(function() return player:FindFirstChild("Inventory") end)
@@ -870,6 +905,7 @@ local function removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
 end
 
 -- New small helper to perform a couple of retry passes to catch races where a later merge re-adds the folder
+-- Place this after removeInventoryEntryFolderByIdForPlayer
 local function removeInventoryEntryFolderWithRetries(player, folderName, id)
 	pcall(function()
 		removeInventoryEntryFolderByIdForPlayer(player, folderName, id)
@@ -890,6 +926,8 @@ end
 
 -- New helper: robustly remove any lingering worldEggs inventory entries for a player/userId
 -- Tries InventoryService (by player), PlayerProfileService (by userId), and finally edits loaded profile in-memory.
+-- New helper: robustly remove any lingering worldEggs inventory entries for a player/userId
+-- Place this after removeInventoryEntryFolderWithRetries
 local function safeRemoveWorldEggForPlayer(playerOrUser, eggId)
 	if not eggId then return end
 
@@ -1307,11 +1345,7 @@ local function persistWorldSlime(ownerPlayer, ownerUserId, slime, eggId)
 
 			-- Then attempt to ask GrowthPersistenceService to stamp & save (blocking variant if available).
 			if SlimeCore and SlimeCore.GrowthPersistenceService and type(SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave) == "function" then
-				-- prefer numeric userId
-				local okSave, res = pcall(function() return SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave(ownerUserId, 6) end)
-				if not okSave then
-					dprint("[PersistWorldSlime] GrowthPersistenceService.FlushPlayerSlimesAndSave failed for", ownerUserId, res)
-				end
+				pcall(function() SlimeCore.GrowthPersistenceService.FlushPlayerSlimesAndSave(ownerUserId, 6) end)
 			end
 		end)
 	end)
@@ -1751,16 +1785,131 @@ end
 ----------------------------------------------------------
 -- REGISTER / DEDUPE / ADOPT
 ----------------------------------------------------------
+
+-- Insert these helpers near the other utility helpers (before registerEggModel)
+
+-- New tolerant extraction helper for egg id (place this near other helpers; before registerEggModel)
+local function _tryExtractEggIdFromModel(inst)
+	if not inst then return nil end
+	local function tryAttr(k)
+		local ok, v = pcall(function() return inst:GetAttribute(k) end)
+		if ok and v ~= nil and tostring(v) ~= "" then return tostring(v) end
+		return nil
+	end
+	-- Common attribute names
+	local candidates = { "EggId", "eggId", "id", "Id", "EggID" }
+	for _, k in ipairs(candidates) do
+		local v = tryAttr(k)
+		if v then return v end
+	end
+
+	-- Child StringValue named Data / EggId / eggId / id
+	local function tryChildNames()
+		local names = { "Data", "EggId", "eggId", "id", "Id" }
+		for _, childName in ipairs(names) do
+			local c = inst:FindFirstChild(childName)
+			if c and c:IsA("StringValue") and c.Value and c.Value ~= "" then
+				-- If it's JSON, prefer JSON id
+				local ok, dec = pcall(function() return HttpService:JSONDecode(c.Value) end)
+				if ok and type(dec) == "table" then
+					local id = dec.eggId or dec.EggId or dec.id or dec.Id
+					if id and tostring(id) ~= "" then return tostring(id) end
+				end
+				-- Not JSON: if it looks like an id/guid, return raw
+				if tostring(c.Value):match("[A-Fa-f0-9%-]+") then
+					return tostring(c.Value)
+				end
+			end
+		end
+		return nil
+	end
+
+	local cid = tryChildNames()
+	if cid then return cid end
+
+	-- last-resort: Name that looks like id
+	if tostring(inst.Name):match("[A-Fa-f0-9%-]+") then
+		return tostring(inst.Name)
+	end
+
+	return nil
+end
+
+-- New helper: findNearbyEggAtPosition (place before registerEggModel)
+local function findNearbyEggAtPosition(pos, ownerUserId, radius)
+	if not pos then return nil end
+	radius = tonumber(radius) or 1.0
+	local radiusSqr = radius * radius
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Egg" then
+			local okOwner, owner = pcall(function() return inst:GetAttribute("OwnerUserId") end)
+			if okOwner and ownerUserId and owner and tostring(owner) ~= tostring(ownerUserId) then
+				-- owner mismatch -> skip
+			else
+				local prim = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+				if prim and prim:IsDescendantOf(Workspace) then
+					local okP, ppos = pcall(function() return prim.Position end)
+					if okP and ppos then
+						local d = (ppos - pos)
+						if (d.X*d.X + d.Y*d.Y + d.Z*d.Z) <= radiusSqr then
+							local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+							local inTool = pcall(function() return inst:FindFirstAncestorWhichIsA("Tool") end)
+							if not inTool and (not okRet or not ret) then
+								return inst
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- Replace the current registerEggModel implementation with this corrected, balanced version.
 local function registerEggModel(worldEgg)
 	if PlacedEggs[worldEgg] then return end
 	if not worldEgg or not worldEgg.Parent then return end
 	if worldEgg:GetAttribute("Hatching") or worldEgg:GetAttribute("Hatched") then return end
 
-	local eggId = worldEgg:GetAttribute("EggId")
+	-- Try tolerant extraction first (handles Data child / alternate attribute names)
+	local eggId = nil
+	pcall(function() eggId = worldEgg:GetAttribute("EggId") end)
+	if not eggId then
+		local ok, extracted = pcall(function() return _tryExtractEggIdFromModel(worldEgg) end)
+		if ok and extracted then eggId = extracted end
+	end
+
+	-- If still no eggId, attempt to adopt a nearby egg (avoid creating an immediate duplicate)
+	if not eggId then
+		local prim = worldEgg.PrimaryPart or worldEgg:FindFirstChildWhichIsA("BasePart")
+		local pos = nil
+		if prim then
+			pcall(function() pos = prim.Position end)
+		end
+		local owner = nil
+		pcall(function() owner = worldEgg:GetAttribute("OwnerUserId") end)
+		if pos then
+			local near = findNearbyEggAtPosition(pos, owner, 1.0)
+			if near then
+				-- Adopt the nearby egg rather than assigning/generating a new one.
+				dprint(("registerEggModel: adopted nearby egg for restored/new model; adopting EggId=%s path=%s")
+					:format(tostring(near:GetAttribute("EggId")), tostring(near:GetFullName())))
+				-- Update attributes on the existing instance to reflect placed state if needed
+				pcall(function() near:SetAttribute("Placed", true) end)
+				pcall(function() near:SetAttribute("OwnerUserId", owner or near:GetAttribute("OwnerUserId")) end)
+				-- ensure snapshot/placed state is consistent
+				pushSnapshot(near)
+				return
+			end
+		end
+	end
+
+	-- If still missing, assign a new EggId (same as previous behavior)
 	if not eggId then
 		eggId = HttpService:GenerateGUID(false)
-		worldEgg:SetAttribute("EggId", eggId)
-		if DEBUG then dprint("Assigned missing EggId="..eggId) end
+		pcall(function() worldEgg:SetAttribute("EggId", eggId) end)
+		if DEBUG then dprint("Assigned missing EggId=" .. eggId) end
 	end
 
 	local prior = EggIdSeenWorld[eggId]
@@ -1769,14 +1918,16 @@ local function registerEggModel(worldEgg)
 		local pb = worldEgg:GetAttribute("PlacedAt") or math.huge
 		if pb >= pa then
 			if shouldSkipPurgeForModel(worldEgg) then
-				dprint(("RegisterEgg: skipped dedupe destroy for restored/new egg EggId=%s Parent=%s"):format(tostring(worldEgg:GetAttribute("EggId")), tostring(worldEgg.Parent and worldEgg.Parent:GetFullName())))
+				dprint(("RegisterEgg: skipped dedupe destroy for restored/new egg EggId=%s Parent=%s")
+					:format(tostring(worldEgg:GetAttribute("EggId")), tostring(worldEgg.Parent and worldEgg.Parent:GetFullName())))
 				return
 			end
 			destroyEggModel(worldEgg, "DedupeLater")
 			return
 		else
 			if shouldSkipPurgeForModel(prior) then
-				dprint(("RegisterEgg: skipped dedupe destroy for prior restored egg EggId=%s Parent=%s"):format(tostring(prior:GetAttribute("EggId")), tostring(prior.Parent and prior.Parent:GetFullName())))
+				dprint(("RegisterEgg: skipped dedupe destroy for prior restored egg EggId=%s Parent=%s")
+					:format(tostring(prior:GetAttribute("EggId")), tostring(prior.Parent and prior.Parent:GetFullName())))
 			else
 				destroyEggModel(prior, "DedupeLaterOlderReplaced")
 			end
@@ -1785,12 +1936,12 @@ local function registerEggModel(worldEgg)
 	EggIdSeenWorld[eggId] = worldEgg
 
 	local owner = worldEgg:GetAttribute("OwnerUserId")
-	local hatchAt= worldEgg:GetAttribute("HatchAt")
+	local hatchAt = worldEgg:GetAttribute("HatchAt")
 	-- Accept eggs that have HatchAt or can be derived by client; for server adoption we require owner at least.
 	if not owner then return end
 
 	PlacedEggs[worldEgg] = {
-		HatchAt = worldEgg:GetAttribute("HatchAt"),
+		HatchAt = hatchAt,
 		OwnerUserId = owner,
 		Zone = nil,
 		Gui = nil,
@@ -1862,11 +2013,16 @@ local function registerEggModel(worldEgg)
 
 	if DEBUG then
 		dprint(("RegisterEgg eggId=%s owner=%s placed=%d/%d hatchIn=%.1fs")
-			:format(eggId, tostring(owner),
-				GetPlacedCount(owner), GetEggPlacementCap({UserId=owner}),
-				math.max(0,(worldEgg:GetAttribute("HatchAt") or os.time()) - os.time())))
+			:format(
+				eggId,
+				tostring(owner),
+				GetPlacedCount(owner),
+				GetEggPlacementCap({ UserId = owner }),
+				math.max(0, (worldEgg:GetAttribute("HatchAt") or os.time()) - os.time())
+			))
 	end
 end
+
 
 local function adoptExistingEggs()
 	local adopted = 0
@@ -1982,6 +2138,8 @@ local function placeEgg(player, hitCFrame, tool)
 	worldEgg:SetAttribute("HatchAt", os.time() + hatchTime)
 
 	-- Replace the current placement math with this block (inside placeEgg after worldEgg is cloned)
+	-- Replace the placement math inside placeEgg with this block.
+	-- Find the section inside placeEgg where worldEgg has been cloned and before parenting; replace the old placement math with this.
 	local primary = choosePrimary(worldEgg)
 	if primary then
 		local okModel, modelPivot = pcall(function() return worldEgg:GetPivot() end)
@@ -2018,7 +2176,7 @@ local function placeEgg(player, hitCFrame, tool)
 			pcall(function() worldEgg:PivotTo(hitCFrame) end)
 		end
 	end
-	
+
 	local parentFolder = nil
 	local tries = 0
 	repeat
@@ -2144,245 +2302,216 @@ end
 -- and before the final `return EggService` so those locals are available).
 -- Replace or insert this function into EggService.lua (it replaces the prior RestoreEggSnapshot)
 -- Replace the existing EggService.RestoreEggSnapshot(...) with this function.
-function EggService.RestoreEggSnapshot(userId, eggList)
-	if not eggList or type(eggList) ~= "table" or #eggList == 0 then return false end
+-- Replace existing EggService.RestoreEggSnapshot(...) with this block (drop-in).
+-- Place this after registerEggModel / pushSnapshot definitions and before the final `return EggService`.
+-- Replacement RestoreEggSnapshot with extra debug + deferred reparent attempts
+-- Drop this into EggService.lua replacing the prior function
+
+-- Strict restore from snapshot: only parent under a verified player plot (no Workspace fallback).
+-- Waits briefly for the player's plot (and optional anchor) to be ready, then restores eggs.
+-- PATCH 4: Replace EggService.RestoreEggSnapshot to respect saved positions/yaw; only fallback to anchor spread
+-- This is a drop-in replacement for the whole function.
+function EggService.RestoreEggSnapshot(userId, eggList, opts)
+	local PLOT_AWAIT_TIMEOUT = (opts and tonumber(opts.timeout)) or 10
+	local REQUIRE_PLOT_READY_PART = (opts and tostring(opts.anchorName)) or "SlimeZone"
+
+	if not eggList or type(eggList) ~= "table" or #eggList == 0 then
+		if DEBUG then dprint(("RestoreEggSnapshot: nothing to restore for userId=%s"):format(tostring(userId))) end
+		return false
+	end
+
 	local uid = tonumber(userId) or userId
 	if not uid then return false end
 
-	-- Try to resolve a plot folder for this user via PlotManager or by scanning Workspace
-	local plotFolder = nil
+	-- Resolve PlotManager and plot
+	local pmModule = nil
 	pcall(function()
-		local pmModule = nil
-		local ms = ModulesRoot
-		if ms and ms:FindFirstChild("PlotManager") then
-			local ok, pm = pcall(function() return require(ms:FindFirstChild("PlotManager")) end)
-			if ok and pm then pmModule = pm end
-		elseif ServerScriptService and ServerScriptService:FindFirstChild("Modules") then
-			local modFolder = ServerScriptService:FindFirstChild("Modules")
-			if modFolder and modFolder:FindFirstChild("PlotManager") then
-				local ok2, pm2 = pcall(function() return require(modFolder:FindFirstChild("PlotManager")) end)
-				if ok2 and pm2 then pmModule = pm2 end
-			end
-		end
-
-		if pmModule and type(pmModule.GetPlayerPlot) == "function" then
-			local okP, p = pcall(function()
-				local pl = Players:GetPlayerByUserId(uid)
-				if pl then return pmModule:GetPlayerPlot(pl) end
-				-- fallback: some PlotManager implementations expose GetPlotFolderForUser userId API
-				if type(pmModule.GetPlotFolderForUser) == "function" then
-					return pmModule.GetPlotFolderForUser(uid)
-				end
-				return nil
-			end)
-			if okP and p then plotFolder = p end
-		end
+		local mod = ModulesRoot:FindFirstChild("PlotManager")
+		if mod and mod:IsA("ModuleScript") then pmModule = require(mod) end
 	end)
 
-	-- Fallback: find any Model under Workspace whose UserId/OwnerUserId matches uid and name looks like Player%d+
-	if not plotFolder then
-		for _, m in ipairs(Workspace:GetChildren()) do
-			if m and m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
-				local ok, attr = pcall(function() return m:GetAttribute("UserId") or m:GetAttribute("OwnerUserId") or m:GetAttribute("AssignedUserId") end)
-				if ok and attr and tostring(attr) == tostring(uid) then
-					plotFolder = m
-					break
+	local function resolvePlot(uidNum, timeoutSec)
+		local deadline = os.clock() + (timeoutSec or PLOT_AWAIT_TIMEOUT)
+		repeat
+			local plot = nil
+			if pmModule and type(pmModule.GetPlayerPlot) == "function" then
+				local pl = Players:GetPlayerByUserId(uidNum)
+				if pl then
+					local ok, p = pcall(function() return pmModule:GetPlayerPlot(pl) end)
+					if ok and p then plot = p end
 				end
 			end
-		end
+			if not plot then
+				for _, m in ipairs(Workspace:GetChildren()) do
+					if m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
+						local a = m:GetAttribute("UserId") or m:GetAttribute("OwnerUserId") or m:GetAttribute("AssignedUserId")
+						if a and tostring(a) == tostring(uidNum) then plot = m break end
+					end
+				end
+			end
+			if plot and plot.Parent then
+				if not REQUIRE_PLOT_READY_PART or REQUIRE_PLOT_READY_PART == "" then return plot end
+				local anchor = plot:FindFirstChild(REQUIRE_PLOT_READY_PART, true)
+				if anchor then return plot end
+			end
+			task.wait(0.1)
+		until os.clock() >= deadline
+		return nil
 	end
 
-	-- helper: ensure PrimaryPart & interaction object (Prompt / ClickDetector)
+	local plot = resolvePlot(tonumber(uid) or uid, PLOT_AWAIT_TIMEOUT)
+	if not plot then
+		if DEBUG then dprint(("[RestoreEggSnapshot] No plot ready for uid=%s; not restoring."):format(tostring(uid))) end
+		return false
+	end
+
+	local anchor = plot:FindFirstChild(REQUIRE_PLOT_READY_PART, true)
+	if not anchor then
+		local okA, z = pcall(function() return we_getPlotOrigin(plot) end)
+		if okA then anchor = z end
+	end
+
+	local spreadIndex = 0
+	local createdAny = false
+
 	local function ensurePrimaryAndInteraction(m)
-		-- ensure primary part
 		if not m.PrimaryPart then
-			local handle = m:FindFirstChild("Handle") or m:FindFirstChildWhichIsA("BasePart")
-			if handle then
-				pcall(function() m.PrimaryPart = handle end)
-			end
+			local h = m:FindFirstChild("Handle") or m:FindFirstChildWhichIsA("BasePart")
+			if h then pcall(function() m.PrimaryPart = h end) end
 		end
-
-		-- check for existing ClickDetector/ProximityPrompt
 		local hasInteract = false
-		for _,d in ipairs(m:GetDescendants()) do
-			if d:IsA("ClickDetector") or d:IsA("ProximityPrompt") then
-				hasInteract = true
-				break
-			end
+		for _, d in ipairs(m:GetDescendants()) do
+			if d:IsA("ClickDetector") or d:IsA("ProximityPrompt") then hasInteract = true break end
 		end
-
 		if not hasInteract then
-			-- try to clone the interaction from the EggTemplate (if present)
 			local src = nil
 			pcall(function()
 				if EggTemplate and EggTemplate:IsA("Model") then
-					-- search recursively in template
 					for _,desc in ipairs(EggTemplate:GetDescendants()) do
-						if desc:IsA("ProximityPrompt") or desc:IsA("ClickDetector") then
-							src = desc
-							break
-						end
+						if desc:IsA("ProximityPrompt") or desc:IsA("ClickDetector") then src = desc break end
 					end
 				end
 			end)
-
 			if src then
-				local ok, clone = pcall(function() return src:Clone() end)
-				if ok and clone then
-					local target = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart") or m
-					pcall(function() clone.Parent = target end)
-					return
-				end
-			end
-
-			-- fallback: create a minimal ClickDetector on primary/base part so client code can detect it
-			local primary = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-			if primary then
-				local cd = Instance.new("ClickDetector")
-				cd.MaxActivationDistance = 32
-				pcall(function() cd.Parent = primary end)
+				pcall(function() local clone = src:Clone() clone.Parent = (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart") or m) end)
+			else
+				local primary = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+				if primary then local cd = Instance.new("ClickDetector") cd.MaxActivationDistance = 32 cd.Parent = primary end
 			end
 		end
 	end
 
-	local createdAny = false
 	for _, entry in ipairs(eggList) do
-		pcall(function()
-			if type(entry) ~= "table" then return end
+		if type(entry) == "table" then
+			pcall(function()
+				local eggId = tostring(entry.eggId or entry.id or entry.EggId or HttpService:GenerateGUID(false))
+				local slimeType = entry.SlimeType or entry.Breed or DEFAULT_SLIME_TYPE
 
-			-- Normalized id fields (accept many variants)
-			local eggId = entry and (entry.eggId or entry.id or entry.EggId or entry.EggID) or nil
-			if not eggId then
-				eggId = HttpService and HttpService:GenerateGUID(false) or ("egg_" .. tostring(os.time()) .. "_" .. tostring(math.random(1, 1e6)))
-			end
-
-			-- clone template where available
-			local m = nil
-			local okClone, cloned = pcall(function() return (EggTemplate and EggTemplate:IsA("Model")) and EggTemplate:Clone() end)
-			if okClone and cloned then
-				m = cloned
-			else
-				m = Instance.new("Model")
+				local m = cloneEggTemplateForType(slimeType)
 				m.Name = "Egg"
-				local p = Instance.new("Part")
-				p.Name = "Handle"
-				p.Size = Vector3.new(1,1,1)
-				p.Anchored = false
-				p.Parent = m
-				m.PrimaryPart = p
-			end
+				m:SetAttribute("EggId", eggId)
+				m:SetAttribute("OwnerUserId", tonumber(uid) or uid)
+				m:SetAttribute("Placed", true)
+				m:SetAttribute("ManualHatch", MANUAL_HATCH_MODE)
+				m:SetAttribute("RecentlyPlacedSaved", true)
+				m:SetAttribute("RecentlyPlacedSavedAt", os.time())
+				m:SetAttribute("RestoredByGrandInvSer", true)
+				m:SetAttribute("PreserveOnServer", true)
+				m:SetAttribute("RestoreStamp", tick())
 
-			m.Name = "Egg"
-			-- attributes: normalize keys and set canonical fields
-			pcall(function() m:SetAttribute("EggId", tostring(eggId)) end)
-			pcall(function() m:SetAttribute("Placed", true) end)
-			-- CRITICAL: ensure ManualHatch attribute is set so client hatch UI recognizes the egg
-			pcall(function() m:SetAttribute("ManualHatch", MANUAL_HATCH_MODE) end)
-			pcall(function() m:SetAttribute("OwnerUserId", tonumber(uid) or uid) end)
-
-			-- placedAt / cr / placed_at variants
-			local placedAt = entry and (entry.placedAt or entry.PlacedAt or entry.cr or entry.placed_at) or nil
-			if placedAt then pcall(function() m:SetAttribute("PlacedAt", tonumber(placedAt) or placedAt) end) end
-
-			-- hatch info: ht/ha/HatchTime/HatchAt
-			local ht = entry and (entry.ht or entry.hatchTime or entry.HatchTime) or nil
-			local ha = entry and (entry.ha or entry.hatchAt or entry.HatchAt) or nil
-			if ht then pcall(function() m:SetAttribute("HatchTime", tonumber(ht)) end) end
-			-- compute/normalize HatchAt: accept epoch-like or compute from placedAt+ht
-			local hatchAtEpoch = nil
-			if ha then
-				local n = tonumber(ha)
-				if n then
-					hatchAtEpoch = n
+				-- Times
+				if entry.placedAt then m:SetAttribute("PlacedAt", tonumber(entry.placedAt) or entry.placedAt) end
+				if entry.hatchTime or entry.ht then
+					local ht = tonumber(entry.hatchTime or entry.ht)
+					if ht then m:SetAttribute("HatchTime", ht) end
 				end
-			end
-			if not hatchAtEpoch and ht and placedAt then
-				local pval = tonumber(placedAt) or nil
-				local htv = tonumber(ht) or nil
-				if pval and htv then
-					hatchAtEpoch = pval + htv
+				local hatchAt = tonumber(entry.hatchAt or entry.ha)
+				if not hatchAt and entry.placedAt and (entry.hatchTime or entry.ht) then
+					local p = tonumber(entry.placedAt); local ht = tonumber(entry.hatchTime or entry.ht)
+					if p and ht then hatchAt = p + ht end
 				end
-			end
-			if not hatchAtEpoch and ht then
-				hatchAtEpoch = os.time() + tonumber(ht)
-			end
-			if hatchAtEpoch then pcall(function() m:SetAttribute("HatchAt", hatchAtEpoch) end) end
+				if hatchAt then m:SetAttribute("HatchAt", hatchAt) end
 
-			-- optional attributes from WE_ATTR_MAP in serializer
-			for k,v in pairs(entry) do
-				if type(k) == "string" then
-					if not (k == "id" or k == "eggId" or k == "EggId" or k == "Placed" or k == "PlacedAt" or k == "OwnerUserId") then
+				-- Persist local/world yaw so we can orient upright
+				local lpx = tonumber(entry.lpx)
+				local lpy = tonumber(entry.lpy)
+				local lpz = tonumber(entry.lpz or entry.lz)
+				local lry = tonumber(entry.lry or entry.ry) or 0
+				local px  = tonumber(entry.px)
+				local py  = tonumber(entry.py)
+				local pz  = tonumber(entry.pz)
+
+				if lpx then m:SetAttribute("RestoreLpx", lpx) end
+				if lpy then m:SetAttribute("RestoreLpy", lpy) end
+				if lpz then m:SetAttribute("RestoreLpz", lpz) end
+				if lry then m:SetAttribute("RestoreLry", lry) end
+				if px then m:SetAttribute("RestorePX", px) end
+				if py then m:SetAttribute("RestorePY", py) end
+				if pz then m:SetAttribute("RestorePZ", pz) end
+
+				-- Other attributes (defensive copy)
+				for k,v in pairs(entry) do
+					if type(k) == "string" and not (k == "id" or k == "eggId" or k == "EggId" or k == "Placed" or k == "PlacedAt" or k == "OwnerUserId" or k == "hatchAt" or k == "hatchTime" or k == "ht" or k == "ha" or k == "lpx" or k == "lpy" or k == "lpz" or k == "lry" or k == "px" or k == "py" or k == "pz") then
 						pcall(function() m:SetAttribute(k, v) end)
 					end
 				end
-			end
 
-			-- position: support px/py/pz or Position table
-			local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-			if prim then
-				local px = entry and (entry.px or (entry.Position and entry.Position.x))
-				local py = entry and (entry.py or (entry.Position and entry.Position.y))
-				local pz = entry and (entry.pz or (entry.Position and entry.Position.z))
-				if px and py and pz then
-					local okPos, posCF = pcall(function() return CFrame.new(tonumber(px) or 0, tonumber(py) or 0, tonumber(pz) or 0) end)
-					if okPos and posCF then
-						-- Preserve the template/model rotation when placing by position only.
-						-- Previously we called m:PivotTo(posCF) which lost the template rotation and caused eggs to lay on their side.
-						local okPivot, modelPivot = pcall(function() return m:GetPivot() end)
-						if okPivot and typeof(modelPivot) == "CFrame" then
-							-- Extract rotation from the model's pivot and apply it to the desired world position
-							local rx, ry, rz = modelPivot:ToOrientation()
-							local rotOnly = CFrame.fromOrientation(rx, ry, rz)
-							local targetPivot = CFrame.new(posCF.Position) * rotOnly
-							pcall(function() m:PivotTo(targetPivot) end)
-						else
-							-- fallback to pivoting to posCF if no model pivot available
-							pcall(function() m:PivotTo(posCF) end)
-						end
-					end
+				m.Parent = plot
+				ensurePrimaryAndInteraction(m)
+
+				-- Compute target CFrame:
+				local targetCF = nil
+				if anchor and lpx ~= nil and lpy ~= nil and lpz ~= nil then
+					-- Use local coords relative to anchor; apply yaw (upright)
+					local baseCF = anchor.CFrame * CFrame.new(lpx, lpy, lpz)
+					targetCF = CFrame.new(baseCF.Position) * CFrame.Angles(0, lry, 0)
+				elseif px ~= nil and py ~= nil and pz ~= nil then
+					-- Use world coords directly; apply yaw (upright)
+					targetCF = CFrame.new(px, py, pz) * CFrame.Angles(0, lry, 0)
+				else
+					-- Fallback: spread near anchor
+					local baseCF = (anchor and anchor.CFrame) or plot:GetPivot() or CFrame.new(0,5,0)
+					local spread = 2.0
+					local ring = math.max(1, math.floor(spreadIndex / 6) + 1)
+					local angle = (spreadIndex % 6) * (math.pi / 3)
+					local dx = math.cos(angle) * ring * spread
+					local dz = math.sin(angle) * ring * spread
+					targetCF = baseCF + Vector3.new(dx, SPAWN_UPWARD_OFFSET, dz)
+					-- Keep upright even in fallback
+					targetCF = CFrame.new(targetCF.Position) * CFrame.Angles(0, 0, 0)
+					spreadIndex += 1
 				end
-			end
 
-			-- CRITICAL CHANGE: mark model preserved BEFORE parenting so poll/purge won't treat it as an orphan
-			local now = os.time()
-			pcall(function() m:SetAttribute("RecentlyPlacedSaved", true) end)
-			pcall(function() m:SetAttribute("RecentlyPlacedSavedAt", now) end)
-			pcall(function() m:SetAttribute("RestoredByGrandInvSer", true) end)
-			pcall(function() m:SetAttribute("PreserveOnServer", true) end)
-			pcall(function() m:SetAttribute("RestoreStamp", tick()) end)
+				-- Pivot upright (anchor then unanchor)
+				local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+				if prim then
+					local prevAnchored = prim.Anchored
+					pcall(function() prim.Anchored = true end)
+					pcall(function() m:PivotTo(targetCF) end)
+					task.delay(2.5, function()
+						pcall(function()
+							if prim and prim.Parent then prim.Anchored = prevAnchored end
+							pcall(function()
+								m:SetAttribute("RestoreStamp", nil)
+								m:SetAttribute("PreserveOnServer", nil)
+							end)
+						end)
+					end)
+				else
+					pcall(function() m:PivotTo(targetCF) end)
+					task.delay(2.5, function()
+						pcall(function()
+							m:SetAttribute("RestoreStamp", nil)
+							m:SetAttribute("PreserveOnServer", nil)
+						end)
+					end)
+				end
 
-			-- parent to plotFolder if found, else to Workspace
-			local targetParent = plotFolder or Workspace
-			pcall(function() m.Parent = targetParent end)
-
-			-- Ensure PrimaryPart and an interaction object exist (after parenting to allow template-relative queries)
-			ensurePrimaryAndInteraction(m)
-
-			-- ensure EggService register sees it: call registerEggModel (module-local)
-			pcall(function()
+				pushSnapshot(m)
 				registerEggModel(m)
+				createdAny = true
 			end)
-
-			-- ensure we push a snapshot to EggSnapshot for consistency
-			pcall(function() pushSnapshot(m) end)
-
-			-- Defensive re-register + snapshot after short delays to reduce race windows
-			task.defer(function()
-				pcall(function()
-					registerEggModel(m)
-					pushSnapshot(m)
-				end)
-			end)
-			task.delay(0.25, function()
-				pcall(function()
-					registerEggModel(m)
-					pushSnapshot(m)
-				end)
-			end)
-
-			createdAny = true
-			dprint(("[RestoreEggSnapshot] restored eggId=%s parent=%s owner=%s"):format(tostring(eggId), tostring(targetParent and targetParent:GetFullName()), tostring(uid)))
-		end)
+		end
 	end
 
 	return createdAny
@@ -2498,6 +2627,9 @@ function EggService.Init()
 							pcall(function() PlayerProfileService.SaveNow(ply, reason or "GrowthMarkDirty") end)
 						elseif tonumber(playerOrId) then
 							pcall(function() PlayerProfileService.SaveNow(tonumber(playerOrId), reason or "GrowthMarkDirty") end)
+						elseif type(playerOrId) == "table" and playerOrId.userId then
+							local uid = tonumber(playerOrId.userId) or tonumber(playerOrId.UserId)
+							if uid then PlayerProfileService.SaveNow(uid, reason or "GrowthMarkDirty") end
 						end
 					end
 

@@ -12,6 +12,8 @@ local RunService          = game:GetService("RunService")
 local HttpService         = game:GetService("HttpService")
 local ServerStorage       = game:GetService("ServerStorage")
 local Players             = game:GetService("Players")
+local SlimeCore = rawget(_G, "SlimeCore") or nil
+
 
 local GrandInventorySerializer = {}
 
@@ -141,125 +143,7 @@ local function findSerializerHelperModule(moduleName)
 end
 
 
--- Fixes the duplicated condition and adds a couple of common alternate key checks.
-local function dedupe_by_id(entries)
-	local out = {}
-	local seen = {}
-	for _, e in ipairs(entries or {}) do
-		if type(e) ~= "table" then
-			table.insert(out, e)
-		else
-			-- canonical id lookup (avoid duplicate checks)
-			local id = e.id or e.SlimeId or e.EggId or e.Id
-			-- fallbacks for uncommon variants
-			if not id then
-				id = e.slimeId or e.SLIME_ID or e.uuid or e.uid or e.ToolUniqueId or e.ToolUid
-			end
 
-			if id then
-				local k = tostring(id)
-				if not seen[k] then
-					seen[k] = true
-					table.insert(out, e)
-				end
-			else
-				-- no id available ? keep entry (can't dedupe reliably)
-				table.insert(out, e)
-			end
-		end
-	end
-	return out
-end
-
--- Merge incoming list into a cached player profile's worldSlimes (dedupe by id).
--- This reduces risk of duplicate entries being appended to profile.inventory.worldSlimes by multiple restores.
-local function merge_incoming_into_profile_worldslimes(userId, incoming)
-	if not incoming or type(incoming) ~= "table" then return false end
-
-	-- Try to require PlayerProfileService safely
-	local ok, PPS = pcall(function()
-		local ms = ServerScriptService and ServerScriptService:FindFirstChild("Modules")
-		if ms and ms:FindFirstChild("PlayerProfileService") then
-			return require(ms:FindFirstChild("PlayerProfileService"))
-		end
-		-- best-effort fallback if module placed elsewhere
-		if ServerScriptService and ServerScriptService:FindFirstChild("PlayerProfileService") then
-			return require(ServerScriptService:FindFirstChild("PlayerProfileService"))
-		end
-		return nil
-	end)
-	if not ok or not PPS or type(PPS.GetProfile) ~= "function" then return false end
-
-	local profile = nil
-	pcall(function() profile = PPS.GetProfile(userId) end)
-	if not profile then return false end
-
-	profile.inventory = profile.inventory or {}
-	local old = profile.inventory.worldSlimes or {}
-	local merged = {}
-	local seen = {}
-
-	-- add existing canonical entries first (normalize their id strings)
-	for _, entry in ipairs(old) do
-		if type(entry) == "table" then
-			local id = entry.id or entry.SlimeId or entry.Id
-			if id then
-				seen[tostring(id)] = true
-				merged[#merged+1] = entry
-			else
-				merged[#merged+1] = entry
-			end
-		end
-	end
-
-	-- add deduped incoming entries
-	local dedupedIncoming = dedupe_by_id(incoming)
-	for _, entry in ipairs(dedupedIncoming) do
-		if type(entry) ~= "table" then
-			table.insert(merged, entry)
-		else
-			local id = entry.id or entry.SlimeId or entry.Id
-			if id then
-				if not seen[tostring(id)] then
-					seen[tostring(id)] = true
-					table.insert(merged, entry)
-				end
-			else
-				table.insert(merged, entry)
-			end
-		end
-	end
-
-	-- If changed, assign and mark dirty
-	local changed = false
-	if #merged ~= #old then changed = true end
-	if not changed then
-		-- shallow compare ids
-		for i = 1, math.min(#merged, #old) do
-			local a = merged[i]; local b = old[i]
-			local aid = a and (a.id or a.SlimeId or a.Id)
-			local bid = b and (b.id or b.SlimeId or b.Id)
-			if tostring(aid) ~= tostring(bid) then changed = true; break end
-		end
-	end
-	if changed then
-		profile.inventory.worldSlimes = merged
-		-- Mark dirty so PlayerProfileService will persist via its normal flow
-		pcall(function()
-			if type(PPS.MarkDirty) == "function" then
-				-- MarkDirty may have different signatures; call defensively
-				pcall(function() PPS.MarkDirty(PPS, userId) end)
-				pcall(function() PPS.MarkDirty(userId) end)
-			end
-		end)
-		if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
-			pcall(function()
-				print(("[WorldSlimeService] merged incoming worldSlimes into profile for userId=%s, newCount=%d"):format(tostring(userId), tonumber(#merged) or #merged))
-			end)
-		end
-	end
-	return changed
-end
 
 -- Helpers: numeric/finite check
 
@@ -284,9 +168,7 @@ local function waitForInventoryReady(player, timeout)
 	return false
 end
 
-local function isFiniteNumber(n)
-	return type(n)=="number" and n==n and n~=math.huge and n~=-math.huge
-end
+
 
 local RESTORE_GRACE_SECONDS = 12
 local _restoreGrace = {}
@@ -303,6 +185,9 @@ local plotModelToUserId = {}
 local plotByPersistentId = {}
 local plotModelToPersistentId = {}
 
+local USE_PLOT_FALLBACKS = false -- hard-disable any arbitrary fallback parenting
+local PLOT_AWAIT_TIMEOUT = 10     -- seconds to wait for a real plot
+local REQUIRE_PLOT_READY_PART = "EggAnchor" -- optional: wait for this child under the plot
 
 local MAX_LOCAL_COORD_MAG = 200
 local function safe_num(v) if v == nil then return nil end local n = tonumber(v) return n end
@@ -363,11 +248,14 @@ end
 
 local function registerPlotModel(plotModel)
 	if not plotModel or not plotModel:IsA("Model") then return end
+
+	-- normalize to the topmost "Player%d+" model under Workspace
 	local top = plotModel
 	while top.Parent and top.Parent ~= Workspace do
 		top = top.Parent
 	end
 	if not top or not top:IsA("Model") then return end
+
 	local candidate = top
 	if not tostring(candidate.Name):match("^Player%d+$") then
 		if tostring(plotModel.Name):match("^Player%d+$") then
@@ -377,11 +265,17 @@ local function registerPlotModel(plotModel)
 		end
 	end
 	plotModel = candidate
+
+	-- read attributes
 	local uidAttr = plotModel:GetAttribute("UserId") or plotModel:GetAttribute("OwnerUserId") or plotModel:GetAttribute("AssignedUserId")
-	local uid = tonum(uidAttr)
+	local uid = tonum and tonum(uidAttr) or tonumber(uidAttr)
+
 	local pidAttr = plotModel:GetAttribute("AssignedPersistentId") or plotModel:GetAttribute("PersistentId") or plotModel:GetAttribute("OwnerPersistentId")
-	local pid = tonum(pidAttr)
-	if uid then
+	local pidStr = pidAttr and tostring(pidAttr) or nil
+	if pidStr == "" or pidStr == "0" then pidStr = nil end
+
+	-- register by user id (only if > 0)
+	if uid and uid > 0 then
 		local prev = plotByUserId[uid]
 		if prev and prev ~= plotModel then
 			plotModelToUserId[prev] = nil
@@ -390,56 +284,92 @@ local function registerPlotModel(plotModel)
 		plotModelToUserId[plotModel] = uid
 		dprint(("Registered plot=%s -> userId=%s"):format(tostring(plotModel:GetFullName()), tostring(uid)))
 	end
-	if pid then
-		local prev = plotByPersistentId[pid]
+
+	-- register by persistent id (store keys as strings)
+	if pidStr then
+		local prev = plotByPersistentId[pidStr]
 		if prev and prev ~= plotModel then
 			plotModelToPersistentId[prev] = nil
 		end
-		plotByPersistentId[pid] = plotModel
-		plotModelToPersistentId[plotModel] = pid
-		dprint(("Registered plot=%s -> persistentId=%s"):format(tostring(plotModel:GetFullName()), tostring(pid)))
+		plotByPersistentId[pidStr] = plotModel
+		plotModelToPersistentId[plotModel] = pidStr
+		dprint(("Registered plot=%s -> persistentId=%s"):format(tostring(plotModel:GetFullName()), pidStr))
 	end
+
+	-- attribute change watchers
 	pcall(function()
-		if plotModel.GetAttributeChangedSignal then
-			plotModel:GetAttributeChangedSignal("UserId"):Connect(function()
-				local new = tonum(plotModel:GetAttribute("UserId"))
-				if not new then return end
-				local old = plotModelToUserId[plotModel]
-				if old and plotByUserId[old] == plotModel then plotByUserId[old] = nil end
-				plotByUserId[new] = plotModel
-				plotModelToUserId[plotModel] = new
-				dprint(("UserId changed; registered plot=%s -> userId=%s"):format(tostring(plotModel:GetFullName()), tostring(new)))
-			end)
-			plotModel:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
-				local new = tonum(plotModel:GetAttribute("OwnerUserId"))
-				if not new then return end
-				local old = plotModelToUserId[plotModel]
-				if old and plotByUserId[old] == plotModel then plotByUserId[old] = nil end
-				plotByUserId[new] = plotModel
-				plotModelToUserId[plotModel] = new
-				dprint(("OwnerUserId changed; registered plot=%s -> userId=%s"):format(tostring(plotModel:GetFullName()), tostring(new)))
-			end)
-			plotModel:GetAttributeChangedSignal("AssignedUserId"):Connect(function()
-				local new = tonum(plotModel:GetAttribute("AssignedUserId"))
-				if not new then return end
-				local old = plotModelToUserId[plotModel]
-				if old and plotByUserId[old] == plotModel then plotByUserId[old] = nil end
-				plotByUserId[new] = plotModel
-				plotModelToUserId[plotModel] = new
-				dprint(("AssignedUserId changed; registered plot=%s -> userId=%s"):format(tostring(plotModel:GetFullName()), tostring(new)))
-			end)
-			plotModel:GetAttributeChangedSignal("AssignedPersistentId"):Connect(function()
-				local new = tonum(plotModel:GetAttribute("AssignedPersistentId"))
-				if not new then return end
-				local old = plotModelToPersistentId[plotModel]
-				if old and plotByPersistentId[old] == plotModel then plotByPersistentId[old] = nil end
-				plotByPersistentId[new] = plotModel
-				plotModelToPersistentId[plotModel] = new
-				dprint(("AssignedPersistentId changed; registered plot=%s -> persistentId=%s"):format(tostring(plotModel:GetFullName()), tostring(new)))
-			end)
+		if not plotModel.GetAttributeChangedSignal then return end
+
+		local function unregisterUserMapping()
+			local old = plotModelToUserId[plotModel]
+			if old and plotByUserId[old] == plotModel then
+				plotByUserId[old] = nil
+			end
+			if old then
+				dprint(("UserId cleared; unregistered plot=%s for userId=%s"):format(tostring(plotModel:GetFullName()), tostring(old)))
+			end
+			plotModelToUserId[plotModel] = nil
 		end
+
+		local function registerUserMapping(newUid)
+			local old = plotModelToUserId[plotModel]
+			if old and plotByUserId[old] == plotModel and old ~= newUid then
+				plotByUserId[old] = nil
+			end
+			plotByUserId[newUid] = plotModel
+			plotModelToUserId[plotModel] = newUid
+			dprint(("UserId changed; registered plot=%s -> userId=%s"):format(tostring(plotModel:GetFullName()), tostring(newUid)))
+		end
+
+		local function onUserIdChanged(attrName)
+			local new = tonum and tonum(plotModel:GetAttribute(attrName)) or tonumber(plotModel:GetAttribute(attrName))
+			if not new or new <= 0 then
+				unregisterUserMapping()
+			else
+				registerUserMapping(new)
+			end
+		end
+
+		plotModel:GetAttributeChangedSignal("UserId"):Connect(function()
+			onUserIdChanged("UserId")
+		end)
+		plotModel:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
+			onUserIdChanged("OwnerUserId")
+		end)
+		plotModel:GetAttributeChangedSignal("AssignedUserId"):Connect(function()
+			onUserIdChanged("AssignedUserId")
+		end)
+
+		local function unregisterPidMapping()
+			local old = plotModelToPersistentId[plotModel]
+			if old and plotByPersistentId[old] == plotModel then
+				plotByPersistentId[old] = nil
+			end
+			if old then
+				dprint(("AssignedPersistentId cleared; unregistered plot=%s for persistentId=%s"):format(tostring(plotModel:GetFullName()), tostring(old)))
+			end
+			plotModelToPersistentId[plotModel] = nil
+		end
+
+		plotModel:GetAttributeChangedSignal("AssignedPersistentId"):Connect(function()
+			local raw = plotModel:GetAttribute("AssignedPersistentId")
+			local newStr = raw and tostring(raw) or ""
+			if newStr == "" or newStr == "0" then
+				unregisterPidMapping()
+			else
+				local old = plotModelToPersistentId[plotModel]
+				if old and plotByPersistentId[old] == plotModel and old ~= newStr then
+					plotByPersistentId[old] = nil
+				end
+				plotByPersistentId[newStr] = plotModel
+				plotModelToPersistentId[plotModel] = newStr
+				dprint(("AssignedPersistentId changed; registered plot=%s -> persistentId=%s"):format(tostring(plotModel:GetFullName()), newStr))
+			end
+		end)
 	end)
-	plotModel.AncestryChanged:Connect(function(child, parent)
+
+	-- cleanup on removal
+	plotModel.AncestryChanged:Connect(function(_, parent)
 		if not parent then
 			local uidHere = plotModelToUserId[plotModel]
 			if uidHere then
@@ -465,6 +395,8 @@ local function scanAndRegisterPlotsOnStartup()
 	end
 end
 
+
+
 Workspace.ChildAdded:Connect(function(child)
 	if child and child:IsA("Model") and tostring(child.Name):match("^Player%d+$") then
 		task.defer(function()
@@ -475,11 +407,12 @@ end)
 
 function GrandInventorySerializer.RegisterPlotModelForUser(plotModel, userId, persistentId)
 	if not plotModel or not userId then return end
-	local uid = tonum(userId)
+	local uid = tonum(userId) or tonumber(userId)
 	if not uid then return end
 	plotModel:SetAttribute("AssignedUserId", uid)
 	if persistentId then
-		plotModel:SetAttribute("AssignedPersistentId", tonumber(persistentId))
+		-- store as string consistently
+		plotModel:SetAttribute("AssignedPersistentId", tostring(persistentId))
 	end
 	registerPlotModel(plotModel)
 end
@@ -529,34 +462,40 @@ local function we_findPlayerPlot_by_userid(userId)
 	return nil
 end
 
+-- In we_findPlayerPlot_by_persistentId (and similar), use string compare:
 local function we_findPlayerPlot_by_persistentId(persistentId)
 	if not persistentId then return nil end
-	local pid = tonum(persistentId)
-	if pid and plotByPersistentId[pid] and plotByPersistentId[pid].Parent then
-		return plotByPersistentId[pid]
+	local pidStr = tostring(persistentId)
+	if pidStr == "" or pidStr == "0" then return nil end
+
+	-- fast path: exact string key
+	local m = plotByPersistentId[pidStr]
+	if m and m.Parent then return m end
+
+	-- robustness: tolerate mixed key types in the map
+	for k, v in pairs(plotByPersistentId) do
+		if tostring(k) == pidStr and v and v.Parent then
+			return v
+		end
 	end
-	for _,m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
-			local attr = tonum(m:GetAttribute("AssignedPersistentId")) or tonum(m:GetAttribute("PersistentId")) or tonum(m:GetAttribute("OwnerPersistentId"))
-			if attr and pid and attr == pid then
-				registerPlotModel(m)
-				return m
+
+	-- fallback: scan Workspace for Player%d+ models and compare attributes
+	for _, child in ipairs(Workspace:GetChildren()) do
+		if child:IsA("Model") and tostring(child.Name):match("^Player%d+$") then
+			local a = child:GetAttribute("AssignedPersistentId")
+				or child:GetAttribute("PersistentId")
+				or child:GetAttribute("OwnerPersistentId")
+			if a and tostring(a) == pidStr then
+				-- ensure registration for future fast lookups
+				pcall(function() registerPlotModel(child) end)
+				return child
 			end
 		end
 	end
-	for _,desc in ipairs(Workspace:GetDescendants()) do
-		if desc:IsA("Model") then
-			local attr = tonum(desc:GetAttribute("OwnerPersistentId")) or tonum(desc:GetAttribute("AssignedPersistentId")) or tonum(desc:GetAttribute("PersistentId"))
-			if attr and pid and attr == pid then
-				local parentModel = desc
-				while parentModel and not parentModel:IsA("Model") and parentModel.Parent do parentModel = parentModel.Parent end
-				if parentModel then registerPlotModel(parentModel) end
-				return parentModel
-			end
-		end
-	end
+
 	return nil
 end
+
 
 local function safe_get_profile(playerOrId)
 	local PPS = getPPS()
@@ -632,46 +571,48 @@ local function safe_wait_for_profile(candidate, timeout)
 	return nil
 end
 
+-- Replace the existing getPersistentIdFor function with this implementation:
 local function getPersistentIdFor(profileOrPlayer)
 	local PPS = getPPS()
 	if not PPS then
 		if type(profileOrPlayer) == "table" then
-			return tonumber(profileOrPlayer.persistentId) or nil
+			-- store/return as string consistently
+			return tostring(profileOrPlayer.persistentId) or nil
 		end
 		return nil
 	end
 	if type(profileOrPlayer) == "table" and profileOrPlayer.persistentId then
-		return tonumber(profileOrPlayer.persistentId)
+		return tostring(profileOrPlayer.persistentId)
 	end
 	if type(profileOrPlayer) == "table" and type(profileOrPlayer.FindFirstChildOfClass) == "function" then
 		local prof = safe_get_profile(profileOrPlayer)
-		if prof and prof.persistentId then return tonumber(prof.persistentId) end
+		if prof and prof.persistentId then return tostring(prof.persistentId) end
 		if type(PPS.GetOrAssignPersistentId) == "function" then
 			local ok, pid = pcall(function() return PPS.GetOrAssignPersistentId(profileOrPlayer) end)
-			if ok and pid then return tonumber(pid) end
+			if ok and pid then return tostring(pid) end
 		end
 		return nil
 	end
 	if type(profileOrPlayer) == "table" and profileOrPlayer.inventory then
-		if profileOrPlayer.persistentId then return tonumber(profileOrPlayer.persistentId) end
+		if profileOrPlayer.persistentId then return tostring(profileOrPlayer.persistentId) end
 		if type(PPS.GetOrAssignPersistentId) == "function" then
 			local ok, pid = pcall(function() return PPS.GetOrAssignPersistentId(profileOrPlayer) end)
-			if ok and pid then return tonumber(pid) end
+			if ok and pid then return tostring(pid) end
 		end
 		return nil
 	end
 	if tonumber(profileOrPlayer) then
 		local prof = safe_get_profile(tonumber(profileOrPlayer))
-		if prof and prof.persistentId then return tonumber(prof.persistentId) end
+		if prof and prof.persistentId then return tostring(prof.persistentId) end
 		if type(PPS.GetOrAssignPersistentId) == "function" then
 			local ok, pid = pcall(function() return PPS.GetOrAssignPersistentId(tonumber(profileOrPlayer)) end)
-			if ok and pid then return tonumber(pid) end
+			if ok and pid then return tostring(pid) end
 		end
 	end
 	if type(profileOrPlayer) == "string" then
 		if type(PPS.GetOrAssignPersistentId) == "function" then
 			local ok, pid = pcall(function() return PPS.GetOrAssignPersistentId(profileOrPlayer) end)
-			if ok and pid then return tonumber(pid) end
+			if ok and pid then return tostring(pid) end
 		end
 	end
 	return nil
@@ -777,7 +718,28 @@ local function _we_getPlotOrigin(plot)
 	return nil
 end
 
-
+local function findPlotForPosition(pos, maxDistance)
+	if not pos then return nil end
+	maxDistance = tonumber(maxDistance) or 30
+	local bestPlot = nil
+	local bestDist = math.huge
+	for _, m in ipairs(Workspace:GetChildren()) do
+		if m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
+			local ok, zone = pcall(function() return _we_getPlotOrigin and _we_getPlotOrigin(m) end)
+			if ok and zone and zone:IsA("BasePart") then
+				local ok2, zpos = pcall(function() return zone.Position end)
+				if ok2 and zpos then
+					local d = (zpos - pos).Magnitude
+					if d < bestDist and d <= maxDistance then
+						bestDist = d
+						bestPlot = m
+					end
+				end
+			end
+		end
+	end
+	return bestPlot
+end
 
 -----------------------------------------------------------------------------------------------
 
@@ -789,42 +751,90 @@ end
 -- findPlotForUserWithFallback (drop-in)
 -- findPlotForUserWithFallback (drop-in)
 -- findPlotForUserWithFallback (drop-in)
-local function findPlotForUserWithFallback(userId, persistentId, nameKey)
-	-- Try by userid -> internal index functions
-	if userId then
-		local ok, p = pcall(function() return we_findPlayerPlot_by_userid(userId) end)
-		if ok and p then return p end
-		ok, p = pcall(function() return we_findPlayerPlot_by_persistentId(userId) end)
-		if ok and p then return p end
-	end
-
-	-- Try by persistent id explicitly
-	if persistentId then
-		local ok, p = pcall(function() return we_findPlayerPlot_by_persistentId(persistentId) end)
-		if ok and p then return p end
-	end
-
-	-- Scan Workspace Player%d+ models for matching attributes as fallback
-	for _, m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and tostring(m.Name):match("^Player%d+$") then
-			local uidAttr = tonumber(m:GetAttribute("UserId")) or tonumber(m:GetAttribute("OwnerUserId")) or tonumber(m:GetAttribute("AssignedUserId"))
-			if uidAttr and userId and tonumber(uidAttr) == tonumber(userId) then
-				return m
-			end
-			local pidAttr = tonumber(m:GetAttribute("AssignedPersistentId")) or tonumber(m:GetAttribute("PersistentId")) or tonumber(m:GetAttribute("OwnerPersistentId"))
-			if pidAttr and persistentId and tonumber(pidAttr) == tonumber(persistentId) then
-				return m
-			end
-			-- name fallback (rare)
-			if nameKey and tostring(m.Name) == tostring(nameKey) then
-				return m
-			end
+-- Strict plot resolver: never use name-based or central fallbacks
+local function findPlotForUserStrict(userId, persistentId)
+	-- Try by userId first (authoritative)
+	if userId and tonumber(userId) and tonumber(userId) > 0 then
+		local ok, plot = pcall(function()
+			return we_findPlayerPlot_by_userid(tonumber(userId))
+		end)
+		if ok and plot and plot.Parent then
+			return plot
 		end
 	end
 
+	-- Then by persistentId (authoritative)
+	if persistentId then
+		local ok, plot = pcall(function()
+			return we_findPlayerPlot_by_persistentId(persistentId)
+		end)
+		if ok and plot and plot.Parent then
+			return plot
+		end
+	end
+
+	-- Absolutely no other fallbacks allowed
 	return nil
 end
 
+local function findPlotForUserWithFallback(userId, persistentId, nameKey)
+	return findPlotForUserStrict(userId, persistentId)
+end
+
+local function awaitPlotForUser(userId, persistentId, timeoutSec)
+	local deadline = os.clock() + (timeoutSec or 8)
+	repeat
+		-- 1) by user id
+		if userId and userId > 0 then
+			local ok, plot = pcall(function()
+				return we_findPlayerPlot_by_userid(userId)
+			end)
+			if ok and plot and plot.Parent then
+				dprint(("[restore] plot resolved by userId=%s -> %s"):format(tostring(userId), plot:GetFullName()))
+				return plot
+			end
+		end
+
+		-- 2) by persistent id (string tolerant)
+		if persistentId then
+			local ok, plot = pcall(function()
+				return we_findPlayerPlot_by_persistentId(persistentId)
+			end)
+			if ok and plot and plot.Parent then
+				dprint(("[restore] plot resolved by persistentId=%s -> %s"):format(tostring(persistentId), plot:GetFullName()))
+				return plot
+			end
+		end
+
+		task.wait(0.2)
+	until os.clock() >= deadline
+
+	dprint(("[restore] plot not resolved within timeout; userId=%s persistentId=%s"):format(tostring(userId), tostring(persistentId)))
+	return nil
+end
+
+
+local function awaitPlotForUserStrict(userId, persistentId, timeoutSec)
+	local t0 = os.clock()
+	local maxWait = timeoutSec or PLOT_AWAIT_TIMEOUT
+
+	repeat
+		local plot = findPlotForUserStrict(userId, persistentId)
+		if plot then
+			if REQUIRE_PLOT_READY_PART and REQUIRE_PLOT_READY_PART ~= "" then
+				local anchor = plot:FindFirstChild(REQUIRE_PLOT_READY_PART, true)
+				if anchor then
+					return plot
+				end
+			else
+				return plot
+			end
+		end
+		task.wait(0.1)
+	until (os.clock() - t0) >= maxWait
+
+	return nil
+end
 -----------------------------------------------------------------------------------------------------------
 
 
@@ -868,6 +878,8 @@ end
 --  - in-flight create/persist lock per SlimeId
 --  - reuse existing Workspace model when SlimeId already present (avoid creating duplicates)
 --  - robust registration and eliminateDuplicate logic
+-- WorldSlime section (hardened): normalization, dedupe, in-flight locks, reuse existing models, safe attribute mapping.
+-- Paste this section into GrandInventorySerializer.lua and ensure normalize_time_to_epoch / we_findPlayerPlot helpers exist in the surrounding file.
 
 local WSCONFIG = GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.WorldSlime or {}
 local WS_ATTR_MAP = {
@@ -885,8 +897,14 @@ local WS_ATTR_MAP = {
 	PersistedGrowthProgress="pgf", SlimeType="tp", Breed="br",
 }
 local colorKeys = { bc=true, ac=true, ec=true }
-local ws_liveIndex = {}
 local MAX_LOCAL_COORD_MAG = (WSCONFIG and WSCONFIG.MaxLocalCoordMag) or 400
+
+-- Local caches and locks
+local ws_profile_cache = {}
+local ws_liveIndex = {}
+local _IN_FLIGHT = {}
+
+local function isFiniteNumber(n) return type(n)=="number" and n==n and n~=math.huge and n~=-math.huge end
 
 local function safe_typeof(v)
 	local ok, t = pcall(function() return typeof and typeof(v) end)
@@ -902,6 +920,61 @@ local function ws_colorToHex(c)
 		math.floor(c.R*255+0.5),
 		math.floor(c.G*255+0.5),
 		math.floor(c.B*255+0.5))
+end
+
+
+local function finalizeRestoreModel(model, entry, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local)
+	if not model then return end
+
+	pcall(function()
+		-- Prefer SlimeCore API if available
+		if SlimeCoreMod and type(SlimeCoreMod.FinalizeRestore) == "function" then
+			pcall(function() SlimeCoreMod.FinalizeRestore(model, entry, origin, plotInst, targetCF) end)
+			return
+		end
+
+		-- SlimeFactory style finalizer
+		if SlimeFactory and type(SlimeFactory.Finalize) == "function" then
+			pcall(function() SlimeFactory.Finalize(model, entry) end)
+			return
+		end
+
+		-- ModelUtils-style finalizer
+		if ModelUtilsLocal and type(ModelUtilsLocal.FinalizeModel) == "function" then
+			pcall(function() ModelUtilsLocal.FinalizeModel(model, entry) end)
+			return
+		end
+
+		-- Generic best-effort actions:
+		--  - attempt to pivot/position model to targetCF if provided
+		--  - set attributes that other systems expect on restored instances
+		if targetCF and typeof and typeof(targetCF) == "CFrame" then
+			pcall(function()
+				local prim = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+				if prim then
+					local okAnch, prevAnch = pcall(function() return prim.Anchored end)
+					pcall(function() prim.Anchored = true end)
+					pcall(function() model:PivotTo(targetCF) end)
+					-- restore anchored state after a short delay to allow physics to settle
+					task.delay(2.5, function()
+						pcall(function()
+							if prim and prim.Parent then
+								if okAnch and prevAnch ~= nil then prim.Anchored = prevAnch else prim.Anchored = false end
+							end
+						end)
+					end)
+				end
+			end)
+		end
+
+		-- Ensure some attributes exist for downstream systems
+		pcall(function() if type(model.SetAttribute) == "function" then
+				model:SetAttribute("ServerRestore", true)
+				model:SetAttribute("PreserveOnServer", true)
+				model:SetAttribute("RestoreStamp", tick())
+				model:SetAttribute("RecentlyPlacedSaved", os.time())
+			end end)
+	end)
 end
 
 local function ws_hexToColor3(hex)
@@ -936,8 +1009,7 @@ local function safeString(v)
 	return tostring(v)
 end
 
--- In-flight creation lock keyed by SlimeId to avoid concurrent create races
-local _IN_FLIGHT = {}
+-- in-flight lock helpers
 local function inflight_acquire(key)
 	if not key then return false end
 	if _IN_FLIGHT[key] then return false end
@@ -949,38 +1021,75 @@ local function inflight_release(key)
 	_IN_FLIGHT[key] = nil
 end
 
--- Index registration, with duplicate prevention
+
+-- profile cache mergers to avoid duplicate restores across passes
+local function dedupe_by_id(list)
+	if type(list) ~= "table" then return list end
+	local map = {}
+	for _, e in ipairs(list) do
+		if type(e) == "table" then
+			local id = e.id or e.SlimeId or e.EggId
+			if id then
+				local key = tostring(id)
+				local cur = map[key]
+				if not cur then
+					map[key] = e
+				else
+					local cur_lg = tonumber(cur.lg) or tonumber(cur.Timestamp) or 0
+					local e_lg = tonumber(e.lg) or tonumber(e.Timestamp) or 0
+					if e_lg > cur_lg then
+						map[key] = e
+					elseif e_lg == cur_lg then
+						local function count_fields(t)
+							local c = 0
+							for k,v in pairs(t) do if v ~= nil then c = c + 1 end end
+							return c
+						end
+						if count_fields(e) >= count_fields(cur) then map[key] = e end
+					end
+				end
+			else
+				local gen = tostring(math.random()) .. "_" .. tostring(#(map) + 1)
+				map[gen] = e
+			end
+		end
+	end
+	local out = {}
+	for _, v in pairs(map) do table.insert(out, v) end
+	return out
+end
+
+
+
+local function merge_incoming_into_profile_worldslimes(userId, normalizedList)
+	if not userId or type(normalizedList) ~= "table" then return end
+	local uid = tostring(userId)
+	local existing = ws_profile_cache[uid] or {}
+	for _, e in ipairs(normalizedList) do
+		if type(e) == "table" then table.insert(existing, e) end
+	end
+	existing = dedupe_by_id(existing)
+	ws_profile_cache[uid] = existing
+	pcall(function()
+		if GrandInventorySerializer and GrandInventorySerializer.Profiles and type(GrandInventorySerializer.Profiles) == "table" then
+			local prof = GrandInventorySerializer.Profiles[tonumber(userId)]
+			if prof and type(prof) == "table" then
+				prof.worldSlimes = prof.worldSlimes or {}
+				local merged = {}
+				for _, e in ipairs(existing) do if type(e) == "table" then merged[#merged+1] = e end end
+				prof.worldSlimes = merged
+			end
+		end
+	end)
+end
+
+-- index and scanning helpers
 local function ws_ensureIndex(player)
 	if not player or not player.UserId then return {} end
 	if not ws_liveIndex[player.UserId] then ws_liveIndex[player.UserId] = {} end
 	return ws_liveIndex[player.UserId]
 end
 
--- Finds an existing Slime model in Workspace by SlimeId, ignoring retired / tool-parented entries.
-local function ws_findExistingSlimeById(slimeId)
-	if not slimeId then return nil end
-	local sidKey = tostring(slimeId)
-	for _, inst in ipairs(Workspace:GetDescendants()) do
-		if inst:IsA("Model") and inst.Name == "Slime" then
-			local ok, sid = pcall(function() return inst:GetAttribute("SlimeId") end)
-			if ok and sid and tostring(sid) == sidKey then
-				-- skip retired or tool-parented ones
-				local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
-				if okRet and ret then
-					-- retired - skip
-				else
-					if not inst:FindFirstAncestorWhichIsA("Tool") then
-						return inst
-					end
-				end
-			end
-		end
-	end
-	return nil
-end
-
--- Helper to compute model ranking for dedupe:
--- Prefer models with (1) non-nil RestoreStamp (higher better), (2) LastGrowthUpdate (higher better), (3) larger part count.
 local function model_rank_for_keep(m)
 	if not m then return {stamp=0,growth=0,parts=0} end
 	local stamp = 0
@@ -992,8 +1101,26 @@ local function model_rank_for_keep(m)
 	return {stamp = stamp, growth = lg, parts = cnt}
 end
 
--- ws_registerModel: register live model and eliminate duplicates at registration time
--- Modified to prefer existing model reuse and avoid destructive races.
+local function ws_findExistingSlimeById(slimeId)
+	if not slimeId then return nil end
+	local sidKey = tostring(slimeId)
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Slime" then
+			local ok, sid = pcall(function() return inst:GetAttribute("SlimeId") end)
+			if ok and sid and tostring(sid) == sidKey then
+				local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+				if okRet and ret then
+				else
+					if not inst:FindFirstAncestorWhichIsA("Tool") then
+						return inst
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
 local function ws_registerModel(player, model)
 	if not player or not model then return end
 	local ok, id = pcall(function() return model:GetAttribute("SlimeId") end)
@@ -1001,38 +1128,27 @@ local function ws_registerModel(player, model)
 	local idx = ws_ensureIndex(player)
 	local key = tostring(id)
 
-	-- If another model with same ID already indexed, choose which to keep based on rank
 	if idx[key] and idx[key] ~= model and idx[key].Parent then
 		local a = idx[key]; local b = model
 		local ra = model_rank_for_keep(a)
 		local rb = model_rank_for_keep(b)
-		-- prefer higher (stamp, growth, parts) lexicographically
 		if (rb.stamp > ra.stamp) or (rb.stamp == ra.stamp and rb.growth > ra.growth) or (rb.stamp == ra.stamp and rb.growth == ra.growth and rb.parts > ra.parts) then
-			-- new model looks better: destroy old and index new
 			pcall(function() a:Destroy() end)
 			idx[key] = b
 		else
-			-- existing model is better: destroy new one (or reparent it out)
 			pcall(function()
-				if b and b.Parent then
-					-- attempt to merge attributes onto the keep model then destroy the duplicate
-					for attr,_ in pairs(WS_ATTR_MAP) do
-						local okv, vv = pcall(function() return b:GetAttribute(attr) end)
-						if okv and vv ~= nil then
-							pcall(function() a:SetAttribute(attr, vv) end)
-						end
-					end
-					-- propagate RestoreStamp if new one has it
-					local okrs, rsv = pcall(function() return b:GetAttribute("RestoreStamp") end)
-					if okrs and rsv then pcall(function() a:SetAttribute("RestoreStamp", rsv) end) end
+				for attr,_ in pairs(WS_ATTR_MAP) do
+					local okv, vv = pcall(function() return b:GetAttribute(attr) end)
+					if okv and vv ~= nil then pcall(function() a:SetAttribute(attr, vv) end) end
 				end
+				local okrs, rsv = pcall(function() return b:GetAttribute("RestoreStamp") end)
+				if okrs and rsv then pcall(function() a:SetAttribute("RestoreStamp", rsv) end) end
 				b:Destroy()
 			end)
 			return
 		end
 	end
 
-	-- No indexed conflict; ensure we are not indexing a retired/tool-parented model
 	local okRet, ret = pcall(function() return model:GetAttribute("Retired") end)
 	if okRet and ret then return end
 	if model:FindFirstAncestorWhichIsA("Tool") then return end
@@ -1043,18 +1159,25 @@ local function ws_registerModel(player, model)
 	end
 end
 
--- Scanning helpers (ignore temporary restore-in-progress models)
 local function ws_scan_by_userid(userId)
 	local out, seen = {}, {}
 	for _, inst in ipairs(Workspace:GetDescendants()) do
-		if inst:IsA("Model") and inst.Name == "Slime" and tostring(inst:GetAttribute("OwnerUserId")) == tostring(userId) and not inst:GetAttribute("Retired") and not inst:FindFirstAncestorWhichIsA("Tool") then
-			local inFlight = false
-			pcall(function() inFlight = inst:GetAttribute("_RestoreInProgress") or false end)
-			if inFlight then continue end
-			local id = inst:GetAttribute("SlimeId")
-			if id and not seen[tostring(id)] then
-				seen[tostring(id)] = true
-				out[#out+1] = inst
+		if inst:IsA("Model") and inst.Name == "Slime" then
+			local okOwner, owner = pcall(function() return inst:GetAttribute("OwnerUserId") end)
+			if okOwner and tostring(owner) == tostring(userId) then
+				local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+				local inTool = pcall(function() return inst:FindFirstAncestorWhichIsA("Tool") end)
+				if (not okRet or not ret) and (not inTool) then
+					local inFlight = false
+					pcall(function() inFlight = inst:GetAttribute("_RestoreInProgress") or false end)
+					if not inFlight then
+						local id = inst:GetAttribute("SlimeId")
+						if id and not seen[tostring(id)] then
+							seen[tostring(id)] = true
+							table.insert(out, inst)
+						end
+					end
+				end
 			end
 		end
 	end
@@ -1066,18 +1189,21 @@ local function ws_scan(player)
 	local out, seen = {}, {}
 	for _, inst in ipairs(Workspace:GetDescendants()) do
 		if inst:IsA("Model") and inst.Name == "Slime" then
-			local owner = nil
-			pcall(function() owner = inst:GetAttribute("OwnerUserId") end)
-			if owner and tonumber(owner) == tonumber(player.UserId) and not inst:GetAttribute("Retired") and not inst:FindFirstAncestorWhichIsA("Tool") then
-				local inFlight = false
-				pcall(function() inFlight = inst:GetAttribute("_RestoreInProgress") or false end)
-				if inFlight then continue end
-				local id = inst:GetAttribute("SlimeId")
-				if id and not seen[tostring(id)] then
-					seen[tostring(id)] = true
-					out[#out+1] = inst
-					-- register but tolerant: ws_registerModel will attempt to dedupe sensibly
-					pcall(function() ws_registerModel(player, inst) end)
+			local ok, owner = pcall(function() return inst:GetAttribute("OwnerUserId") end)
+			if ok and owner and tonumber(owner) == tonumber(player.UserId) then
+				local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+				local inTool = pcall(function() return inst:FindFirstAncestorWhichIsA("Tool") end)
+				if (not okRet or not ret) and (not inTool) then
+					local inFlight = false
+					pcall(function() inFlight = inst:GetAttribute("_RestoreInProgress") or false end)
+					if not inFlight then
+						local id = inst:GetAttribute("SlimeId")
+						if id and not seen[tostring(id)] then
+							seen[tostring(id)] = true
+							table.insert(out, inst)
+							pcall(function() ws_registerModel(player, inst) end)
+						end
+					end
 				end
 			end
 		end
@@ -1085,13 +1211,9 @@ local function ws_scan(player)
 	return out
 end
 
--- resolvePlotCandidate: ensure availability
+-- resolvePlotCandidate (best-effort)
 local function resolvePlotCandidate(plotCandidate)
-	if type(plotCandidate) == "userdata" then
-		local ok, isModel = pcall(function() return plotCandidate and plotCandidate.IsA and plotCandidate:IsA("Model") end)
-		if ok and isModel then return plotCandidate end
-		if ok and plotCandidate then return plotCandidate end
-	end
+	if type(plotCandidate) == "table" and plotCandidate.IsA and plotCandidate:IsA("Model") then return plotCandidate end
 	if type(plotCandidate) == "table" and type(plotCandidate.FindFirstChild) == "function" then return plotCandidate end
 	if type(plotCandidate) == "string" and plotCandidate ~= "" then
 		local p = Workspace:FindFirstChild(plotCandidate)
@@ -1103,7 +1225,7 @@ local function resolvePlotCandidate(plotCandidate)
 			Workspace:FindFirstChild("PlotsFolder"),
 		}
 		for _, folder in ipairs(tryFolders) do
-			if folder and type(folder.FindFirstChild) == "function" then
+			if folder then
 				local c = folder:FindFirstChild(plotCandidate)
 				if c and c:IsA("Model") then return c end
 			end
@@ -1120,7 +1242,6 @@ local function resolvePlotCandidate(plotCandidate)
 end
 
 -- Outgoing normalization
--- ws_normalizeOutgoingEntry (WorldSlime outgoing normalization)
 local function ws_normalizeOutgoingEntry(raw)
 	local entry = {}
 	if raw.px ~= nil or raw.py ~= nil or raw.pz ~= nil then
@@ -1143,10 +1264,10 @@ local function ws_normalizeOutgoingEntry(raw)
 				v = ws_colorToHex(v)
 			end
 			if short == "lu" then
-				local now_tick = tick()
-				local now_os = os.time()
-				local maybe = normalize_time_to_epoch and normalize_time_to_epoch(v, now_tick, now_os) or nil
-				if maybe then v = maybe end
+				if type(normalize_time_to_epoch) == "function" then
+					local maybe = normalize_time_to_epoch(v, tick(), os.time())
+					if maybe then v = maybe end
+				end
 			end
 			if type(v) == "number" and not isFiniteNumber(v) then v = nil end
 			entry[short] = v
@@ -1156,12 +1277,10 @@ local function ws_normalizeOutgoingEntry(raw)
 
 	if raw.id ~= nil then entry.id = safeString(raw.id) end
 	if raw.lg ~= nil then entry.lg = parseNumber(raw.lg) end
-	if raw.ow ~= nil then entry.ow = parseNumber(raw.ow) or nil end
+	if raw.ow ~= nil then entry.ow = parseNumber(raw.ow) end
 	return entry
 end
 
--- ws_serialize: gather profile + live instances into normalized list
--- ws_serialize (WorldSlimes: gather profile + live instances into normalized list)
 local function ws_serialize(player, isFinal, profile)
 	local function shallow_clone(t)
 		if type(t) ~= "table" then return t end
@@ -1183,9 +1302,8 @@ local function ws_serialize(player, isFinal, profile)
 	local function processInstanceModel(m, origin)
 		local sid = nil
 		pcall(function() sid = m:GetAttribute("SlimeId") end)
-		local sidKey = sid and tostring(sid) or nil
 		local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-		if not prim then return nil, sidKey end
+		if not prim then return nil, sid and tostring(sid) or nil end
 		local cf = prim.CFrame
 		local raw_entry = { px = cf.X, py = cf.Y, pz = cf.Z }
 		if WSCONFIG and WSCONFIG.UseLocalCoords and origin then
@@ -1202,8 +1320,8 @@ local function ws_serialize(player, isFinal, profile)
 			pcall(function() v = m:GetAttribute(attr) end)
 			if v ~= nil then
 				if colorKeys[short] and isColor3(v) then v = ws_colorToHex(v) end
-				if short == "lu" then
-					local maybe = normalize_time_to_epoch and normalize_time_to_epoch(v, now_tick_global, now_os_global) or nil
+				if short == "lu" and type(normalize_time_to_epoch) == "function" then
+					local maybe = normalize_time_to_epoch(v, now_tick_global, now_os_global)
 					if maybe then v = maybe end
 				end
 				if type(v) == "number" and not isFiniteNumber(v) then v = nil end
@@ -1223,26 +1341,25 @@ local function ws_serialize(player, isFinal, profile)
 			entry.lpz = (entry.lpz > 0) and MAX_LOCAL_COORD_MAG or -MAX_LOCAL_COORD_MAG
 		end
 
-		return entry, sidKey
+		return entry, sid and tostring(sid) or nil
 	end
 
 	local function gatherLiveInstances(ply, prof)
-		local list = {}
-		local origin = nil
 		if ply then
-			list = ws_scan(ply)
+			local insts = ws_scan(ply)
 			local plot = nil
 			for _, m in ipairs(Workspace:GetChildren()) do
-				local ok, val = pcall(function() return (tonumber(m:GetAttribute("UserId")) or tonumber(m:GetAttribute("OwnerUserId"))) end)
+				local ok, val = pcall(function() return tonumber(m:GetAttribute("UserId")) or tonumber(m:GetAttribute("OwnerUserId")) end)
 				if ok and val == ply.UserId and tostring(m.Name):match("^Player%d+$") then
 					plot = m; break
 				end
 			end
+			local origin = nil
 			if plot then
 				local zone = plot:FindFirstChild("SlimeZone")
 				if zone and zone:IsA("BasePart") then origin = zone end
 			end
-			return list, origin
+			return insts, origin
 		end
 		if prof and (prof.userId or prof.UserId) then
 			return ws_scan_by_userid(prof.userId or prof.UserId), nil
@@ -1286,36 +1403,29 @@ local function ws_serialize(player, isFinal, profile)
 end
 
 -- Incoming normalization
--- ws_normalizeIncomingEntry (WorldSlime incoming normalization)
 local function ws_normalizeIncomingEntry(raw)
 	if type(raw) ~= "table" then return nil end
 	local now_tick = tick()
 	local now_os = os.time()
 	local e = {}
-	-- owner
 	if raw.ow then e.ow = parseNumber(raw.ow)
-	elseif raw.OwnerUserId then e.ow = parseNumber(raw.OwnerUserId)
-	elseif raw.OwnerPersistentId then e.ow = parseNumber(raw.OwnerPersistentId) end
+	elseif raw.OwnerUserId then e.ow = parseNumber(raw.OwnerUserId) end
 
-	-- id variants
 	if raw.id then e.id = safeString(raw.id)
-	elseif raw.SlimeId then e.id = safeString(raw.SlimeId)
-	elseif raw.EggId then e.id = safeString(raw.EggId) end
+	elseif raw.SlimeId then e.id = safeString(raw.SlimeId) end
 
-	-- coords
 	if raw.px or raw.py or raw.pz then
 		e.px = parseNumber(raw.px); e.py = parseNumber(raw.py); e.pz = parseNumber(raw.pz)
 	elseif raw.x or raw.y or raw.z then
 		e.px = parseNumber(raw.x); e.py = parseNumber(raw.y); e.pz = parseNumber(raw.z)
 	end
-	-- local coords
+
 	if raw.lpx or raw.lpy or raw.lpz then
 		e.lpx = parseNumber(raw.lpx); e.lpy = parseNumber(raw.lpy); e.lpz = parseNumber(raw.lpz)
 	elseif raw.localX or raw.localY or raw.localZ then
 		e.lpx = parseNumber(raw.localX); e.lpy = parseNumber(raw.localY); e.lpz = parseNumber(raw.localZ)
 	end
 
-	-- Position table
 	if raw.Position and type(raw.Position) == "table" then
 		local P = raw.Position
 		e.px = e.px or parseNumber(P.x or P.X or P[1])
@@ -1326,26 +1436,16 @@ local function ws_normalizeIncomingEntry(raw)
 	if raw.ry then e.ry = parseNumber(raw.ry) end
 	if raw.lry then e.lry = parseNumber(raw.lry) end
 
-	-- Preserve explicit last-growth 'lg'
 	if raw.lg then e.lg = parseNumber(raw.lg) end
-
-	-- Accept Timestamp / ts
-	if not e.lg then
-		if raw.Timestamp then
-			e.lg = parseNumber(raw.Timestamp)
-		elseif raw.ts then
-			e.lg = parseNumber(raw.ts)
-		elseif raw.timestamp then
-			e.lg = parseNumber(raw.timestamp)
-		end
-	end
+	if raw.Timestamp and not e.lg then e.lg = parseNumber(raw.Timestamp) end
+	if raw.ts and not e.lg then e.lg = parseNumber(raw.ts) end
 
 	for attr, short in pairs(WS_ATTR_MAP) do
 		local v = raw[short]
 		if v == nil then v = raw[attr] end
 		if v ~= nil then
 			if colorKeys[short] then
-				if type(v) == "table" and (v.r or v.R) and (v.g or v.G) and (v.b or v.B) then
+				if type(v) == "table" and (v.r or v.R) then
 					local rr = tonumber(v.r or v.R) or 0
 					local gg = tonumber(v.g or v.G) or 0
 					local bb = tonumber(v.b or v.B) or 0
@@ -1358,8 +1458,8 @@ local function ws_normalizeIncomingEntry(raw)
 				end
 			end
 
-			if short == "lu" then
-				local normalized = normalize_time_to_epoch and normalize_time_to_epoch(v, now_tick, now_os) or nil
+			if short == "lu" and type(normalize_time_to_epoch) == "function" then
+				local normalized = normalize_time_to_epoch(v, now_tick, now_os)
 				if normalized then v = normalized end
 			end
 
@@ -1368,7 +1468,6 @@ local function ws_normalizeIncomingEntry(raw)
 		end
 	end
 
-	-- require id or positional/attr data
 	local hasMeaningful = false
 	if e.id then hasMeaningful = true end
 	if e.px or e.py or e.pz or e.lpx or e.lpy or e.lpz then hasMeaningful = true end
@@ -1377,7 +1476,6 @@ local function ws_normalizeIncomingEntry(raw)
 	end
 	if not hasMeaningful then return nil end
 
-	-- clamp local coords
 	if e.lpx and math.abs(e.lpx) > MAX_LOCAL_COORD_MAG then
 		e.lpx = (e.lpx > 0) and MAX_LOCAL_COORD_MAG or -MAX_LOCAL_COORD_MAG
 	end
@@ -1388,35 +1486,20 @@ local function ws_normalizeIncomingEntry(raw)
 	return e
 end
 
-
-
-
--- buildFactoryEntry (safe copy)
-local function buildFactoryEntry(e)
-	if type(e) ~= "table" then return e end
-	local fe = {}
-	for attr, short in pairs(WS_ATTR_MAP) do
-		if e[short] ~= nil then
-			fe[short] = e[short]; fe[attr] = e[short]
-		elseif e[attr] ~= nil then
-			fe[short] = e[attr]; fe[attr] = e[attr]
-		end
+local function safe_try_require(names)
+	for _, n in ipairs(names) do
+		local ok, mod = pcall(function()
+			local ms = ServerScriptService and ServerScriptService:FindFirstChild("Modules")
+			if ms and ms:FindFirstChild(n) then return require(ms:FindFirstChild(n)) end
+			if ServerScriptService and ServerScriptService:FindFirstChild(n) then return require(ServerScriptService:FindFirstChild(n)) end
+			if ReplicatedStorage and ReplicatedStorage:FindFirstChild(n) then return require(ReplicatedStorage:FindFirstChild(n)) end
+			return nil
+		end)
+		if ok and type(mod) == "table" then return mod end
 	end
-	local copyKeys = { "id","SlimeId","OwnerUserId","ow","px","py","pz","lpx","lpy","lpz","ry","lry","ts","lg","Timestamp","Position","SlimeType","Breed" }
-	for _, k in ipairs(copyKeys) do if e[k] ~= nil then fe[k] = e[k] end end
-	if type(e.Position) == "table" then
-		local pos = e.Position
-		fe.px = fe.px or (pos.x or pos.X or pos[1])
-		fe.py = fe.py or (pos.y or pos.Y or pos[2])
-		fe.pz = fe.pz or (pos.z or pos.Z or pos[3])
-	end
-	if not fe.OwnerUserId and fe.ow then fe.OwnerUserId = tonumber(fe.ow) end
-	fe.__raw = e
-	return fe
+	return nil
 end
 
--- tryCreateUsingFactoryModules: re-check existing before creating; mark in-flight before parenting
--- Uses inflight_acquire/release to avoid duplicate concurrent creations.
 local function tryCreateUsingFactoryModules(factoryModule, coreModule, factoryEntry, player, plot)
 	local candidates = {
 		"RestoreFromSnapshot","RestoreWorldSlime","Restore","RestoreSlime",
@@ -1424,13 +1507,9 @@ local function tryCreateUsingFactoryModules(factoryModule, coreModule, factoryEn
 		"BuildFromSnapshot","BuildWorldSlime","BuildSlime"
 	}
 
-	-- check pre-existing by SlimeId to avoid race
 	if factoryEntry and factoryEntry.id then
 		local already = ws_findExistingSlimeById(factoryEntry.id)
-		if already then
-			dprint("tryCreateUsingFactoryModules: found existing for id", tostring(factoryEntry.id))
-			return already
-		end
+		if already then return already end
 	end
 
 	local function tryCall(tbl)
@@ -1439,13 +1518,9 @@ local function tryCreateUsingFactoryModules(factoryModule, coreModule, factoryEn
 			if type(tbl[name]) == "function" then
 				local ok, res = pcall(function() return tbl[name](factoryEntry, player, plot) end)
 				if ok and res then
-					-- mark in-flight early to avoid duplication during concurrent restores
 					pcall(function() res:SetAttribute("_RestoreInProgress", true) end)
-					-- ensure SlimeId is set as early as possible
 					if factoryEntry and factoryEntry.id then
-						pcall(function()
-							if not res:GetAttribute("SlimeId") then res:SetAttribute("SlimeId", factoryEntry.id) end
-						end)
+						pcall(function() if not res:GetAttribute("SlimeId") then res:SetAttribute("SlimeId", factoryEntry.id) end end)
 					end
 					return res
 				end
@@ -1454,31 +1529,26 @@ local function tryCreateUsingFactoryModules(factoryModule, coreModule, factoryEn
 		return nil
 	end
 
-	-- Acquire inflight lock (if id present)
 	local key = factoryEntry and factoryEntry.id and tostring(factoryEntry.id) or nil
 	local acquired = key and inflight_acquire(key) or true
 	if not acquired then
-		-- Someone else is creating; try to find the instance now
 		if key then
 			local foundNow = ws_findExistingSlimeById(key)
 			if foundNow then return foundNow end
-			-- fallback to nil
 		end
 	end
 
-	-- try on factoryModule first, then coreModule
 	local created = nil
-	local ok, err = pcall(function()
+	pcall(function()
 		created = tryCall(factoryModule) or tryCall(coreModule)
-		-- fallback: attempt SlimeFactory nested on coreModule
 		if not created and coreModule and type(coreModule) == "table" then
 			local sf = coreModule.SlimeFactory or coreModule.Factory
 			created = tryCall(sf)
 		end
 	end)
+
 	if key then inflight_release(key) end
 
-	-- If created, best-effort ensure SlimeId already set and mark _RestoreInProgress
 	if created then
 		pcall(function()
 			if factoryEntry and factoryEntry.id and (not pcall(function() return created:GetAttribute("SlimeId") end)) then
@@ -1491,7 +1561,6 @@ local function tryCreateUsingFactoryModules(factoryModule, coreModule, factoryEn
 	return created
 end
 
--- clearPreserveFlagsAndRecompute (tolerant)
 local function clearPreserveFlagsAndRecompute(model)
 	if not model then return end
 	pcall(function()
@@ -1500,9 +1569,7 @@ local function clearPreserveFlagsAndRecompute(model)
 		model:SetAttribute("RestoreStamp", tick())
 		if type(model.GetAttribute) == "function" then
 			local okRecent, recent = pcall(function() return model:GetAttribute("RecentlyPlacedSaved") end)
-			if (not okRecent) or (recent == nil) then
-				model:SetAttribute("RecentlyPlacedSaved", os.time())
-			end
+			if (not okRecent) or (recent == nil) then model:SetAttribute("RecentlyPlacedSaved", os.time()) end
 		end
 	end)
 
@@ -1545,23 +1612,10 @@ local function clearPreserveFlagsAndRecompute(model)
 
 	local okNow = pcall(function() return tryImmediate() end)
 	if not okNow then
-		task.defer(function()
-			pcall(function() tryImmediate() end)
-		end)
+		task.defer(function() pcall(function() tryImmediate() end) end)
 	end
 end
 
--- Utility to count BaseParts
-local function partCount(model)
-	if not model then return 0 end
-	local c = 0
-	for _, d in ipairs(model:GetDescendants()) do
-		if d:IsA("BasePart") then c = c + 1 end
-	end
-	return c
-end
-
--- eliminateDuplicateFor: robustly pick best model from pair
 local function eliminateDuplicateFor(created, sidKey, parent)
 	pcall(function() if created and created.Parent == nil then created.Parent = parent or Workspace end end)
 	task.wait(0.01)
@@ -1576,20 +1630,16 @@ local function eliminateDuplicateFor(created, sidKey, parent)
 	if other and other ~= created then
 		local ra = model_rank_for_keep(other)
 		local rb = model_rank_for_keep(created)
-		-- prefer the one with higher stamp, then growth, then parts
 		local keepOther = false
 		if (ra.stamp > rb.stamp) or (ra.stamp == rb.stamp and ra.growth > rb.growth) or (ra.stamp == rb.stamp and ra.growth == rb.growth and ra.parts >= rb.parts) then
 			keepOther = true
 		end
 
 		if keepOther then
-			-- merge useful attributes from created into other then destroy created
 			pcall(function()
 				for attr,_ in pairs(WS_ATTR_MAP) do
 					local ok, v = pcall(function() return created:GetAttribute(attr) end)
-					if ok and v ~= nil then
-						pcall(function() other:SetAttribute(attr, v) end)
-					end
+					if ok and v ~= nil then pcall(function() other:SetAttribute(attr, v) end) end
 				end
 			end)
 			pcall(function() created:Destroy() end)
@@ -1602,476 +1652,50 @@ local function eliminateDuplicateFor(created, sidKey, parent)
 	return created
 end
 
--- dedupe_now: scan workspace and remove duplicate Slime models keeping best candidate
-local function dedupe_now()
-	local seen = {}
-	local removed = 0
-	for _, m in ipairs(Workspace:GetDescendants()) do
-		if m:IsA("Model") and m.Name == "Slime" then
-			local ok, sid = pcall(function() return m:GetAttribute("SlimeId") end)
-			if ok and sid then
-				local key = tostring(sid)
-				local inFlight = false
-				pcall(function() inFlight = m:GetAttribute("_RestoreInProgress") or false end)
-				-- if we encounter duplicates, keep the best-ranked one
-				if seen[key] then
-					local keep = seen[key]
-					local ra = model_rank_for_keep(keep)
-					local rb = model_rank_for_keep(m)
-					local keepCurrent = (ra.stamp > rb.stamp) or (ra.stamp == rb.stamp and ra.growth > rb.growth) or (ra.stamp == rb.stamp and ra.growth == rb.growth and ra.parts >= rb.parts)
-					if not keepCurrent then
-						pcall(function() keep:Destroy() end)
-						seen[key] = m
-					else
-						pcall(function() m:Destroy() end)
-					end
-					removed = removed + 1
-				else
-					seen[key] = m
-				end
-			end
-		end
-	end
-	dprint("dedupe_now removed", removed, "duplicates")
-	return removed
-end
-
--- tryCreateUsingFactoryModules already defined above; ws_restore uses it
-
-
--- Replacement finalizeRestoreModel
--- Paste this function in GrandInventorySerializer.lua replacing the prior finalizeRestoreModel definition.
-
-local function dprintf(...)
-	local ok, _ = pcall(function() end)
-	return ok
-end
-
-local function try_find_slime_template()
-	-- Try common locations: ReplicatedStorage.Assets.Slime, ReplicatedStorage.Slime, ServerStorage.Slime
-	local assets = ReplicatedStorage:FindFirstChild("Assets")
-	if assets then
-		local s = assets:FindFirstChild("Slime")
-		if s and s:IsA("Model") then return s end
-	end
-	local s2 = ReplicatedStorage:FindFirstChild("Slime")
-	if s2 and s2:IsA("Model") then return s2 end
-	local s3 = ReplicatedStorage:FindFirstChild("SlimeTemplate")
-	if s3 and s3:IsA("Model") then return s3 end
-	return nil
-end
-
-local function sanitize_and_clone_visual(templateModel)
-	if not templateModel or not templateModel:IsA("Model") then return nil, "bad-template" end
-	local ok, clone = pcall(function() return templateModel:Clone() end)
-	if not ok or not clone then return nil, "clone-failed" end
-
-	-- remove scripts and make parts non-colliding initially
-	for _,desc in ipairs(clone:GetDescendants()) do
-		if desc:IsA("Script") or desc:IsA("LocalScript") or desc:IsA("ModuleScript") then
-			pcall(function() desc:Destroy() end)
-		elseif desc:IsA("BasePart") then
-			pcall(function()
-				desc.Anchored = true     -- anchored while we position
-				desc.CanCollide = false
-				desc.CanTouch = false
-				desc.CanQuery = false
-				-- keep OriginalSize if present, but ensure attribute exists
-				if not pcall(function() return desc:GetAttribute("OriginalSize") end) then
-					desc:SetAttribute("OriginalSize", desc.Size)
-				end
-			end)
-		end
-	end
-
-	-- ensure PrimaryPart exists on the clone (pick first BasePart if needed)
-	if not clone.PrimaryPart then
-		for _,c in ipairs(clone:GetDescendants()) do
-			if c:IsA("BasePart") then
-				clone.PrimaryPart = c
-				break
-			end
-		end
-	end
-
-	if not clone.PrimaryPart then
-		return nil, "visual-no-primary"
-	end
-
-	return clone, nil
-end
-
-local function ensure_model_primary(model)
-	if not model or not model.Parent then return nil end
-	if model.PrimaryPart and model.PrimaryPart:IsDescendantOf(model) then return model.PrimaryPart end
-	-- try common candidate names
-	local candidates = { "Outer","Inner","Body","Core","Main","Torso","Slime","Base","Handle" }
-	for _,name in ipairs(candidates) do
-		local p = model:FindFirstChild(name)
-		if p and p:IsA("BasePart") then
-			model.PrimaryPart = p
-			return p
-		end
-	end
-	-- fallback to first BasePart found
-	for _,c in ipairs(model:GetDescendants()) do
-		if c:IsA("BasePart") then
-			model.PrimaryPart = c
-			return c
-		end
-	end
-	return nil
-end
-
-local function apply_colors_and_scale_to_visual(clone, sourceAttrs)
-	-- sourceAttrs: table with BodyColor/AccentColor/EyeColor/CurrentSizeScale etc
-	if not clone or type(sourceAttrs) ~= "table" then return end
-
-	local function decodeColor(val)
-		if not val then return nil end
-		if type(val) == "string" then
-			local hex = val:gsub("^#","")
-			if #hex == 6 then
-				local r = tonumber(hex:sub(1,2),16)
-				local g = tonumber(hex:sub(3,4),16)
-				local b = tonumber(hex:sub(5,6),16)
-				if r and g and b then return Color3.fromRGB(r,g,b) end
-			end
-		end
-		if typeof and typeof(val) == "Color3" then return val end
-		return nil
-	end
-
-	local bc = decodeColor(sourceAttrs.BodyColor)
-	local ac = decodeColor(sourceAttrs.AccentColor)
-	local ec = decodeColor(sourceAttrs.EyeColor)
-	local scale = tonumber(sourceAttrs.CurrentSizeScale or sourceAttrs.StartSizeScale) or nil
-
-	for _,p in ipairs(clone:GetDescendants()) do
-		if p:IsA("BasePart") then
-			local ln = (p.Name or ""):lower()
-			if ec and (ln:find("eye") or ln:find("pupil")) then
-				p.Color = ec
-			elseif ac and ln:find("accent") then
-				p.Color = ac
-			elseif bc then
-				-- avoid overwriting explicit accent parts
-				if not ln:find("accent") then p.Color = bc end
-			end
-
-			if scale and scale > 0 then
-				local orig = p:GetAttribute("OriginalSize") or p.Size
-				local ns = orig * scale
-				p.Size = Vector3.new(math.max(ns.X, 0.05), math.max(ns.Y, 0.05), math.max(ns.Z, 0.05))
-			end
-		end
-	end
-end
-
-
-
-local function finalizeRestoreModel(model, entry, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local)
-	if not model then return end
-
-	-- existing integration hook (call internal finalize if present)
-	pcall(function()
-		if GrandInventorySerializer and GrandInventorySerializer._internal and GrandInventorySerializer._internal.WorldSlime and type(GrandInventorySerializer._internal.WorldSlime.finalizeRestoreModel) == "function" then
-			GrandInventorySerializer._internal.WorldSlime.finalizeRestoreModel(model, entry, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local)
-			return
-		end
-	end)
-
-	-- global finalize hook fallback
-	local okGlobal, didGlobal = pcall(function()
-		if type(_G) == "table" and type(_G.finalizeRestoreModel) == "function" then
-			_G.finalizeRestoreModel(model, entry, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local)
-			return true
-		end
-		return false
-	end)
-	if okGlobal and didGlobal then return end
-
-	-- try a handful of common named API calls on SlimeFactory/SlimeCoreMod
-	local function try_names(mod)
-		if not mod or type(mod) ~= "table" then return false end
-		local names = {"FinalizeRestore","Finalize","RestoreFinalize","RestoreFromSnapshot","Restore","FinalizeModel","InitSlime","ApplyVisuals"}
-		for _,n in ipairs(names) do
-			if type(mod[n]) == "function" then
-				pcall(function() mod[n](model, entry, plotInst) end)
-				return true
-			end
-		end
-		return false
-	end
-	if try_names(SlimeFactory) then return end
-	if try_names(SlimeCoreMod) then return end
-
-	-- Template visual attachment disabled here: proceed to minimal fallback. Visuals should be applied by the project's factory/core modules when available.
-
-	-- Minimal fallback: safe placement/pivot/anchor/scale handling
-
-	local parent = plotInst or Workspace
-	pcall(function() model.Parent = parent end)
-
-	-- Ensure PrimaryPart: prefer explicit, otherwise pick largest BasePart
-	local prim = nil
-	pcall(function() prim = model.PrimaryPart end)
-	if not prim then
-		pcall(function() prim = model:FindFirstChildWhichIsA("BasePart") end)
-	end
-	if not prim then
-		local best, bestVol = nil, 0
-		for _,part in ipairs(model:GetDescendants()) do
-			if part and type(part.IsA) == "function" and part:IsA("BasePart") then
-				local vol = (part.Size.X * part.Size.Y * part.Size.Z) or 0
-				if vol > bestVol then best = part; bestVol = vol end
-			end
-		end
-		if best then
-			prim = best
-			pcall(function() model.PrimaryPart = prim end)
-		end
-	end
-
-	-- Mark as in-flight
-	pcall(function() model:SetAttribute("_RestoreInProgress", true) end)
-	pcall(function() model:SetAttribute("ServerRestore", true) end)
-
-	-- Helper to zero velocities
-	local function zeroVelocity(part)
-		if not part or type(part.IsA) ~= "function" or not part:IsA("BasePart") then return end
-		pcall(function() part.Velocity = Vector3.new(0,0,0) end)
-		pcall(function() part.RotVelocity = Vector3.new(0,0,0) end)
-		pcall(function() part.AssemblyLinearVelocity = Vector3.new(0,0,0) end)
-		pcall(function() part.AssemblyAngularVelocity = Vector3.new(0,0,0) end)
-	end
-
-	-- Anchor and zero velocity on all BaseParts, record prior anchored/collide states
-	local prevAnchored, prevCanCollide = {}, {}
-	for _,bp in ipairs(model:GetDescendants()) do
-		if bp and type(bp.IsA) == "function" and bp:IsA("BasePart") then
-			local okA, a = pcall(function() return bp.Anchored end)
-			if okA then prevAnchored[bp] = a end
-			local okC, c = pcall(function() return bp.CanCollide end)
-			if okC then prevCanCollide[bp] = c end
-
-			pcall(function() bp.Anchored = true end)
-			local lname = (bp.Name or ""):lower()
-			local enableCollision = false
-			if lname:find("body") or lname:find("base") or lname:find("root") or bp == prim then enableCollision = true end
-			if not enableCollision and (bp.Size and (bp.Size.Magnitude >= 0.5)) then enableCollision = true end
-			if enableCollision then pcall(function() bp.CanCollide = true end) end
-
-			zeroVelocity(bp)
-		end
-	end
-
-	-- PivotTo targetCF if provided and primary present
-	if targetCF and prim then
-		pcall(function() model:PivotTo(targetCF) end)
-		pcall(function() model.Parent = parent end)
-	elseif prim then
-		pcall(function() model.Parent = parent end)
-	else
-		pcall(function() model.Parent = parent end)
-	end
-
-	-- Try ModelUtils.UniformScale if available (best-effort)
-	pcall(function()
-		if ModelUtilsLocal and type(ModelUtilsLocal.UniformScale) == "function" then
-			local maybeScale = nil
-			if type(entry) == "table" then maybeScale = tonumber(entry.CurrentSizeScale or entry.sz or entry.StartSizeScale) end
-			if not maybeScale then
-				local ok, v = pcall(function() return model:GetAttribute("CurrentSizeScale") end)
-				if ok and v then maybeScale = tonumber(v) end
-			end
-			local skipScale = false
-			pcall(function()
-				local builtByFactory = model:GetAttribute("_FactoryRestoreBuilt") or model:GetAttribute("FactoryVisualReady")
-				if builtByFactory then skipScale = true end
-			end)
-			if maybeScale and not skipScale then
-				pcall(function() ModelUtilsLocal.UniformScale(model, maybeScale) end)
-			end
-		end
-	end)
-
-	-- Release anchors after short delay and run recompute/init calls
-	task.delay(1.0, function()
-		for bp, _ in pairs(prevAnchored) do
-			if bp and bp.Parent then
-				pcall(function()
-					local prev = prevAnchored[bp]
-					if prev == true then bp.Anchored = true else bp.Anchored = false end
-					if prevCanCollide[bp] ~= nil then bp.CanCollide = prevCanCollide[bp] end
-				end)
-			end
-		end
-
-		pcall(function()
-			model:SetAttribute("_RestoreInProgress", nil)
-			model:SetAttribute("RestoreStamp", tick())
-			model:SetAttribute("ServerRestore", true)
-			pcall(function() model:SetAttribute("RecentlyPlacedSaved", os.time()) end)
-		end)
-
-		pcall(function()
-			if SlimeCoreMod and type(SlimeCoreMod.Recompute) == "function" then
-				SlimeCoreMod.Recompute(model)
-			end
-		end)
-	end)
-end
-
--- ws_restore (WorldSlimes restore; dedupe + reuse existing models + in-flight locks)
 local function ws_restore(player, list)
-	if not list or type(list) ~= "table" or #list == 0 then
-		if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
-			dprint("ws_restore: nothing to restore for player", tostring(player and player.UserId or "<nil>"))
-		end
-		return
-	end
+	if not list or type(list) ~= "table" or #list == 0 then return end
 	if player then
 		waitForInventoryReady(player)
 	end
+
 	local normalized = {}
 	for _, raw in ipairs(list) do
 		local ok, n = pcall(function() return ws_normalizeIncomingEntry(raw) end)
-		if ok and type(n) == "table" then
-			table.insert(normalized, n)
-		else
-			if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
-				dprint("ws_restore: dropped malformed entry for player", tostring(player and player.UserId or "<nil>"))
-			end
-		end
+		if ok and type(n) == "table" then table.insert(normalized, n) end
 	end
 	if #normalized == 0 then return end
 
-	-- If we have a player or a userId, merge incoming entries into the cached profile worldSlimes first
-	-- This prevents duplicate entries accumulating in profile.inventory.worldSlimes across multiple restore passes.
-	if player and player.UserId then
-		pcall(function() merge_incoming_into_profile_worldslimes(player.UserId, normalized) end)
-	end
-
-	if player then
-		pcall(function() ws_scan(player) end)
-	end
+	if player and player.UserId then pcall(function() merge_incoming_into_profile_worldslimes(player.UserId, normalized) end) end
+	if player then pcall(function() ws_scan(player) end) end
 
 	local plotRaw = nil
 	if player then
-		local ok, p = pcall(function() return we_findPlayerPlot_by_userid(player.UserId) end)
-		if ok and p then
-			plotRaw = p
-		else
-			local ok2, p2 = pcall(function() return _we_findPlayerPlot and _we_findPlayerPlot(player) end)
+		local ok, p = pcall(function() return we_findPlayerPlot_by_userid and we_findPlayerPlot_by_userid(player.UserId) end)
+		if ok and p then plotRaw = p else
+			local ok2, p2 = pcall(function() return (rawget(_G, "we_findPlayerPlot") and rawget(_G, "we_findPlayerPlot")(player)) end)
 			if ok2 and p2 then plotRaw = p2 end
 		end
 	else
-		local ownerUid = nil
-		for _, e in ipairs(normalized) do
-			if not ownerUid and e and e.ow then ownerUid = tonumber(e.ow) or ownerUid end
-			if ownerUid then break end
-		end
-		if ownerUid then
-			local ok1, pr = pcall(function() return we_findPlayerPlot_by_userid and we_findPlayerPlot_by_userid(ownerUid) end)
-			if ok1 and pr then plotRaw = pr end
-			if not plotRaw then
-				local ok2, pr2 = pcall(function() return we_findPlayerPlot_by_persistentId and we_findPlayerPlot_by_persistentId(ownerUid) end)
-				if ok2 and pr2 then plotRaw = pr2 end
-			end
-		end
+		for _, e in ipairs(normalized) do if not plotRaw and e and e.ow then plotRaw = we_findPlayerPlot_by_userid and we_findPlayerPlot_by_userid(e.ow) end end
 	end
 
 	local plotInst = resolvePlotCandidate(plotRaw)
 	local origin = nil
 	if plotInst then
-		local ok, o = pcall(function() return _we_getPlotOrigin and _we_getPlotOrigin(plotInst) end)
+		local ok, o = pcall(function() return (rawget(_G, "we_getPlotOrigin") and rawget(_G, "we_getPlotOrigin")(plotInst)) end)
 		if ok and o then origin = o end
-	end
-
-	local zonePart = origin
-	if not zonePart and plotInst then
-		local direct = nil
-		pcall(function()
-			direct = plotInst:FindFirstChild("SlimeZone")
-		end)
-		if direct and typeof(direct) == "Instance" and direct:IsA("BasePart") then
-			zonePart = direct
-		else
-			pcall(function()
-				for _, desc in ipairs(plotInst:GetDescendants()) do
-					if desc:IsA("BasePart") and tostring(desc.Name) == "SlimeZone" then
-						zonePart = desc
-						break
-					end
-				end
-			end)
-		end
 	end
 
 	local parent = plotInst or Workspace
 	local restored = 0
 	local restoredModels = {}
 	local restoredIds = {}
-	local persistentId = player and getPersistentIdFor and getPersistentIdFor(player) or nil
+	local persistentId = player and (function() local ok, p = pcall(function() return getPersistentIdFor and getPersistentIdFor(player) end) if ok then return p end return nil end)() or nil
 
-	-- Require modules
-	local SlimeFactory, ModelUtilsLocal, SlimeAI_local, SlimeCoreMod
-	do
-		local function tryRequire(name)
-			local ok, mod = pcall(function()
-				local ms = ServerScriptService:FindFirstChild("Modules")
-				if ms then
-					local inst = ms:FindFirstChild(name)
-					if inst and inst:IsA("ModuleScript") then return require(inst) end
-				end
-				local direct = ServerScriptService:FindFirstChild(name)
-				if direct and direct:IsA("ModuleScript") then return require(direct) end
-				local rs = ReplicatedStorage and ReplicatedStorage:FindFirstChild(name)
-				if rs and rs:IsA("ModuleScript") then return require(rs) end
-				return nil
-			end)
-			if ok and type(mod) == "table" then return mod end
-			return nil
-		end
-
-		local function trySlimeCore()
-			local ok, sc = pcall(function()
-				local candidates = {
-					function() if script and script.Parent then return script.Parent:FindFirstChild("SlimeCore") end end,
-					function() local m = ServerScriptService:FindFirstChild("Modules"); if m then return m:FindFirstChild("SlimeCore") end end,
-					function() return ServerScriptService:FindFirstChild("SlimeCore") end,
-					function() return ReplicatedStorage and ReplicatedStorage:FindFirstChild("SlimeCore") end,
-				}
-				for _, finder in ipairs(candidates) do
-					local inst = finder()
-					if inst and inst:IsA("ModuleScript") then
-						return require(inst)
-					end
-				end
-				return nil
-			end)
-			if ok and type(sc) == "table" then return sc end
-			return nil
-		end
-
-		SlimeFactory = tryRequire("SlimeFactory")
-		ModelUtilsLocal = tryRequire("ModelUtils")
-		SlimeAI_local = tryRequire("SlimeAI")
-		SlimeCoreMod = trySlimeCore()
-
-		if SlimeCoreMod then
-			if not SlimeFactory then
-				SlimeFactory = SlimeCoreMod.SlimeFactory or SlimeCoreMod.Factory or SlimeCoreMod.Restore or SlimeCoreMod
-			end
-			if not ModelUtilsLocal then
-				ModelUtilsLocal = SlimeCoreMod.ModelUtils or SlimeCoreMod.Model
-			end
-			if not SlimeAI_local then
-				SlimeAI_local = SlimeCoreMod.SlimeAI or SlimeCoreMod.AI
-			end
-		end
-	end
+	local SlimeFactory = safe_try_require({ "SlimeFactory" }) or (SlimeCore and SlimeCore.SlimeFactory) or nil
+	local ModelUtilsLocal = safe_try_require({ "ModelUtils" }) or (SlimeCore and SlimeCore.ModelUtils) or nil
+	local SlimeAI_local = safe_try_require({ "SlimeAI" }) or (SlimeCore and SlimeCore.SlimeAI) or nil
+	local SlimeCoreMod = safe_try_require({ "SlimeCore" }) or SlimeCore
 
 	local function clamp_local(v, maxmag)
 		if v == nil then return nil end
@@ -2086,11 +1710,8 @@ local function ws_restore(player, list)
 		if type(e) ~= "table" then return e end
 		local fe = {}
 		for attr, short in pairs(WS_ATTR_MAP) do
-			if e[short] ~= nil then
-				fe[short] = e[short]; fe[attr] = e[short]
-			elseif e[attr] ~= nil then
-				fe[short] = e[attr]; fe[attr] = e[attr]
-			end
+			if e[short] ~= nil then fe[short] = e[short]; fe[attr] = e[short]
+			elseif e[attr] ~= nil then fe[short] = e[attr]; fe[attr] = e[attr] end
 		end
 		local copyKeys = { "id","SlimeId","OwnerUserId","ow","px","py","pz","lpx","lpy","lpz","ry","lry","ts","lg","Timestamp","Position","SlimeType","Breed" }
 		for _, k in ipairs(copyKeys) do if e[k] ~= nil then fe[k] = e[k] end end
@@ -2111,39 +1732,19 @@ local function ws_restore(player, list)
 		pcall(function() prim = model.PrimaryPart end)
 		if not prim or not prim:IsDescendantOf(model) then
 			pcall(function() prim = model:FindFirstChildWhichIsA("BasePart") end)
-			if prim then
-				pcall(function() model.PrimaryPart = prim end)
-			end
+			if prim then pcall(function() model.PrimaryPart = prim end) end
 		end
 		if not prim then return false end
-
 		local prevAnchored = nil
 		pcall(function() prevAnchored = prim.Anchored end)
 		pcall(function()
-			prim.Anchored = true
-			prim.AssemblyLinearVelocity = Vector3.new(0,0,0)
-			prim.AssemblyAngularVelocity = Vector3.new(0,0,0)
+			pcall(function() prim.Anchored = true end)
+			pcall(function() prim.AssemblyLinearVelocity = Vector3.new(0,0,0) end)
+			pcall(function() prim.AssemblyAngularVelocity = Vector3.new(0,0,0) end)
 		end)
-
 		local ok = false
-		ok = pcall(function()
-			model:PivotTo(desiredCF)
-		end)
-
-		if prevAnchored ~= nil then
-			pcall(function() prim.Anchored = prevAnchored end)
-		end
-
-		if GrandInventorySerializer.CONFIG.Debug then
-			pcall(function()
-				if ok then
-					dprint(string.format("ws_restore: enforcePivot[%s] -> %s", tostring(label or model:GetAttribute("SlimeId") or "?"), posStr(desiredCF.Position)))
-				else
-					dprint(string.format("ws_restore: enforcePivot[%s] failed (target=%s)", tostring(label or model:GetAttribute("SlimeId") or "?"), posStr(desiredCF.Position)))
-				end
-			end)
-		end
-
+		ok = pcall(function() model:PivotTo(desiredCF) end)
+		if prevAnchored ~= nil then pcall(function() prim.Anchored = prevAnchored end) end
 		return ok
 	end
 
@@ -2154,18 +1755,14 @@ local function ws_restore(player, list)
 		local sid = e.id
 		local sidKey = sid and tostring(sid) or nil
 
-		-- Skip duplicates in-restoration set
 		if sidKey and restoredIds[sidKey] then
-			if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
-				dprint("ws_restore: skipping duplicate slime id in batch", tostring(sid))
-			end
+			-- skip duplicates in batch
 		else
 			local existing = nil
 			if sidKey then existing = ws_findExistingSlimeById(sidKey) end
 			local skip_existing_remaining = false
 
 			if existing then
-				-- Update attributes on existing model
 				pcall(function()
 					local ownerUidVal = (player and player.UserId) or e.ow or existing:GetAttribute("OwnerUserId")
 					existing:SetAttribute("OwnerUserId", ownerUidVal)
@@ -2239,13 +1836,6 @@ local function ws_restore(player, list)
 						end
 						if targetCF then spawnPositionOverride = targetCF.Position end
 
-						if GrandInventorySerializer.CONFIG.Debug then
-							local parentName = parent and parent.GetFullName and parent:GetFullName() or tostring(parent)
-							local originName = origin and origin:GetFullName() or "<nil>"
-							local targetPosStr = targetCF and string.format("%.2f, %.2f, %.2f", targetCF.Position.X, targetCF.Position.Y, targetCF.Position.Z) or "<nil>"
-							dprint(string.format("ws_restore: existing slime id=%s targetCF=%s parent=%s origin=%s local=(%s,%s,%s) abs=(%s,%s,%s)", tostring(sidKey or e.id or "<nil>"), targetPosStr, parentName, originName, tostring(lpx), tostring(lpy), tostring(lpz), tostring(px), tostring(py), tostring(pz)))
-						end
-
 						local okCF, pos = pcall(function() return targetCF and targetCF.Position end)
 						if okCF and pos and isFiniteNumber(pos.X) and isFiniteNumber(pos.Y) and isFiniteNumber(pos.Z) then
 							local okAnch, prevA = pcall(function() return prim2 and prim2.Anchored end)
@@ -2278,27 +1868,14 @@ local function ws_restore(player, list)
 					end)
 					pcall(function()
 						if existing then
-							if spawnPositionOverride then
-								existing:SetAttribute("SpawnPosition", spawnPositionOverride)
-							else
-								local okPivot, pivotNow = pcall(function() return existing:GetPivot() end)
-								if okPivot and pivotNow then
-									spawnPositionOverride = pivotNow.Position
-									existing:SetAttribute("SpawnPosition", spawnPositionOverride)
-								end
-							end
+							if spawnPositionOverride then existing:SetAttribute("SpawnPosition", spawnPositionOverride) end
 						end
 					end)
 					local pivotTarget = targetCF
-					if not pivotTarget and spawnPositionOverride then
-						pivotTarget = CFrame.new(spawnPositionOverride)
-					end
+					if not pivotTarget and spawnPositionOverride then pivotTarget = CFrame.new(spawnPositionOverride) end
 					if pivotTarget then
 						local immediatePivot = enforcePivot(existing, pivotTarget, "existing-immediate")
-						if immediatePivot then
-							task.defer(function()
-								enforcePivot(existing, pivotTarget, "existing-deferred")
-							end)
+						if immediatePivot then task.defer(function() enforcePivot(existing, pivotTarget, "existing-deferred") end)
 						else
 							local fallbackVec = spawnPositionOverride
 							if not fallbackVec and prim2 then
@@ -2309,71 +1886,38 @@ local function ws_restore(player, list)
 								local okPivotNow, pivotNow = pcall(function() return existing:GetPivot() end)
 								if okPivotNow and pivotNow then fallbackVec = pivotNow.Position end
 							end
-							if fallbackVec then
-								enforcePivot(existing, CFrame.new(fallbackVec), "existing-fallback")
-							end
+							if fallbackVec then enforcePivot(existing, CFrame.new(fallbackVec), "existing-fallback") end
 						end
-					end
-					if GrandInventorySerializer.CONFIG.Debug then
-						pcall(function()
-							local preStartPivot = existing and existing:GetPivot()
-							local spawnAttrPre = existing and existing:GetAttribute("SpawnPosition")
-							if preStartPivot then
-								dprint(string.format("ws_restore: existing slime id=%s preStart pivot=%s spawn=%s", tostring(sidKey or e.id or "<nil>"), posStr(preStartPivot.Position), posStr(spawnAttrPre)))
-								if pivotTarget then
-									local deltaMag = (preStartPivot.Position - pivotTarget.Position).Magnitude
-									if deltaMag > 0.05 then
-										dprint(string.format("ws_restore: existing slime id=%s pivot delta=%.3f studs", tostring(sidKey or e.id or "<nil>"), deltaMag))
-									end
-								end
-							end
-						end)
 					end
 					pcall(function()
 						if ModelUtilsLocal and type(ModelUtilsLocal.AutoWeld) == "function" and existing then
 							pcall(function() ModelUtilsLocal.AutoWeld(existing, existing.PrimaryPart or existing:FindFirstChildWhichIsA("BasePart")) end)
 						end
 						if SlimeAI_local and type(SlimeAI_local.Start) == "function" and existing then
-							pcall(function() SlimeAI_local.Start(existing, zonePart, spawnPositionOverride or (prim2 and prim2.Position)) end)
+							pcall(function() SlimeAI_local.Start(existing, origin, spawnPositionOverride or (prim2 and prim2.Position)) end)
 						end
 					end)
-					if GrandInventorySerializer.CONFIG.Debug then
-						pcall(function()
-							local actualCF = existing and existing:GetPivot()
-							local parentNameNow = existing and existing.Parent and existing.Parent.GetFullName and existing.Parent:GetFullName() or tostring(existing and existing.Parent)
-							local spawnAttr = existing and existing:GetAttribute("SpawnPosition")
-							if actualCF then
-								dprint(string.format("ws_restore: existing slime id=%s finalized at %s parent=%s spawn=%s", tostring(sidKey or e.id or "<nil>"), posStr(actualCF.Position), parentNameNow, posStr(spawnAttr)))
-							end
-						end)
-					end
 					restored = restored + 1
 					if sidKey then restoredIds[sidKey] = true end
 					if existing then table.insert(restoredModels, existing) end
 				end
 			else
-				-- No existing: create (but re-check immediately prior to creating)
 				local precheck = nil
 				if sidKey then precheck = ws_findExistingSlimeById(sidKey) end
 				if precheck then
-					-- some other concurrent step created it; treat as existing next iteration
 					existing = precheck
 					pcall(function() ws_registerModel(player, existing) end)
 					if sidKey then restoredIds[sidKey] = true end
 				else
-					-- Prevent concurrent creators for this SlimeId
 					local lockKey = sidKey
 					local gotLock = (not lockKey) or inflight_acquire(lockKey)
 					if not gotLock then
-						-- Another thread creating; try find again and skip if found
-						local foundNow = nil
-						if lockKey then foundNow = ws_findExistingSlimeById(lockKey) end
+						local foundNow = lockKey and ws_findExistingSlimeById(lockKey) or nil
 						if foundNow then
 							pcall(function() ws_registerModel(player, foundNow) end)
 							if lockKey then restoredIds[lockKey] = true end
 							if foundNow then table.insert(restoredModels, foundNow); restored = restored + 1 end
 						else
-							-- cannot acquire lock but no model found; fall back to waiting briefly then try again
 							task.wait(0.05)
 							local foundLater = lockKey and ws_findExistingSlimeById(lockKey) or nil
 							if foundLater then
@@ -2383,19 +1927,13 @@ local function ws_restore(player, list)
 							end
 						end
 					else
-						-- We own lock; attempt factory create or fallback placeholder
 						local created = nil
 						local successCreate = false
 						if SlimeFactory or SlimeCoreMod then
 							local factoryEntry = buildFactoryEntry(e)
-							-- check again before creation to minimize race
 							if factoryEntry and factoryEntry.id then
 								local found = ws_findExistingSlimeById(factoryEntry.id)
-								if found then
-									created = found
-								else
-									created = tryCreateUsingFactoryModules(SlimeFactory, SlimeCoreMod, factoryEntry, player or { UserId = (e.ow or (player and player.UserId) or nil) }, plotInst)
-								end
+								if found then created = found else created = tryCreateUsingFactoryModules(SlimeFactory, SlimeCoreMod, factoryEntry, player or { UserId = (e.ow or (player and player.UserId) or nil) }, plotInst) end
 							else
 								created = tryCreateUsingFactoryModules(SlimeFactory, SlimeCoreMod, buildFactoryEntry(e), player or { UserId = (e.ow or (player and player.UserId) or nil) }, plotInst)
 							end
@@ -2403,7 +1941,6 @@ local function ws_restore(player, list)
 
 						if created then
 							successCreate = true
-							-- mark attributes early and set in-flight flag (tryCreate already sets it)
 							pcall(function()
 								if e.id and not created:GetAttribute("SlimeId") then created:SetAttribute("SlimeId", e.id) end
 								created:SetAttribute("OwnerUserId", (player and player.UserId) or e.ow or created:GetAttribute("OwnerUserId"))
@@ -2443,20 +1980,13 @@ local function ws_restore(player, list)
 							else
 								targetCF = CFrame.new(px or 0, py or 0, pz or 0)
 							end
-							if GrandInventorySerializer.CONFIG.Debug then
-								local parentName = parent and parent.GetFullName and parent:GetFullName() or tostring(parent)
-								local originName = origin and origin:GetFullName() or "<nil>"
-								local targetPosStr = targetCF and string.format("%.2f, %.2f, %.2f", targetCF.Position.X, targetCF.Position.Y, targetCF.Position.Z) or "<nil>"
-								dprint(string.format("ws_restore: new slime id=%s targetCF=%s parent=%s origin=%s local=(%s,%s,%s) abs=(%s,%s,%s)", tostring(sidKey or e.id or "<nil>"), targetPosStr, parentName, originName, tostring(lpx), tostring(lpy), tostring(lpz), tostring(px), tostring(py), tostring(pz)))
-							end
 							pcall(function() finalizeRestoreModel(created, e, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local) end)
 							pcall(function() clearPreserveFlagsAndRecompute(created) end)
 							local spawnOverrideVector = nil
 							pcall(function()
 								if created then
 									local desiredPosition = nil
-									if targetCF then
-										desiredPosition = targetCF.Position
+									if targetCF then desiredPosition = targetCF.Position
 									else
 										local okPivot, pivot = pcall(function() return created:GetPivot() end)
 										if okPivot and pivot then desiredPosition = pivot.Position end
@@ -2468,15 +1998,10 @@ local function ws_restore(player, list)
 								end
 							end)
 							local pivotTarget = targetCF
-							if not pivotTarget and spawnOverrideVector then
-								pivotTarget = CFrame.new(spawnOverrideVector)
-							end
+							if not pivotTarget and spawnOverrideVector then pivotTarget = CFrame.new(spawnOverrideVector) end
 							if pivotTarget then
 								local immediatePivot = enforcePivot(created, pivotTarget, "new-immediate")
-								if immediatePivot then
-									task.defer(function()
-										enforcePivot(created, pivotTarget, "new-deferred")
-									end)
+								if immediatePivot then task.defer(function() enforcePivot(created, pivotTarget, "new-deferred") end)
 								else
 									local fallbackVec = spawnOverrideVector
 									if not fallbackVec then
@@ -2486,58 +2011,27 @@ local function ws_restore(player, list)
 											if okPos then fallbackVec = primPos end
 										end
 									end
-									if not fallbackVec and targetCF then
-										fallbackVec = targetCF.Position
-									end
-									if fallbackVec then
-										enforcePivot(created, CFrame.new(fallbackVec), "new-fallback")
-									end
+									if not fallbackVec and targetCF then fallbackVec = targetCF.Position end
+									if fallbackVec then enforcePivot(created, CFrame.new(fallbackVec), "new-fallback") end
 								end
-							end
-							if GrandInventorySerializer.CONFIG.Debug then
-								pcall(function()
-									local preStartCF = created and created:GetPivot()
-									local spawnAttrPre = created and created:GetAttribute("SpawnPosition")
-									if preStartCF then
-										dprint(string.format("ws_restore: new slime id=%s preStart pivot=%s spawn=%s", tostring(sidKey or e.id or "<nil>"), posStr(preStartCF.Position), posStr(spawnAttrPre)))
-										if pivotTarget then
-											local deltaMag = (preStartCF.Position - pivotTarget.Position).Magnitude
-											if deltaMag > 0.05 then
-												dprint(string.format("ws_restore: new slime id=%s pivot delta=%.3f studs", tostring(sidKey or e.id or "<nil>"), deltaMag))
-											end
-										end
-									end
-								end)
 							end
 							pcall(function()
 								if SlimeAI_local and type(SlimeAI_local.Start) == "function" then
-									SlimeAI_local.Start(created, zonePart, spawnOverrideVector)
+									SlimeAI_local.Start(created, origin, spawnOverrideVector)
 								end
 							end)
 							pcall(function() mark_restored_instance(created, (player and player.UserId) or e.ow or nil, nil) end)
-							if GrandInventorySerializer.CONFIG.Debug then
-								pcall(function()
-									local actualCF = created and created:GetPivot()
-									local parentNameNow = created and created.Parent and created.Parent.GetFullName and created.Parent:GetFullName() or tostring(created and created.Parent)
-									local spawnAttr = created and created:GetAttribute("SpawnPosition")
-									if actualCF then
-										dprint(string.format("ws_restore: new slime id=%s finalized at %s parent=%s spawn=%s", tostring(sidKey or e.id or "<nil>"), posStr(actualCF.Position), parentNameNow, posStr(spawnAttr)))
-									end
-								end)
-							end
 
 							restored = restored + 1
 							if sidKey then restoredIds[sidKey] = true end
 							table.insert(restoredModels, created)
 						else
-							-- fallback simple placeholder model
+							-- fallback placeholder
 							local m = Instance.new("Model")
 							m.Name = "Slime"
 							local prim = Instance.new("Part")
 							prim.Name = "Body"
 							prim.Size = Vector3.new(2,2,2)
-							prim.TopSurface = Enum.SurfaceType.Smooth
-							prim.BottomSurface = Enum.SurfaceType.Smooth
 							prim.Parent = m
 							m.PrimaryPart = prim
 							if e.id then pcall(function() m:SetAttribute("SlimeId", e.id) end) end
@@ -2554,13 +2048,8 @@ local function ws_restore(player, list)
 									pcall(function() m:SetAttribute(attr, v) end)
 								end
 							end
-
-							if merged.lg then
-								pcall(function() m:SetAttribute("LastGrowthUpdate", tonumber(merged.lg)) end)
-							end
-
+							if merged.lg then pcall(function() m:SetAttribute("LastGrowthUpdate", tonumber(merged.lg)) end) end
 							if merged.lu then pcall(function() m:SetAttribute("LastHungerUpdate", tonumber(merged.lu) or parseNumber(merged.lu)) end) end
-
 							if merged.lpx then pcall(function() m:SetAttribute("RestoreLpx", merged.lpx) end) end
 							if merged.lpy then pcall(function() m:SetAttribute("RestoreLpy", merged.lpy) end) end
 							if merged.lpz then pcall(function() m:SetAttribute("RestoreLpz", merged.lpz) end) end
@@ -2570,42 +2059,34 @@ local function ws_restore(player, list)
 							pcall(function() m:SetAttribute("PreserveOnServer", true) end)
 							pcall(function() m:SetAttribute("RestoreStamp", tick()) end)
 
-							-- Mark placeholder as restored before parenting so cleanup/guard logic can detect it
-							pcall(function()
-								mark_restored_instance(m, (player and player.UserId) or e.ow or nil, nil)
-							end)
-
+							pcall(function() mark_restored_instance(m, (player and player.UserId) or e.ow or nil, nil) end)
 							pcall(function() m.Parent = parent end)
 							pcall(function() prim.Anchored = true end)
-							local lpx = merged.lpx; local lpy = merged.lpy; local lpz = merged.lpz
-							local px = merged.px; local py = merged.py; local pz = merged.pz
+							local merged_e = merged
 							local targetCF = nil
-							local hasLocal = is_local_coords_present(lpx, lpy, lpz)
+							local hasLocal = is_local_coords_present(merged_e.lpx, merged_e.lpy, merged_e.lpz)
 							if origin and hasLocal then
-								local sx, sy, sz = lpx or 0, lpy or 0, lpz or 0
+								local sx, sy, sz = merged_e.lpx or 0, merged_e.lpy or 0, merged_e.lpz or 0
 								sx = clamp_local(sx, MAX_LOCAL_COORD_MAG); sz = clamp_local(sz, MAX_LOCAL_COORD_MAG)
 								targetCF = origin.CFrame * CFrame.new(sx, sy or 0, sz)
 							elseif plotInst and hasLocal then
 								local okp, plotPivot = pcall(function() return plotInst:GetPivot() end)
 								if okp and plotPivot then
-									local sx, sy, sz = lpx or 0, lpy or 0, lpz or 0
+									local sx, sy, sz = merged_e.lpx or 0, merged_e.lpy or 0, merged_e.lpz or 0
 									sx = clamp_local(sx, MAX_LOCAL_COORD_MAG); sz = clamp_local(sz, MAX_LOCAL_COORD_MAG)
 									targetCF = plotPivot * CFrame.new(sx, sy or 0, sz)
 								end
 							else
-								targetCF = CFrame.new(px or 0, py or 0, pz or 0)
+								targetCF = CFrame.new(merged_e.px or 0, merged_e.py or 0, merged_e.pz or 0)
 							end
-							pcall(function() finalizeRestoreModel(m, merged, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local) end)
+							pcall(function() finalizeRestoreModel(m, merged_e, origin, plotInst, targetCF, SlimeCoreMod, ModelUtilsLocal, SlimeFactory, SlimeAI_local) end)
 							pcall(function() clearPreserveFlagsAndRecompute(m) end)
 
 							restored = restored + 1
 							if sidKey then restoredIds[sidKey] = true end
 							table.insert(restoredModels, m)
 						end
-						-- release inflight lock if we acquired it earlier
 						if lockKey then inflight_release(lockKey) end
-
-
 					end
 				end
 			end
@@ -2613,52 +2094,34 @@ local function ws_restore(player, list)
 	end
 end
 
--- ws_restore_by_userid (userId-path)
 local function ws_restore_by_userid(userId, list)
-	if not userId or not list or type(list) ~= "table" or #list == 0 then
-		if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
-			dprint("ws_restore_by_userid: nothing to restore for userId", tostring(userId or "<nil>"))
-		end
-		return
-	end
-
+	if not userId or not list or type(list) ~= "table" or #list == 0 then return end
 	local uid = tonumber(userId) or nil
 	local player = nil
-	if uid then
-		pcall(function() player = Players:GetPlayerByUserId(uid) end)
-	end
-	if player then
-		waitForInventoryReady(player)
-	end
-	-- First, normalize and dedupe the incoming batch.
+	if uid then pcall(function() player = Players:GetPlayerByUserId(uid) end) end
+	if player then waitForInventoryReady(player) end
+
 	local normalized = {}
 	for _, raw in ipairs(list) do
 		local ok, n = pcall(function() return ws_normalizeIncomingEntry(raw) end)
-		if ok and type(n) == "table" then
-			normalized[#normalized+1] = n
-		end
+		if ok and type(n) == "table" then normalized[#normalized+1] = n end
 	end
 	if #normalized == 0 then return end
 	normalized = dedupe_by_id(normalized)
 
-	-- Merge into cached profile to prevent multiple restore passes from appending duplicate entries
 	pcall(function() merge_incoming_into_profile_worldslimes(uid, normalized) end)
 
-	-- If player is online, call ws_restore with the normalized list (creation will be dedup-aware)
 	if player then
 		pcall(function() ws_restore(player, normalized) end)
 		return
 	end
 
-	-- Otherwise augment entries with owner info and run restore (which will register models and avoid duplicates)
 	local augmented = {}
 	for _, entry in ipairs(normalized) do
 		if type(entry) == "table" then
 			local ecopy = {}
 			for k,v in pairs(entry) do ecopy[k] = v end
-			if ecopy.ow == nil and ecopy.OwnerUserId == nil and uid then
-				ecopy.ow = uid
-			end
+			if ecopy.ow == nil and ecopy.OwnerUserId == nil and uid then ecopy.ow = uid end
 			table.insert(augmented, ecopy)
 		else
 			table.insert(augmented, entry)
@@ -2668,20 +2131,20 @@ local function ws_restore_by_userid(userId, list)
 	pcall(function() ws_restore(nil, augmented) end)
 end
 
--- Expose utilities into GrandInventorySerializer._internal.WorldSlime
-if GrandInventorySerializer then
-	GrandInventorySerializer._internal = GrandInventorySerializer._internal or {}
-	GrandInventorySerializer._internal.WorldSlime = GrandInventorySerializer._internal.WorldSlime or {}
-	GrandInventorySerializer._internal.WorldSlime.dedupe_by_id = dedupe_by_id
-	GrandInventorySerializer._internal.WorldSlime.merge_incoming_into_profile_worldslimes = merge_incoming_into_profile_worldslimes
-	GrandInventorySerializer._internal.WorldSlime.ws_restore = ws_restore
-	GrandInventorySerializer._internal.WorldSlime.ws_restore_by_userid = ws_restore_by_userid
-	GrandInventorySerializer._internal.WorldSlime.ws_serialize = ws_serialize
-	GrandInventorySerializer._internal.WorldSlime.ws_findExistingSlimeById = ws_findExistingSlimeById
-	GrandInventorySerializer._internal.WorldSlime.ws_scan = ws_scan
-end
 
-dprint("WorldSlimeService_fixed.lua loaded (dedupe + in-flight locks enabled).")
+
+-- Expose utilities
+GrandInventorySerializer._internal = GrandInventorySerializer._internal or {}
+GrandInventorySerializer._internal.WorldSlime = GrandInventorySerializer._internal.WorldSlime or {}
+GrandInventorySerializer._internal.WorldSlime.dedupe_by_id = dedupe_by_id
+GrandInventorySerializer._internal.WorldSlime.merge_incoming_into_profile_worldslimes = merge_incoming_into_profile_worldslimes
+GrandInventorySerializer._internal.WorldSlime.ws_restore = ws_restore
+GrandInventorySerializer._internal.WorldSlime.ws_restore_by_userid = ws_restore_by_userid
+GrandInventorySerializer._internal.WorldSlime.ws_serialize = ws_serialize
+GrandInventorySerializer._internal.WorldSlime.ws_findExistingSlimeById = ws_findExistingSlimeById
+GrandInventorySerializer._internal.WorldSlime.ws_scan = ws_scan
+
+dprint("WorldSlime section loaded (dedupe + in-flight locks + reuse existing enabled).")
 
 -- End of WorldSlime section
 -- WorldEgg
@@ -2803,16 +2266,109 @@ local function we_inflight_release(eggId)
 	_WE_RESTORE_IN_FLIGHT[eggId] = nil
 end
 
-local function we_findExistingEggById(eggId)
-	if not eggId then return nil end
-	for _,inst in ipairs(Workspace:GetDescendants()) do
+local function _tryExtractEggIdFromModel(inst)
+	-- Try multiple attribute / child-value locations to find an id (string)
+	if not inst then return nil end
+	local function tryAttr(k)
+		local ok, v = pcall(function() return inst:GetAttribute(k) end)
+		if ok and v ~= nil and tostring(v) ~= "" then return tostring(v) end
+		return nil
+	end
+	-- Common attribute names
+	local candidates = { "EggId", "eggId", "id", "Id", "EggID" }
+	for _, k in ipairs(candidates) do
+		local v = tryAttr(k)
+		if v then return v end
+	end
+
+	-- Child StringValue named Data / EggId / eggId / id
+	local function tryChildNames()
+		local names = { "Data", "EggId", "eggId", "id", "Id" }
+		for _, childName in ipairs(names) do
+			local c = inst:FindFirstChild(childName)
+			if c and c:IsA("StringValue") and c.Value and c.Value ~= "" then
+				-- If it's JSON, prefer JSON id
+				local ok, dec = pcall(function() return HttpService:JSONDecode(c.Value) end)
+				if ok and type(dec) == "table" then
+					local id = dec.eggId or dec.EggId or dec.id or dec.Id
+					if id and tostring(id) ~= "" then return tostring(id) end
+				end
+				-- Not JSON: if it looks like an id/guid, return raw
+				if tostring(c.Value):match("[A-Fa-f0-9%-]+") then
+					return tostring(c.Value)
+				end
+			end
+		end
+		return nil
+	end
+
+	local cid = tryChildNames()
+	if cid then return cid end
+
+	-- last-resort: Name that looks like id
+	if tostring(inst.Name):match("[A-Fa-f0-9%-]+") then
+		return tostring(inst.Name)
+	end
+
+	return nil
+end
+
+local function findNearbyEggAtPosition(pos, ownerUserId, radius)
+	if not pos then return nil end
+	radius = tonumber(radius) or 1.0
+	local radiusSqr = radius * radius
+	for _, inst in ipairs(Workspace:GetDescendants()) do
 		if inst:IsA("Model") and inst.Name == "Egg" then
-			local eid = inst:GetAttribute("EggId")
-			if eid and tostring(eid) == tostring(eggId) then
-				return inst
+			local ok, owner = pcall(function() return inst:GetAttribute("OwnerUserId") end)
+			if ok and ownerUserId and owner and tostring(owner) ~= tostring(ownerUserId) then
+				-- owner mismatch -> skip
+			else
+				local prim = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+				if prim and prim:IsDescendantOf(Workspace) then
+					local okP, ppos = pcall(function() return prim.Position end)
+					if okP and ppos then
+						local d = (ppos - pos)
+						if (d.X*d.X + d.Y*d.Y + d.Z*d.Z) <= radiusSqr then
+							-- double-check it's not destroyed/retired
+							local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+							local inTool = pcall(function() return inst:FindFirstAncestorWhichIsA("Tool") end)
+							if not inTool and (not okRet or not ret) then
+								return inst
+							end
+						end
+					end
+				end
 			end
 		end
 	end
+	return nil
+end
+
+
+local function we_findExistingEggById(eggId)
+	if not eggId then return nil end
+	local target = tostring(eggId)
+	-- 1) scan workspace for matching attribute keys or Data child
+	for _,inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Egg" then
+			local ok, found = pcall(function() return _tryExtractEggIdFromModel(inst) end)
+			if ok and found and tostring(found) == target then
+				-- ensure it's not an egg that's been destroyed/retired
+				local okRet, ret = pcall(function() return inst:GetAttribute("Retired") end)
+				if okRet and ret then
+					-- retired -> skip
+				else
+					-- exclude eggs that are inside a Tool (still packed)
+					local inTool = pcall(function() return inst:FindFirstAncestorWhichIsA("Tool") end)
+					if not inTool then
+						return inst
+					end
+				end
+			end
+		end
+	end
+
+	-- 2) If none found by id, return nil. Proximity fallback is done by we_restore before create (to avoid accidental reuse globally).
 	return nil
 end
 
@@ -2826,6 +2382,9 @@ local function we_enumeratePlotEggs(player)
 	local now_os = os.time()
 	local list = {}
 	local seen = {}
+	-- PATCH 1: we_enumeratePlotEggs - persist local/world yaw and use lpz
+	-- Replace the existing acceptEgg() body inside we_enumeratePlotEggs with this one.
+
 	local function acceptEgg(desc)
 		if not desc or not desc:IsA("Model") then return end
 		local placed     = desc:GetAttribute("Placed")
@@ -2862,6 +2421,8 @@ local function we_enumeratePlotEggs(player)
 		local eggId = desc:GetAttribute("EggId") or ("Egg_"..math.random(1,1e9))
 		if seen[eggId] then return end
 		seen[eggId] = true
+
+		-- Times
 		local rawHatchAt = desc:GetAttribute("HatchAt")
 		local ha_epoch = nil
 		if rawHatchAt ~= nil then
@@ -2890,13 +2451,18 @@ local function we_enumeratePlotEggs(player)
 				hatchAtRawForPayload = now_os + remaining
 			end
 		end
+
+		-- World and local transforms
 		local cf = prim:GetPivot()
+		local worldYaw = math.atan2(-cf.LookVector.X, -cf.LookVector.Z)
+
 		local e = {
 			id = eggId,
 			ht = hatchTime,
 			ha = hatchAtRawForPayload,
 			tr = remaining,
 			px = cf.X, py = cf.Y, pz = cf.Z,
+			ry = worldYaw,
 			cr = (function()
 				local placedRaw = desc:GetAttribute("PlacedAt")
 				if placedRaw then
@@ -2906,14 +2472,18 @@ local function we_enumeratePlotEggs(player)
 				return now_os - (hatchTime or 0)
 			end)(),
 		}
+
 		if origin then
 			local onCF = origin.CFrame:ToObjectSpace(cf)
-			e.lpx, e.lpy, e.lz = onCF.X, onCF.Y, onCF.Z
+			e.lpx, e.lpy, e.lpz = onCF.X, onCF.Y, onCF.Z
+			e.lry = math.atan2(-onCF.LookVector.X, -onCF.LookVector.Z)
 		end
+
 		for attr,short in pairs(WE_ATTR_MAP) do
 			local v = desc:GetAttribute(attr)
 			if v ~= nil then e[short] = v end
 		end
+
 		list[#list+1] = e
 	end
 	if plot then
@@ -2938,6 +2508,9 @@ local function we_enumeratePlotEggs_by_userid(userId)
 	local profileForPid = safe_get_profile(tonumber(userId) or userId)
 	local persistentId = nil
 	if profileForPid then persistentId = getPersistentIdFor(profileForPid) end
+	-- PATCH 2: we_enumeratePlotEggs_by_userid - persist lpx/lpy/lpz and yaw (same as above pattern)
+	-- Replace acceptEgg() inside we_enumeratePlotEggs_by_userid with this one.
+
 	local function acceptEgg(desc)
 		if not desc or not desc:IsA("Model") then return end
 		local placed     = desc:GetAttribute("Placed")
@@ -2951,6 +2524,7 @@ local function we_enumeratePlotEggs_by_userid(userId)
 			ownerMatch = true
 		end
 		if not ownerMatch then return end
+
 		if isPreview and not placed and not manualHatch then return end
 		if not placed and not manualHatch then
 			local placedAtRaw = tonumber(desc:GetAttribute("PlacedAt"))
@@ -2963,11 +2537,13 @@ local function we_enumeratePlotEggs_by_userid(userId)
 				if placedAge > grace then return end
 			end
 		end
+
 		local prim = desc.PrimaryPart or desc:FindFirstChildWhichIsA("BasePart")
 		if not prim then return end
 		local eggId = desc:GetAttribute("EggId") or ("Egg_"..math.random(1,1e9))
 		if seen[eggId] then return end
 		seen[eggId] = true
+
 		local rawHatchAt = desc:GetAttribute("HatchAt")
 		local ha_epoch = nil
 		if rawHatchAt ~= nil then
@@ -2996,13 +2572,17 @@ local function we_enumeratePlotEggs_by_userid(userId)
 				hatchAtRawForPayload = now_os + remaining
 			end
 		end
+
 		local cf = prim:GetPivot()
+		local worldYaw = math.atan2(-cf.LookVector.X, -cf.LookVector.Z)
+
 		local e = {
 			id = eggId,
 			ht = hatchTime,
 			ha = hatchAtRawForPayload,
 			tr = remaining,
 			px = cf.X, py = cf.Y, pz = cf.Z,
+			ry = worldYaw,
 			cr = (function()
 				local placedRaw = desc:GetAttribute("PlacedAt")
 				if placedRaw then
@@ -3014,7 +2594,8 @@ local function we_enumeratePlotEggs_by_userid(userId)
 		}
 		if origin then
 			local onCF = origin.CFrame:ToObjectSpace(cf)
-			e.lpx, e.lpy, e.lz = onCF.X, onCF.Y, onCF.Z
+			e.lpx, e.lpy, e.lpz = onCF.X, onCF.Y, onCF.Z
+			e.lry = math.atan2(-onCF.LookVector.X, -onCF.LookVector.Z)
 		end
 		for attr,short in pairs(WE_ATTR_MAP) do
 			local v = desc:GetAttribute(attr)
@@ -3207,6 +2788,115 @@ local function sanitizeInventoryOnProfile(profile)
 	end
 end
 
+
+
+
+-- Replacement: ensureWorldEggInventoryEntry (defensive, avoids bare InventoryService global)
+-- Replacement: ensureWorldEggInventoryEntry (fixed IsA checks to avoid parser error)
+local function ensureWorldEggInventoryEntry(targetPlayerOrUserId, eggId, payload)
+	if not eggId then return false end
+
+	local function tryInvMod(mod)
+		if not mod or type(mod) ~= "table" then return false end
+
+		-- Preferred function names (in order): Accept a variety of historical APIs
+		local attempts = {
+			function() if type(mod.EnsureEntryHasId) == "function" then pcall(function() mod.EnsureEntryHasId(targetPlayerOrUserId, "worldEggs", eggId, payload) end) return true end end,
+			function() if type(mod.EnsureInventoryEntry) == "function" then pcall(function() mod.EnsureInventoryEntry(targetPlayerOrUserId, "worldEggs", eggId, payload) end) return true end end,
+			function() if type(mod.EnsureInventoryItem) == "function" then pcall(function() mod.EnsureInventoryItem(targetPlayerOrUserId, "worldEggs", eggId, payload) end) return true end end,
+			function() if type(mod.AddInventoryItem) == "function" then pcall(function() mod.AddInventoryItem(targetPlayerOrUserId, "worldEggs", payload) end) return true end end,
+			-- last-resort: UpdateProfileInventory (signatures vary; best-effort)
+			function()
+				if type(mod.UpdateProfileInventory) == "function" then
+					pcall(function()
+						-- Try profile object first if available
+						local prof = nil
+						local ok, p = pcall(function() return safe_get_profile(targetPlayerOrUserId) end)
+						if ok and type(p) == "table" then
+							prof = p
+						end
+						if prof then
+							-- attempt to merge/ensure; some implementations expect (profile, key, list)
+							pcall(function() mod.UpdateProfileInventory(prof, "worldEggs", payload) end)
+						else
+							-- fallback: pass (userId, key, entry) and hope for the best
+							pcall(function() mod.UpdateProfileInventory(targetPlayerOrUserId, "worldEggs", payload) end)
+						end
+					end)
+					return true
+				end
+				return false
+			end,
+		}
+
+		for _, fn in ipairs(attempts) do
+			local ok, res = pcall(fn)
+			if ok and res then return true end
+		end
+
+		return false
+	end
+
+	local success = false
+
+	-- 1) try a global InventoryService exposed via _G
+	pcall(function()
+		local invGlobal = rawget(_G, "InventoryService")
+		if invGlobal and tryInvMod(invGlobal) then success = true end
+	end)
+
+	-- 2) try safe_try_require helper if present (uses ServerScriptService/ReplicatedStorage search)
+	if not success and type(safe_try_require) == "function" then
+		pcall(function()
+			local mod = safe_try_require({ "InventoryService", "InvSvc", "Inventory" })
+			if mod and tryInvMod(mod) then success = true end
+		end)
+	end
+
+	-- 3) best-effort: scan common module locations directly
+	if not success then
+		pcall(function()
+			local candidates = {}
+			local ms = ServerScriptService and ServerScriptService:FindFirstChild("Modules")
+			if ms then table.insert(candidates, ms) end
+			table.insert(candidates, ServerScriptService)
+			table.insert(candidates, ReplicatedStorage)
+			for _, container in ipairs(candidates) do
+				if container and type(container.GetChildren) == "function" then
+					for _, child in ipairs(container:GetChildren()) do
+						if child and type(child.Name) == "string" and (child.Name == "InventoryService" or child.Name == "InvSvc" or child.Name == "Inventory") then
+							-- Use explicit typeof check before calling :IsA to avoid parser/runtime issues
+							if type(child.IsA) == "function" and child:IsA("ModuleScript") then
+								local ok, mod = pcall(function() return require(child) end)
+								if ok and type(mod) == "table" and tryInvMod(mod) then success = true; break end
+							end
+						end
+					end
+					if success then break end
+				end
+			end
+		end)
+	end
+
+	-- 4) If we successfully called an InventoryService variant and a live Player instance was passed,
+	--    try to nudge UpdateProfileInventory so changes are visible quickly (best-effort).
+	if success and type(targetPlayerOrUserId) == "table" and type(targetPlayerOrUserId.FindFirstChildOfClass) == "function" then
+		pcall(function()
+			local invSvc = nil
+			-- prefer InventoryService from _G (avoid bare global reference)
+			invSvc = rawget(_G, "InventoryService")
+			if not invSvc and type(safe_try_require) == "function" then
+				invSvc = safe_try_require({ "InventoryService", "InvSvc", "Inventory" })
+			end
+			if invSvc and type(invSvc.UpdateProfileInventory) == "function" then
+				pcall(function() invSvc.UpdateProfileInventory(targetPlayerOrUserId, { overrideEmptyGuard = true }) end)
+			end
+		end)
+	end
+
+	return success
+end
+
 -- We'll call sanitizeInventoryOnProfile before SaveNow in PreExitSync and after merges in Restore
 
 -- Replace the existing we_restore(...) and we_restore_by_userid(...) functions in GrandInventorySerializer.lua
@@ -3258,6 +2948,10 @@ end
 
 -- Patched we_restore (world eggs) with safer deferred reparent/reposition logic.
 -- we_restore (world eggs) - patched deferred reposition + robust create/update
+-- Patched we_restore (world eggs) with yaw persistence and yaw-applied pivoting.
+-- Adds:
+--  - RestoreLry attribute from incoming entry (e.lry or e.ry)
+--  - Deferred pivot applies yaw so eggs restore upright and with correct orientation
 local function we_restore(player, list)
 	if not list or type(list) ~= "table" or #list == 0 then
 		if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
@@ -3287,7 +2981,6 @@ local function we_restore(player, list)
 				local foundNow = eggId and we_findExistingEggById(eggId) or nil
 				if foundNow then
 					dprint(("we_restore: found existing Egg for id=%s during inflight lock; updating"):format(tostring(eggId)))
-
 				end
 			end
 
@@ -3327,6 +3020,10 @@ local function we_restore(player, list)
 				if e.px then existing:SetAttribute("RestorePX", e.px) end
 				if e.py then existing:SetAttribute("RestorePY", e.py) end
 				if e.pz then existing:SetAttribute("RestorePZ", e.pz) end
+				-- PATCH 3: persist yaw for deferred reposition
+				if e.lry or e.ry then
+					pcall(function() existing:SetAttribute("RestoreLry", tonumber(e.lry or e.ry)) end)
+				end
 
 				restored = restored + 1
 				if eggId then restoredIds[eggId] = true end
@@ -3369,10 +3066,17 @@ local function we_restore(player, list)
 				end
 				m:SetAttribute("HatchAt", computedHatchAt)
 				if GrandInventorySerializer.CONFIG.Debug then pcall(function() m:SetAttribute("HatchRestoreReason", tostring(hatchReason)) end) end
-				if e.lpx or e.lpy or e.lz then
+				if e.lpx or e.lpy or e.lz or e.lpz then
 					if e.lpx then m:SetAttribute("RestoreLpx", e.lpx) end
 					if e.lpy then m:SetAttribute("RestoreLpy", e.lpy) end
 					if e.lz or e.lpz then m:SetAttribute("RestoreLpz", (e.lz or e.lpz)) end
+				end
+				if e.px then m:SetAttribute("RestorePX", e.px) end
+				if e.py then m:SetAttribute("RestorePY", e.py) end
+				if e.pz then m:SetAttribute("RestorePZ", e.pz) end
+				-- PATCH 3: persist yaw for deferred reposition
+				if e.lry or e.ry then
+					pcall(function() m:SetAttribute("RestoreLry", tonumber(e.lry or e.ry)) end)
 				end
 				local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
 				if not prim then
@@ -3398,7 +3102,7 @@ local function we_restore(player, list)
 		end
 	end
 
-	-- === Deferred reparent/reposition closure (do not omit) ===
+	-- === Deferred reparent/reposition closure with yaw applied ===
 	task.spawn(function()
 		local _player = player
 		local _restored = restoredModels
@@ -3426,8 +3130,8 @@ local function we_restore(player, list)
 					if uidAttr and uid and tonumber(uidAttr) == tonumber(uid) then
 						return m
 					end
-					local pidAttr = tonumber(m:GetAttribute("AssignedPersistentId")) or tonumber(m:GetAttribute("PersistentId")) or tonumber(m:GetAttribute("OwnerPersistentId"))
-					if pidAttr and pid and tonumber(pidAttr) == tonumber(pid) then
+					local pidAttr = tostring(m:GetAttribute("AssignedPersistentId") or m:GetAttribute("PersistentId") or m:GetAttribute("OwnerPersistentId") or "")
+					if pidAttr ~= "" and pid and tostring(pidAttr) == tostring(pid) then
 						return m
 					end
 					if nameKey and tostring(m.Name) == tostring(nameKey) then
@@ -3454,39 +3158,45 @@ local function we_restore(player, list)
 						local lpx = mm:GetAttribute("RestoreLpx")
 						local lpy = mm:GetAttribute("RestoreLpy")
 						local lpz = mm:GetAttribute("RestoreLpz")
-						if originNow and lpx and lpy and lpz then
-							local ok, newCF = pcall(function()
+						local lry = mm:GetAttribute("RestoreLry") or 0
+						local wpx = mm:GetAttribute("RestorePX")
+						local wpy = mm:GetAttribute("RestorePY")
+						local wpz = mm:GetAttribute("RestorePZ")
+
+						local newCF = nil
+
+						if originNow and lpx ~= nil and lpy ~= nil and lpz ~= nil then
+							local ok, baseCF = pcall(function()
 								return originNow.CFrame * CFrame.new(tonumber(lpx) or 0, tonumber(lpy) or 0, tonumber(lpz) or 0)
 							end)
-							if ok and newCF then
-								local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
-								local okAnch, prevA = pcall(function() return prim and prim.Anchored end)
-								pcall(function() if prim then prim.Anchored = true end end)
-								pcall(function() mm:PivotTo(newCF) end)
-								pcall(function() mm.Parent = foundPlot end)
-								task.delay(3.5, function()
-									pcall(function()
-										if prim and prim.Parent then
-											if okAnch then prim.Anchored = prevA else prim.Anchored = false end
-										end
-										pcall(function()
-											mm:SetAttribute("RestoreStamp", nil)
-											mm:SetAttribute("PreserveOnServer", nil)
-										end)
-									end)
-								end)
-							else
-								pcall(function() mm.Parent = foundPlot end)
-								task.delay(3.5, function()
+							if ok and baseCF then
+								newCF = CFrame.new(baseCF.Position) * CFrame.Angles(0, tonumber(lry) or 0, 0)
+							end
+						end
+
+						if (not newCF) and wpx and wpy and wpz then
+							newCF = CFrame.new(tonumber(wpx) or 0, tonumber(wpy) or 0, tonumber(wpz) or 0) * CFrame.Angles(0, tonumber(lry) or 0, 0)
+						end
+
+						if newCF then
+							local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
+							local okAnch, prevA = pcall(function() return prim and prim.Anchored end)
+							pcall(function() if prim then prim.Anchored = true end end)
+							pcall(function() mm:PivotTo(newCF) end)
+							pcall(function() mm.Parent = foundPlot end)
+							task.delay(3.5, function()
+								pcall(function()
+									if prim and prim.Parent then
+										if okAnch then prim.Anchored = prevA else prim.Anchored = false end
+									end
 									pcall(function()
 										mm:SetAttribute("RestoreStamp", nil)
 										mm:SetAttribute("PreserveOnServer", nil)
-										local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
-										if prim and prim.Parent then prim.Anchored = false end
 									end)
 								end)
-							end
+							end)
 						else
+							-- No CF computed; parent only and clear flags later
 							pcall(function() mm.Parent = foundPlot end)
 							task.delay(3.5, function()
 								pcall(function()
@@ -3524,9 +3234,14 @@ local function we_restore(player, list)
 	end)
 end
 
+
 -- Patched we_restore_by_userid (userId-path) with safer deferred reparent/reposition logic.
 -- we_restore_by_userid (userId-path for world eggs)
 -- we_restore_by_userid (userId-path for world eggs)
+-- Patched we_restore_by_userid (userId-path) with yaw persistence and yaw-applied pivoting.
+-- Adds:
+--  - RestoreLry attribute from incoming entry (e.lry or e.ry)
+--  - Deferred pivot applies yaw so eggs restore upright and with correct orientation
 local function we_restore_by_userid(userId, list)
 	if not userId or not list or type(list) ~= "table" or #list == 0 then
 		if GrandInventorySerializer and GrandInventorySerializer.CONFIG and GrandInventorySerializer.CONFIG.Debug then
@@ -3546,9 +3261,10 @@ local function we_restore_by_userid(userId, list)
 		waitForInventoryReady(player)
 	end
 
-	local plot = we_findPlayerPlot_by_userid(userId) or we_findPlayerPlot_by_persistentId(userId)
-	local origin = we_getPlotOrigin(plot)
-	local parent = plot or Workspace
+	-- top-level/base attempts remain as before
+	local basePlot = we_findPlayerPlot_by_userid(userId) or we_findPlayerPlot_by_persistentId(userId)
+	local baseOrigin = we_getPlotOrigin(basePlot)
+
 	local restored = 0
 	local restoredModels = {}
 	local restoredIds = {}
@@ -3562,12 +3278,27 @@ local function we_restore_by_userid(userId, list)
 		if eggId and restoredIds[eggId] then
 			dprint(("Skipping duplicate egg restore id=%s (by userId)"):format(tostring(eggId)))
 		else
+			-- Per-entry plot/origin/parent fallback logic (prefer owner-resolved plot but fallback to nearby plot via world px/py/pz)
+			local plotInst = basePlot
+			local origin = baseOrigin
+			if (not plotInst) and (e.px or e.py or e.pz) then
+				local okPos, pos = pcall(function() return Vector3.new(tonumber(e.px or 0), tonumber(e.py or 0), tonumber(e.pz or 0)) end)
+				if okPos and pos then
+					local okFind, candidate = pcall(function() return findPlotForPosition(pos, 40) end)
+					if okFind and candidate then
+						plotInst = candidate
+						origin = we_getPlotOrigin(plotInst)
+					end
+				end
+			end
+
+			local parent = plotInst or Workspace
+
 			local gotLock = eggId and we_inflight_acquire(eggId) or true
 			if not gotLock then
 				local foundNow = eggId and we_findExistingEggById(eggId) or nil
 				if foundNow then
 					dprint(("we_restore_by_userid: found existing Egg for id=%s during inflight lock; updating"):format(tostring(eggId)))
-
 				end
 			end
 
@@ -3608,6 +3339,10 @@ local function we_restore_by_userid(userId, list)
 				if e.px then existing:SetAttribute("RestorePX", e.px) end
 				if e.py then existing:SetAttribute("RestorePY", e.py) end
 				if e.pz then existing:SetAttribute("RestorePZ", e.pz) end
+				-- PATCH 3: persist yaw for deferred reposition
+				if e.lry or e.ry then
+					pcall(function() existing:SetAttribute("RestoreLry", tonumber(e.lry or e.ry)) end)
+				end
 
 				restored = restored + 1
 				if eggId then restoredIds[eggId] = true end
@@ -3651,10 +3386,17 @@ local function we_restore_by_userid(userId, list)
 				end
 				m:SetAttribute("HatchAt", computedHatchAt)
 				if GrandInventorySerializer.CONFIG.Debug then pcall(function() m:SetAttribute("HatchRestoreReason", tostring(hatchReason)) end) end
-				if e.lpx or e.lpy or e.lz then
+				if e.lpx or e.lpy or e.lz or e.lpz then
 					if e.lpx then m:SetAttribute("RestoreLpx", e.lpx) end
 					if e.lpy then m:SetAttribute("RestoreLpy", e.lpy) end
 					if e.lz or e.lpz then m:SetAttribute("RestoreLpz", (e.lz or e.lpz)) end
+				end
+				if e.px then m:SetAttribute("RestorePX", e.px) end
+				if e.py then m:SetAttribute("RestorePY", e.py) end
+				if e.pz then m:SetAttribute("RestorePZ", e.pz) end
+				-- PATCH 3: persist yaw for deferred reposition
+				if e.lry or e.ry then
+					pcall(function() m:SetAttribute("RestoreLry", tonumber(e.lry or e.ry)) end)
 				end
 				local prim = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
 				if not prim then
@@ -3680,7 +3422,7 @@ local function we_restore_by_userid(userId, list)
 		end
 	end
 
-	-- === Deferred reposition/reparent closure (do not omit) ===
+	-- === Deferred reposition/reparent closure with yaw applied ===
 	task.spawn(function()
 		local _uid = userId
 		local _restored = restoredModels
@@ -3723,39 +3465,45 @@ local function we_restore_by_userid(userId, list)
 						local lpx = mm:GetAttribute("RestoreLpx")
 						local lpy = mm:GetAttribute("RestoreLpy")
 						local lpz = mm:GetAttribute("RestoreLpz")
-						if originNow and lpx and lpy and lpz then
-							local ok, newCF = pcall(function()
+						local lry = mm:GetAttribute("RestoreLry") or 0
+						local wpx = mm:GetAttribute("RestorePX")
+						local wpy = mm:GetAttribute("RestorePY")
+						local wpz = mm:GetAttribute("RestorePZ")
+
+						local newCF = nil
+
+						if originNow and lpx ~= nil and lpy ~= nil and lpz ~= nil then
+							local ok, baseCF = pcall(function()
 								return originNow.CFrame * CFrame.new(tonumber(lpx) or 0, tonumber(lpy) or 0, tonumber(lpz) or 0)
 							end)
-							if ok and newCF then
-								local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
-								local okAnch, prevA = pcall(function() return prim and prim.Anchored end)
-								pcall(function() if prim then prim.Anchored = true end end)
-								pcall(function() mm:PivotTo(newCF) end)
-								pcall(function() mm.Parent = plotNow end)
-								task.delay(3.5, function()
-									pcall(function()
-										if prim and prim.Parent then
-											if okAnch then prim.Anchored = prevA else prim.Anchored = false end
-										end
-										pcall(function()
-											mm:SetAttribute("RestoreStamp", nil)
-											mm:SetAttribute("PreserveOnServer", nil)
-										end)
-									end)
-								end)
-							else
-								pcall(function() mm.Parent = plotNow end)
-								task.delay(3.5, function()
+							if ok and baseCF then
+								newCF = CFrame.new(baseCF.Position) * CFrame.Angles(0, tonumber(lry) or 0, 0)
+							end
+						end
+
+						if (not newCF) and wpx and wpy and wpz then
+							newCF = CFrame.new(tonumber(wpx) or 0, tonumber(wpy) or 0, tonumber(wpz) or 0) * CFrame.Angles(0, tonumber(lry) or 0, 0)
+						end
+
+						if newCF then
+							local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
+							local okAnch, prevA = pcall(function() return prim and prim.Anchored end)
+							pcall(function() if prim then prim.Anchored = true end end)
+							pcall(function() mm:PivotTo(newCF) end)
+							pcall(function() mm.Parent = plotNow end)
+							task.delay(3.5, function()
+								pcall(function()
+									if prim and prim.Parent then
+										if okAnch then prim.Anchored = prevA else prim.Anchored = false end
+									end
 									pcall(function()
 										mm:SetAttribute("RestoreStamp", nil)
 										mm:SetAttribute("PreserveOnServer", nil)
-										local prim = mm.PrimaryPart or mm:FindFirstChildWhichIsA("BasePart")
-										if prim and prim.Parent then prim.Anchored = false end
 									end)
 								end)
-							end
+							end)
 						else
+							-- No CF computed; parent only and clear flags later
 							pcall(function() mm.Parent = plotNow end)
 							task.delay(3.5, function()
 								pcall(function()
@@ -6904,6 +6652,10 @@ function GrandInventorySerializer.Restore(...)
 					-- Ensure filtered entries are normalized and carry restore flags
 					for i = 1, #filtered do pcall(function() filtered[i] = normalizeWorldEggEntry(filtered[i]) end) end
 
+					-- Additional diagnostic trace showing why/where we're scheduling
+					local keyName = callerName or (profile and (profile.playerName or profile.name))
+					dprint(("GrandInvSer: scheduling we_restore_by_userid uid=%s pId=%s nameKey=%s entries=%d"):format(tostring(uid), tostring(pid), tostring(keyName), #filtered))
+
 					dprint(("Scheduling we_restore_by_userid for uid=%s entries=%d (pid=%s)"):format(tostring(uid), #filtered, tostring(pid)))
 					pcall(function() we_restore_by_userid(uid, filtered) end)
 
@@ -6991,6 +6743,7 @@ function GrandInventorySerializer.Restore(...)
 				end
 			end
 		end
+
 	end
 
 	-- CAPTURED SLIMES (cs)
@@ -7504,6 +7257,109 @@ end
 pcall(function()
 	scanAndRegisterPlotsOnStartup()
 end)
+
+
+local function try_find_slime_template()
+	-- Prefer an existing function if present
+	if type(findSlimeTemplate) == "function" then
+		local ok, res = pcall(findSlimeTemplate)
+		if ok and res then return res end
+	end
+
+	-- Fallback: look in common asset locations (best-effort)
+	local function findInPath(root, pathTable)
+		local cur = root
+		for _, seg in ipairs(pathTable) do
+			if not cur or type(cur.FindFirstChild) ~= "function" then return nil end
+			cur = cur:FindFirstChild(seg)
+			if not cur then return nil end
+		end
+		-- Use explicit checks instead of a compact expression to avoid parser errors
+		if cur and type(cur.IsA) == "function" and cur:IsA("Model") then
+			return cur
+		end
+		return nil
+	end
+
+	local candidates = {
+		{ "Assets", "Slime" },
+		{ "Assets" },
+		{ "Slime" },
+	}
+
+	for _, path in ipairs(candidates) do
+		local ok, node = pcall(function() return findInPath(ReplicatedStorage, path) end)
+		if ok and node then return node end
+	end
+
+	-- last-resort: direct lookups
+	local ok, alt = pcall(function()
+		local a = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Assets")
+		if a then
+			local s = a:FindFirstChild("Slime")
+			if s and type(s.IsA) == "function" and s:IsA("Model") then return s end
+		end
+		local top = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Slime")
+		if top and type(top.IsA) == "function" and top:IsA("Model") then return top end
+		return nil
+	end)
+	if ok then return alt end
+	return nil
+end
+
+
+local function sanitize_and_clone_visual(template)
+	-- Prefer project-provided sanitizer if available
+	if type(deepCloneAndSanitize) == "function" then
+		local ok, res = pcall(deepCloneAndSanitize, template)
+		if ok and res then return res end
+	end
+
+	-- Minimal safe fallback: clone and neutralize scripts, ensure parts are non-collidable/unanchored
+	if not template then return nil end
+	local ok, clone = pcall(function() return template:Clone() end)
+	if not ok or not clone then return nil end
+
+	-- Hard cap to avoid enormous clones causing iteration blowups
+	local MAX_DESCENDANTS = 5000
+	local count = 0
+
+	for _, node in ipairs(clone:GetDescendants()) do
+		count = count + 1
+		if count > MAX_DESCENDANTS then
+			-- Too many nodes — abort and return nil to indicate failure to sanitize safely.
+			pcall(function() clone:Destroy() end)
+			return nil
+		end
+
+		pcall(function()
+			-- Scripts / LocalScripts: disable and detach rather than blunt Destroy when possible.
+			if node:IsA("Script") or node:IsA("LocalScript") then
+				-- Attempt to disable (LocalScript supports Disabled property in some contexts)
+				pcall(function() node.Disabled = true end)
+				-- Detach to avoid accidental execution; keep the node in storage for debugging if needed.
+				pcall(function() node.Parent = nil end)
+			elseif node:IsA("ModuleScript") then
+				-- ModuleScripts can execute on require; detach to be safe
+				pcall(function() node.Parent = nil end)
+			elseif node:IsA("BasePart") then
+				-- Make parts non-interfering for restore visuals
+				pcall(function() node.Anchored = false end)
+				pcall(function() node.CanCollide = false end)
+				pcall(function() node.CanTouch = false end)
+				pcall(function() node.CanQuery = false end)
+				-- Massless may not exist on all runtimes; guard the call
+				pcall(function() if node.Massless ~= nil then node.Massless = true end end)
+			end
+		end)
+	end
+
+	return clone
+end
+
+-- Ensure dynamic references resolve to strict versions
+local findPlotForUser = findPlotForUserStrict
+local awaitPlotForUser = awaitPlotForUserStrict
 
 -- Expose some internals (optional) for debugging/testing
 GrandInventorySerializer._internal = {

@@ -1,28 +1,7 @@
 -- PreExitInventorySync.lua (safe revert, with enhanced merge/debug instrumentation)
--- Flush Slime growth, collect live world state, merge growth fields into in-memory profile,
--- update InventoryService, then request a verified save. This variant avoids calling
--- GrandInventorySerializer.PreExitSync (which may itself perform a SaveNow) and avoids
--- aggressive diagnostics that could cause side-effects.
---
--- Patch summary:
---  - Conservative merge logic so non-empty profile arrays are not overwritten by empty payloads.
---  - Debug logging function debugPreExitMerge to print before/after counts for key fields.
---  - After a verified save completes, mark owned world models/tools with a RecentlyPlacedSaved
---    attribute (timestamp) so WorldAssetCleanup will skip them during its leave cleanup grace window.
---  - Added pre-save protection: ensure profile.core.coins is present by restoring from PlayerProfileService.GetCoins()
---    if the in-memory profile appears to have lost coin data before invoking a verified save. This prevents
---    "coins-zeroed-stored" validation blocks.
---  - Added more verbose save-result logging for SaveNowAndWait / ForceFullSaveNow.
---  - INSERTION: call InventoryService.FinalizePlayer (if available) and log its result; when used we skip
---    the module's own verified-save attempt because InventoryService.FinalizePlayer handles serialization/update/save.
---  - INSERTION: mark InventoryService "dirty" (via exposed API or fallback player attribute) BEFORE calling
---    InventoryService.UpdateProfileInventory so InventoryService sees the intent of the pre-exit merge and
---    does not trigger the PreventEmptyOverwrite guard.
---
--- These changes are intended to reduce the risk of an empty snapshot overwriting a
--- previously non-empty inventory/coins during the PreExit merge/save flow and to make the
--- precise merge behavior visible in the logs for debugging.
------------------------------------------------------------------------
+-- Updated to fire a BindableEvent "PreExitInventorySaved" under ServerScriptService.Modules
+-- when the pre-exit verified save/finalize completes (saved == true). WorldAssetCleanup listens
+-- for that event and will run its cleanup after finalization so we avoid race conditions.
 
 local Players                = game:GetService("Players")
 local ServerScriptService    = game:GetService("ServerScriptService")
@@ -66,6 +45,12 @@ do
 	end
 end
 
+local InventoryService = nil
+pcall(function() InventoryService = require(ModulesRoot:WaitForChild("InventoryService")) end)
+
+local InventorySyncUtils = nil
+pcall(function() InventorySyncUtils = require(ModulesRoot:WaitForChild("InventorySyncUtils")) end)
+
 local PreExitInventorySync = {}
 
 local function dprint(...)
@@ -105,8 +90,6 @@ local function deepCopy(src)
 	return dst
 end
 
--- replace the existing collect_world_slimes_with_growth(...) function with this version
-
 local function collect_world_slimes_with_growth(userId)
 	local out = {}
 	for _,inst in ipairs(workspace:GetDescendants()) do
@@ -130,7 +113,7 @@ local function collect_world_slimes_with_growth(userId)
 			local lg = inst:GetAttribute("LastGrowthUpdate")
 			if lg ~= nil then entry.LastGrowthUpdate = lg end
 
-			-- NEW: hunger-related attributes
+			-- hunger-related attributes
 			local cf_full = inst:GetAttribute("CurrentFullness")
 			if cf_full ~= nil then entry.CurrentFullness = cf_full end
 			local fed = inst:GetAttribute("FedFraction")
@@ -262,7 +245,6 @@ local function overwrite_profile_world_slimes_with_payload(profile, payloadWorld
 	return updated
 end
 
--- Debug helper: print before/after counts for merge-sensitive fields
 local function debugPreExitMerge(userId, baseSnapshot, payload, mergedSnapshot)
 	local function cnt(tbl, key) return tbl and tbl[key] and #tbl[key] or 0 end
 	dprint(string.format("[PreExitDebug][Merge] userId=%s base(worldEggs=%d,captured=%d,eggTools=%d,foodTools=%d) payload(worldEggs=%d,captured=%d,eggTools=%d,foodTools=%d) merged(worldEggs=%d,captured=%d,eggTools=%d,foodTools=%d) time=%s",
@@ -273,8 +255,6 @@ local function debugPreExitMerge(userId, baseSnapshot, payload, mergedSnapshot)
 		os.date("%X")))
 end
 
--- Conservative merge: prefer not to overwrite non-empty profile arrays with empty payload arrays.
--- When both sides are non-empty, append any incoming entries that do not already exist (by id/uid).
 local function merge_pre_exit_snapshot_into_profile(profile, payload)
 	if not profile then return false end
 	profile.inventory = profile.inventory or {}
@@ -283,7 +263,6 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 
 	local function ensureList(t, k) if not t[k] or type(t[k]) ~= "table" then t[k] = {} end end
 
-	-- capture baseline for debug
 	local before = {
 		worldEggs = deepCopy(inv.worldEggs),
 		eggTools = deepCopy(inv.eggTools),
@@ -291,7 +270,6 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 		capturedSlimes = deepCopy(inv.capturedSlimes),
 	}
 
-	-- helper to get identifier for entries (best-effort)
 	local function entryId(e)
 		if type(e) ~= "table" then return tostring(e) end
 		return tostring(e.id or e.SlimeId or e.uid or e.Id or e.nm or e.name or "")
@@ -302,24 +280,18 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 		ensureList(inv, fieldName)
 
 		local existing = inv[fieldName] or {}
-		-- if existing empty and incoming non-empty -> adopt incoming (deep copy to avoid shared refs)
 		if (#existing == 0 and #value > 0) then
 			inv[fieldName] = deepCopy(value)
 			applied = true
 			return
 		end
-
-		-- both empty -> nothing to do
 		if #existing == 0 and #value == 0 then
 			return
 		end
-
-		-- existing non-empty and incoming empty -> keep existing (do not overwrite)
 		if #existing > 0 and #value == 0 then
 			return
 		end
 
-		-- both non-empty: merge by id (append missing)
 		local seen = {}
 		for _,e in ipairs(existing) do
 			local id = entryId(e)
@@ -328,7 +300,6 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 		for _,inc in ipairs(value) do
 			local id = entryId(inc)
 			if id == "" then
-				-- append entries with no id (best-effort)
 				table.insert(existing, deepCopy(inc))
 				applied = true
 			else
@@ -347,14 +318,12 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 	mergeField("foodTools",   payload.foodTools   or {})
 	mergeField("capturedSlimes", payload.capturedSlimes or {})
 
-	-- debug snapshot after merge
 	local after = {
 		worldEggs = deepCopy(inv.worldEggs),
 		eggTools = deepCopy(inv.eggTools),
 		foodTools = deepCopy(inv.foodTools),
 		capturedSlimes = deepCopy(inv.capturedSlimes),
 	}
-	-- print debug merge info
 	debugPreExitMerge((profile and (profile.userId or profile.UserId)) or "<unknown>", before, payload or {}, after)
 
 	profile.meta = profile.meta or {}
@@ -363,7 +332,6 @@ local function merge_pre_exit_snapshot_into_profile(profile, payload)
 	return applied
 end
 
--- Mark owned models/tools with a RecentlyPlacedSaved attribute so WorldAssetCleanup will skip them.
 local function mark_owned_models_recently_saved(userId)
 	if not userId then return end
 	local now = tick()
@@ -397,8 +365,6 @@ local function mark_owned_models_recently_saved(userId)
 	dprint("Marked RecentlyPlacedSaved timestamp for owned models/tools for userId=", tostring(userId))
 end
 
--- Attempt to mark InventoryService state as dirty so it recognizes the pre-exit merge intent.
--- This tries several common API names and argument shapes; falls back to setting a short-lived player attribute.
 local function mark_inventory_service_dirty(invServiceModule, player, uid)
 	if not player and not uid then return end
 	local called = false
@@ -410,7 +376,6 @@ local function mark_inventory_service_dirty(invServiceModule, player, uid)
 		end
 	end
 
-	-- Try with player object and userId in many common forms
 	tryInvoke("MarkDirty", player)
 	tryInvoke("MarkDirty", uid)
 	tryInvoke("MarkPlayerDirty", player)
@@ -426,13 +391,50 @@ local function mark_inventory_service_dirty(invServiceModule, player, uid)
 	tryInvoke("MarkStateDirty", player)
 	tryInvoke("MarkStateDirty", uid)
 
-	-- defensive fallback: set a short-lived attribute on the player which InventoryService may inspect,
-	-- or that can be inspected in later debugging. This avoids relying on exact API surface.
 	if not called and player and type(player.SetAttribute) == "function" then
 		pcall(function()
 			player:SetAttribute("__PreExitInventoryMergedAt", os.time())
 			dprint("InvMarkDirty: fallback set player attribute __PreExitInventoryMergedAt")
 		end)
+	end
+end
+
+-- Ensure the bindable exists early so other modules (WorldAssetCleanup) can connect to it promptly.
+local function ensurePreExitBindable()
+	local ok, modulesFolder = pcall(function() return ServerScriptService:FindFirstChild("Modules") end)
+	if not ok or not modulesFolder then return nil end
+	local be = modulesFolder:FindFirstChild("PreExitInventorySaved")
+	if be and be:IsA("BindableEvent") then return be end
+	local okc, created = pcall(function()
+		local b = Instance.new("BindableEvent")
+		b.Name = "PreExitInventorySaved"
+		b.Parent = modulesFolder
+		return b
+	end)
+	if okc then return created end
+	return nil
+end
+-- create proactively (best-effort)
+pcall(ensurePreExitBindable)
+
+-- Provide a helper to ensure the bindable exists and to fire it.
+local function firePreExitSavedBindable(userId, savedFlag)
+	local ok, modulesFolder = pcall(function() return ServerScriptService:FindFirstChild("Modules") end)
+	if not ok or not modulesFolder then return end
+	local be = modulesFolder:FindFirstChild("PreExitInventorySaved")
+	if not be then
+		local success, created = pcall(function()
+			local b = Instance.new("BindableEvent")
+			b.Name = "PreExitInventorySaved"
+			b.Parent = modulesFolder
+			return b
+		end)
+		if success and created then
+			be = created
+		end
+	end
+	if be and be:IsA("BindableEvent") then
+		pcall(function() be:Fire(userId, savedFlag) end)
 	end
 end
 
@@ -447,16 +449,14 @@ function PreExitInventorySync.Init()
 			local uid = player.UserId
 			dprint("PlayerRemoving for", player.Name, "userId=", uid)
 
-			-- Mark that PreExitInventorySync has taken ownership of the leave flow so other handlers can observe.
 			pcall(function()
 				if type(player.SetAttribute) == "function" then
 					player:SetAttribute("__PreExitInventorySyncActive", os.clock())
 				end
 			end)
 
-			awaitProfileQueue(uid, "pre-exit-begin", 2.5)
+			awaitProfileQueue(uid, "pre-exit-begin", 1.0)
 
-			-- attempt to get in-memory profile
 			local profile = nil
 			local okProf, prof = pcall(function() return PlayerProfileService and PlayerProfileService.GetProfile and PlayerProfileService.GetProfile(uid) end)
 			if okProf and type(prof) == "table" then
@@ -471,14 +471,18 @@ function PreExitInventorySync.Init()
 			end
 			local isProfile = (profile ~= nil) and (type(profile) == "table")
 
-			-- require InventoryService defensively
-			local invServiceModule = nil
-			local invOk, InventoryService = pcall(function()
-				return require(ModulesRoot:WaitForChild("InventoryService"))
-			end)
-			if invOk and InventoryService then invServiceModule = InventoryService end
+			local invServiceModule = InventoryService
+			if not invServiceModule then
+				local invOk, invMod = pcall(function() return require(ModulesRoot:WaitForChild("InventoryService")) end)
+				if invOk and invMod then invServiceModule = invMod end
+			end
 
-			-- Flush growth first
+			local invSync = InventorySyncUtils
+			if not invSync then
+				local okis, ismod = pcall(function() return require(ModulesRoot:WaitForChild("InventorySyncUtils")) end)
+				if okis and ismod then invSync = ismod end
+			end
+
 			pcall(function()
 				if SlimeCore and SlimeCore.GrowthService and type(SlimeCore.GrowthService.FlushPlayerSlimes) == "function" then
 					pcall(function() SlimeCore.GrowthService:FlushPlayerSlimes(uid) end)
@@ -488,7 +492,7 @@ function PreExitInventorySync.Init()
 				if SlimeCore and SlimeCore.GrowthPersistenceService then
 					local gps = SlimeCore.GrowthPersistenceService
 					if type(gps.FlushPlayerSlimesAndSave) == "function" then
-						local okFlush, res = pcall(function() return gps.FlushPlayerSlimesAndSave(uid, 4) end)
+						local okFlush, res = pcall(function() return gps.FlushPlayerSlimesAndSave(uid, 1) end)
 						if okFlush then
 							dprint("GrowthPersistenceService.FlushPlayerSlimesAndSave returned:", tostring(res))
 						else
@@ -506,7 +510,6 @@ function PreExitInventorySync.Init()
 				task.wait(0.12)
 			end)
 
-			-- Collect live world state AFTER the flush (including GrowthProgress)
 			local worldSlimes = collect_world_slimes_with_growth(uid)
 			local worldEggs   = collect_world_eggs(uid)
 			local eggTools, foodTools, captured = collect_staged_tools(uid)
@@ -519,7 +522,6 @@ function PreExitInventorySync.Init()
 				capturedSlimes = captured or {},
 			}
 
-			-- Merge payload into profile: for worldSlimes, overwrite growth fields on matching entries
 			if isProfile then
 				local okMerge, mergeRes = pcall(function()
 					return overwrite_profile_world_slimes_with_payload(profile, payload.worldSlimes)
@@ -541,18 +543,14 @@ function PreExitInventorySync.Init()
 				dprint("No in-memory profile object found for", uid, "- will request save by uid")
 			end
 
-			-- Attempt to mark InventoryService as dirty BEFORE we call UpdateProfileInventory so that
-			-- InventoryService's guard logic can observe that a recent pre-exit merge was intended.
 			if invServiceModule then
 				pcall(function()
 					mark_inventory_service_dirty(invServiceModule, player, uid)
 				end)
 			end
 
-			-- Update InventoryService/profile AFTER we've updated worldSlimes growth fields
 			if invServiceModule and type(invServiceModule.UpdateProfileInventory) == "function" then
 				pcall(function()
-					-- Pass overrideEmptyGuard = true so the pre-exit merge intended by this handler is honored
 					local okInv, resInv = pcall(function()
 						return invServiceModule.UpdateProfileInventory(player, { overrideEmptyGuard = true })
 					end)
@@ -564,10 +562,8 @@ function PreExitInventorySync.Init()
 				end)
 			end
 
-			awaitProfileQueue(uid, "post-update-profile", 2.5)
+			awaitProfileQueue(uid, "post-update-profile", 1.0)
 
-			-- === PRE-SAVE PROTECTION: ensure profile.core.coins is present and not accidentally zeroed ===
-			-- Fetch canonical cached profile (may have been updated by InventoryService.UpdateProfileInventory)
 			local canonicalProfile = nil
 			pcall(function() canonicalProfile = PlayerProfileService and PlayerProfileService.GetProfile and PlayerProfileService.GetProfile(uid) end)
 			canonicalProfile = canonicalProfile or profile
@@ -580,7 +576,6 @@ function PreExitInventorySync.Init()
 				end
 			end
 
-			-- If canonicalProfile exists, ensure core/coions exist. If missing/zero while authoritative GetCoins > 0, restore coins.
 			if canonicalProfile and type(canonicalProfile) == "table" then
 				local curCoins = nil
 				pcall(function() curCoins = (canonicalProfile.core and canonicalProfile.core.coins) end)
@@ -589,22 +584,19 @@ function PreExitInventorySync.Init()
 						return PlayerProfileService and PlayerProfileService.GetCoins and PlayerProfileService.GetCoins(uid)
 					end)
 					if okGet and type(authoritativeCoins) == "number" and authoritativeCoins > 0 then
-						-- Restore via SetCoins so PlayerProfileService bookkeeping remains consistent.
 						pcall(function()
-							-- PlayerProfileService.SetCoins accepts player or userId; try both forms.
 							pcall(function() PlayerProfileService.SetCoins(player, authoritativeCoins) end)
 							pcall(function() PlayerProfileService.SetCoins(uid, authoritativeCoins) end)
-							-- schedule a coalesced save now (SaveNow will be debounced inside PlayerProfileService)
-							PlayerProfileService.SaveNow(uid, "PreExit_RestoreCoins")
+							if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
+								PlayerProfileService.SaveNow(uid, "PreExit_RestoreCoins")
+							end
 						end)
 						dprint("Restored coins into profile from authoritative store for", uid, "coins=", authoritativeCoins)
-						-- refresh canonicalProfile reference
 						pcall(function() canonicalProfile = PlayerProfileService.GetProfile(uid) end)
 					end
 				end
 			end
 
-			-- Log summary just before attempting verified save for easier triage if blocked later
 			local function summarize(p)
 				if not p or type(p) ~= "table" then return { coins = nil, captured = 0, world = 0 } end
 				local coins = nil
@@ -618,9 +610,6 @@ function PreExitInventorySync.Init()
 			local beforeSaveSummary = summarize(canonicalProfile or profile)
 			dprint(("Pre-save summary userId=%s coins=%s captured=%d world=%d"):format(tostring(uid), tostring(beforeSaveSummary.coins), beforeSaveSummary.captured, beforeSaveSummary.world))
 
-			-- --- INSERTION: call InventoryService.FinalizePlayer when available and log the result.
-			-- If InventoryService.FinalizePlayer exists we delegate finalization & save to it and skip our own verified-save logic,
-			-- because InventoryService.FinalizePlayer already serializes, updates profile inventory, and requests verified save.
 			local finalizeUsed = false
 			if invServiceModule and type(invServiceModule.FinalizePlayer) == "function" then
 				local okFinal, finalRes = pcall(function()
@@ -634,32 +623,29 @@ function PreExitInventorySync.Init()
 				end
 			end
 
-			-- If InventoryService.FinalizePlayer handled finalization, we skip our own verified-save attempts to avoid double-writing.
 			local numericId = tonumber(uid)
 			local saved = false
 			if not finalizeUsed then
-				-- Request verified save (preferred). Do NOT call GrandInventorySerializer.PreExitSync here to avoid
-				-- serializer-driven SaveNow calls that may persist partial/empty snapshots.
 				local okSaveNowAndWait, saveRes = pcall(function()
 					if PlayerProfileService and type(PlayerProfileService.SaveNowAndWait) == "function" then
-						dprint("Invoking PlayerProfileService.SaveNowAndWait for", numericId)
-						return PlayerProfileService.SaveNowAndWait(numericId, 4, {
+						dprint("Invoking PlayerProfileService.SaveNowAndWait (fail-fast) for", numericId)
+						return PlayerProfileService.SaveNowAndWait(numericId, 1.25, {
 							verified = true,
 							reason = "PreExit",
 							failFast = true,
-							noFallback = true,
+							noFallback = false,
 						})
 					elseif PlayerProfileService and type(PlayerProfileService.ForceFullSaveNow) == "function" then
-						dprint("Invoking PlayerProfileService.ForceFullSaveNow for", numericId)
-						return PlayerProfileService.ForceFullSaveNow(numericId, "PreExitInventorySync_Verified", { failFast = true, noFallback = true })
+						dprint("Invoking PlayerProfileService.ForceFullSaveNow (fail-fast) for", numericId)
+						return PlayerProfileService.ForceFullSaveNow(numericId, "PreExitInventorySync_Verified", { failFast = true, noFallback = false })
 					else
 						if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
 							dprint("Invoking PlayerProfileService.SaveNow (async fallback) for", numericId)
 							PlayerProfileService.SaveNow(numericId, "PreExitInventorySync_AsyncFallback")
 						end
 						if PlayerProfileService and type(PlayerProfileService.WaitForSaveComplete) == "function" then
-							dprint("Waiting for PlayerProfileService.WaitForSaveComplete for", numericId)
-							return PlayerProfileService.WaitForSaveComplete(numericId, 2)
+							dprint("Waiting briefly for PlayerProfileService.WaitForSaveComplete for", numericId)
+							return PlayerProfileService.WaitForSaveComplete(numericId, 0.5)
 						end
 						return false
 					end
@@ -675,11 +661,11 @@ function PreExitInventorySync.Init()
 					end
 					dprint("Save call returned for", numericId, "saved=", tostring(saved), "raw=", tostring(saveRes))
 				else
-					dprint("SaveNowAndWait/ForceFullSaveNow call failed for", uid, "err=", tostring(saveRes))
+					dprint("SaveNowAndWait/ForceFullSaveNow call (fail-fast) failed for", uid, "err=", tostring(saveRes))
 				end
 
 				if not saved then
-					dprint("Verified save not observed; falling back to async SaveNow and waiting (best-effort)")
+					dprint("Verified save not observed (fail-fast); scheduling async SaveNow and continuing (short best-effort wait)")
 					pcall(function()
 						if PlayerProfileService and type(PlayerProfileService.SaveNow) == "function" then
 							PlayerProfileService.SaveNow(numericId, "PreExitInventorySync_Fallback")
@@ -687,28 +673,52 @@ function PreExitInventorySync.Init()
 					end)
 					pcall(function()
 						if PlayerProfileService and type(PlayerProfileService.WaitForSaveComplete) == "function" then
-							PlayerProfileService.WaitForSaveComplete(numericId, 2)
+							PlayerProfileService.WaitForSaveComplete(numericId, 0.5)
 							saved = true
 						end
 					end)
-					if not saved then task.wait(0.35) end
+					if not saved then task.wait(0.25) end
 				end
 			else
-				-- FinalizePlayer was used: we assume it handled serialization and triggering of save (and respected guard).
-				-- We intentionally do not perform another verified save here to avoid double-writes or accidental overwrites.
 				dprint("Skipped module-level verified save because InventoryService.FinalizePlayer was used for uid=", tostring(uid))
-				-- We set saved = true to allow post-save marking behavior below; InventoryService.FinalizePlayer may have actually saved.
 				saved = true
 			end
 
-			-- If we got a verified save, mark freshly-saved owned models/tools so cleanup won't destroy them prematurely.
 			if saved then
 				pcall(function()
 					mark_owned_models_recently_saved(uid)
 				end)
 			end
 
-			awaitProfileQueue(uid, "post-finalize", 3.0)
+			if invSync and type(invSync.safeRemoveWorldEggForPlayer) == "function" and payload and payload.worldEggs then
+				pcall(function()
+					for _, we in ipairs(payload.worldEggs) do
+						local id = we and (we.id or we.eggId or we.EggId)
+						if id then
+							invSync.safeRemoveWorldEggForPlayer(player or uid, id)
+						end
+					end
+				end)
+			end
+
+			if not invSync and player and player:FindFirstChild("Inventory") and payload and payload.worldEggs then
+				pcall(function()
+					local folder = player.Inventory:FindFirstChild("worldEggs")
+					if folder then
+						for _, we in ipairs(payload.worldEggs) do
+							local id = we and (we.id or we.eggId or we.EggId)
+							if id then
+								local f = folder:FindFirstChild("Entry_" .. tostring(id))
+								if f then
+									pcall(function() f:Destroy() end)
+								end
+							end
+						end
+					end
+				end)
+			end
+
+			awaitProfileQueue(uid, "post-finalize", 1.5)
 
 			pcall(function()
 				if type(player.SetAttribute) == "function" then
@@ -717,6 +727,12 @@ function PreExitInventorySync.Init()
 						player:SetAttribute("__PreExitInventorySyncFinalizedAt", os.clock())
 					end
 				end
+			end)
+
+			-- FIRE bindable to signal Post-PreExit finalization/saved state
+			-- WorldAssetCleanup listens for this and will run cleanup after finalization.
+			pcall(function()
+				firePreExitSavedBindable(uid, saved)
 			end)
 
 			dprint("PreExitInventorySync persistence complete (saved="..tostring(saved)..") for userId=", numericId)

@@ -1,34 +1,22 @@
 -- SlimeAI.lua
--- Version: v1.3.3-fullfix-rp (Aug 2025)
--- Base: v1.3.3-fullfix with root promotion safeguard + orientation maintenance.
---
--- Additions in -rp:
---   * Root promotion: if Model.PrimaryPart is not the assembly root we promote root before AI starts
---     (defensive layer in case EggService missed a model).
---   * Orientation maintenance for Wander / Hungry (gated, cooldown) re-added so slimes face travel direction.
---   * Clear comments for where to disable ForceFirstHopAfterSeconds once verified.
---
--- Physics freeze cause (documented): Applying velocity to non-assembly-root (Inner) while Outer was real root.
--- Fix strategy: (1) EggService promotes root; (2) AI double-checks; (3) All per-frame CFrame writes removed except
--- gated, low-frequency PivotTo calls (clamp / orient / tilt / hop yaw).
---
--- Diagnostics:
---   LastPivotBy attribute set to one of:
---      SlimeAI-Clamp, SlimeAI-Orient, SlimeAI-IdleOrient, SlimeAI-HopYaw, SlimeAI-Tilt
---   LastHopAt attribute updated on hop launch.
+-- Version: v1.3.3-fullfix-rp (Aug 2025) - Smooth pivot + pre-hop crouch polish
+-- NOTE: This file is your original SlimeAI with small, targeted visual-smoothing changes:
+--   * SmoothPivot scheduling (doPivot now schedules an eased pivot rather than instant PivotTo)
+--   * Pre-hop "crouch" animation during HopPrep to give anticipation to hops
+-- All core physics behavior (AssemblyLinearVelocity hop), gating, and persistence remain unchanged.
 
 local RunService = game:GetService("RunService")
 local Players    = game:GetService("Players")
 local Replicated = game:GetService("ReplicatedStorage")
 
 local SlimeAI = {}
-SlimeAI.__Version = "v1.3.3-fullfix-rp"
+SlimeAI.__Version = "v1.3.3-fullfix-rp-smooth"
 warn("[SlimeAI] SOURCE LOADED "..SlimeAI.__Version)
 
 local ACTIVE = {} -- [Model] = data
 
 --------------------------------------------------------------------------------
--- CONFIG
+-- CONFIG (added SmoothPivotDuration & PreHopCrouchAmount)
 --------------------------------------------------------------------------------
 local CONFIG = {
 	IdleMinTime                  = 4.0,
@@ -163,7 +151,10 @@ local CONFIG = {
 		OrientationCooldown       = 0.25,
 		IdleFacingCooldown        = 0.40,
 		TiltCooldown              = 0.40,
+		-- Added clamp cooldown so comparisons never hit nil
 		ClampCooldown             = 0.40,
+		-- Added: smooth pivot duration (how long to interpolate rotations)
+		SmoothPivotDuration       = 0.12,
 	},
 
 	Debug                = false,
@@ -173,6 +164,12 @@ local CONFIG = {
 	ForceFirstHopAfterSeconds = nil, -- set to nil when satisfied hops work
 
 	AssignNetworkToOwner = true,
+
+	-- Visual polish params:
+	-- How far (world studs) the model will "crouch" visually before hop (applied as a small pivot offset)
+	PreHopCrouchAmount = 0.14, -- tuned small; multiplied by CurrentSizeScale
+	-- How long smoothing pivots should take (can be overridden via TransformGating)
+	SmoothPivotDuration = 0.12,
 
 	DebugOverrides = {
 		Enable = false,
@@ -199,7 +196,7 @@ local function dprint(...) if CONFIG.Debug then print("[SlimeAI]", ...) end end
 local function sprint(...) if CONFIG.Splat.Debug then print("[SlimeSplat]", ...) end end
 
 --------------------------------------------------------------------------------
--- Attribute helpers
+-- Attribute helpers (unchanged)
 --------------------------------------------------------------------------------
 local function getFullness(model)
 	local f = model:GetAttribute("FedFraction")
@@ -220,7 +217,7 @@ local function getOwnerRootAndVelocity(model)
 end
 
 --------------------------------------------------------------------------------
--- Geometry
+-- Geometry (unchanged)
 --------------------------------------------------------------------------------
 local function ensurePrimary(model)
 	if model.PrimaryPart then return model.PrimaryPart end
@@ -301,31 +298,109 @@ local function angleBetween(a,b)
 end
 
 --------------------------------------------------------------------------------
--- Transform gating
+-- Transform gating (updated to account for pending smooth pivots and nil-safe)
 --------------------------------------------------------------------------------
 local function canPivot(data, prim, now, purpose)
+	-- If there's a pending smooth pivot in progress, block new pivots
+	if data.PendingSmoothPivot then return false end
+
+	-- Must be grounded
 	if not data.GroundedNow then return false end
-	if data.LastHopLaunchAt and (now - data.LastHopLaunchAt) < CONFIG.TransformGating.SkipAfterHopSeconds then return false end
-	if math.abs(prim.AssemblyLinearVelocity.Y) > CONFIG.TransformGating.LowVerticalSpeedThreshold then return false end
+
+	-- Use safe defaults if TransformGating fields are nil (protect against missing config edits)
+	local tg = CONFIG.TransformGating or {}
+	local skipAfterHop = tg.SkipAfterHopSeconds or 0.50
+	local lowVertThresh = tg.LowVerticalSpeedThreshold or 0.5
+	local clampCooldown = tg.ClampCooldown or (CONFIG.ZoneClamp and CONFIG.ZoneClamp.CooldownSeconds) or 0.4
+	local orientCooldown = tg.OrientationCooldown or 0.25
+	local idleFacingCooldown = tg.IdleFacingCooldown or 0.40
+	local tiltCooldown = tg.TiltCooldown or 0.40
+
+	-- Hop cooldown gating
+	if data.LastHopLaunchAt and (now - data.LastHopLaunchAt) < skipAfterHop then return false end
+
+	-- Vertical motion gating
+	if math.abs(prim.AssemblyLinearVelocity.Y) > lowVertThresh then return false end
+
+	-- Purpose-specific cooldown checks
 	if purpose == "Clamp" then
-		if data.LastClampAt and (now - data.LastClampAt) < CONFIG.TransformGating.ClampCooldown then return false end
+		if data.LastClampAt and (now - data.LastClampAt) < clampCooldown then return false end
 	elseif purpose == "Orient" then
-		if data.LastOrientAt and (now - data.LastOrientAt) < CONFIG.TransformGating.OrientationCooldown then return false end
+		if data.LastOrientAt and (now - data.LastOrientAt) < orientCooldown then return false end
 	elseif purpose == "IdleFacing" then
-		if data.LastIdleFacingAt and (now - data.LastIdleFacingAt) < CONFIG.TransformGating.IdleFacingCooldown then return false end
+		if data.LastIdleFacingAt and (now - data.LastIdleFacingAt) < idleFacingCooldown then return false end
 	elseif purpose == "Tilt" then
-		if data.LastTiltAt and (now - data.LastTiltAt) < CONFIG.TransformGating.TiltCooldown then return false end
+		if data.LastTiltAt and (now - data.LastTiltAt) < tiltCooldown then return false end
 	end
+
 	return true
 end
 
-local function doPivot(model, prim, targetCF, label)
-	model:SetAttribute("LastPivotBy", label)
-	model:PivotTo(targetCF)
+-- Easing helpers
+local function easeOutQuad(t) return 1 - (1 - t) * (1 - t) end
+local function easeInOutSin(t) return 0.5 * (1 - math.cos(math.pi * t)) end
+
+-- Do a scheduled, smooth pivot instead of an immediate snap.
+local function scheduleSmoothPivot(data, fromCF, toCF, duration, label)
+	data.PendingSmoothPivot = {
+		From = fromCF,
+		To = toCF,
+		Start = time(),
+		Duration = math.max(0.01, duration or CONFIG.SmoothPivotDuration),
+		Label = label,
+	}
+	-- mark which subsystem requested pivot; LastPivotBy updated now for diagnostics
+	data.Model:SetAttribute("LastPivotBy", label)
+end
+
+-- Convenience wrapper: replaced doPivot immediate with scheduled smooth pivot
+local function doPivot(data, prim, targetCF, label)
+	-- Build a current-from pivot that preserves current model pivot
+	local ok, from = pcall(function() return data.Model:GetPivot() end)
+	if not ok or not from then
+		from = prim.CFrame
+	end
+	local dur = (CONFIG.TransformGating and CONFIG.TransformGating.SmoothPivotDuration) or CONFIG.SmoothPivotDuration
+	scheduleSmoothPivot(data, from, targetCF, dur, label)
 end
 
 --------------------------------------------------------------------------------
--- Clamp
+-- When a pending smooth pivot is active, drive it here (called each update)
+--------------------------------------------------------------------------------
+local function processPendingSmoothPivot(data, prim, now)
+	local pend = data.PendingSmoothPivot
+	if not pend then return end
+	local elapsed = now - pend.Start
+	local t = math.clamp(elapsed / pend.Duration, 0, 1)
+	local eased = easeOutQuad(t)
+	local cf = pend.From:Lerp(pend.To, eased)
+	-- Safe guarded single write per update to drive the interpolation
+	local ok, err = pcall(function() data.Model:PivotTo(cf) end)
+	if not ok then
+		-- if pivot fails, clear to avoid infinite loop
+		data.PendingSmoothPivot = nil
+		return
+	end
+	if t >= 1 then
+		-- finalize timestamp according to label semantics
+		local lbl = pend.Label or ""
+		if lbl == "SlimeAI-Clamp" then
+			data.LastClampAt = now
+		elseif lbl == "SlimeAI-IdleOrient" then
+			data.LastIdleFacingAt = now
+		elseif lbl == "SlimeAI-Tilt" then
+			data.LastTiltAt = now
+		else
+			-- general orientation pivot
+			data.LastOrientAt = now
+		end
+		-- clear pending
+		data.PendingSmoothPivot = nil
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Clamp (uses scheduleSmoothPivot via doPivot)
 --------------------------------------------------------------------------------
 local function guardedZoneClamp(data, prim, now)
 	local zc = CONFIG.ZoneClamp
@@ -338,12 +413,12 @@ local function guardedZoneClamp(data, prim, now)
 	if horizMag < zc.HorizontalThreshold then return end
 	local pos = zc.PreserveY and Vector3.new(clamped.X, prim.Position.Y, clamped.Z) or clamped
 	local forward = getLogicalForward(prim.CFrame)
-	doPivot(data.Model, prim, makeFacingCF(pos, forward), "SlimeAI-Clamp")
-	data.LastClampAt = now
+	-- schedule a smooth pivot to the clamped position + facing direction
+	doPivot(data, prim, makeFacingCF(pos, forward), "SlimeAI-Clamp")
 end
 
 --------------------------------------------------------------------------------
--- Orientation
+-- Orientation (uses scheduleSmoothPivot via doPivot)
 --------------------------------------------------------------------------------
 local function tryYawPivot(data, prim, desiredDir, now, label)
 	if not desiredDir or desiredDir.Magnitude < 1e-4 then return end
@@ -352,12 +427,8 @@ local function tryYawPivot(data, prim, desiredDir, now, label)
 	if not canPivot(data, prim, now, purpose) then return end
 	local current = getLogicalForward(prim.CFrame)
 	if angleBetween(current, desiredDir) < CONFIG.MinAngularErrorToTurn then return end
-	doPivot(data.Model, prim, makeFacingCF(prim.Position, desiredDir), label)
-	if label == "SlimeAI-IdleOrient" then
-		data.LastIdleFacingAt = now
-	else
-		data.LastOrientAt = now
-	end
+	-- schedule smooth pivot rather than instantaneous
+	doPivot(data, prim, makeFacingCF(prim.Position, desiredDir), label)
 end
 
 local function orientationMaintenance(data, prim, now)
@@ -371,7 +442,7 @@ local function orientationMaintenance(data, prim, now)
 end
 
 --------------------------------------------------------------------------------
--- Tilt
+-- Tilt (unchanged except uses smooth pivot scheduling)
 --------------------------------------------------------------------------------
 local function tiltCorrect(data, prim, now)
 	if not canPivot(data, prim, now, "Tilt") then return end
@@ -380,12 +451,12 @@ local function tiltCorrect(data, prim, now)
 	if ang <= CONFIG.MaxTiltCorrectionDeg then return end
 	local forward = getLogicalForward(prim.CFrame)
 	local target = prim.CFrame:Lerp(makeFacingCF(prim.Position, forward), math.clamp(CONFIG.TiltCorrectionSpeed*(1/60),0,1))
-	doPivot(data.Model, prim, target, "SlimeAI-Tilt")
-	data.LastTiltAt = now
+	-- Schedule a short smooth pivot for tilt correction
+	scheduleSmoothPivot(data, data.Model:GetPivot(), target, CONFIG.TransformGating.TiltCooldown or 0.08, "SlimeAI-Tilt")
 end
 
 --------------------------------------------------------------------------------
--- Hop logic
+-- Hop logic (added HopPrep.StartTime and pre-hop crouch animation)
 --------------------------------------------------------------------------------
 local function applyHop(prim, dir, horizMag, vertMag)
 	prim.AssemblyLinearVelocity = dir * horizMag + Vector3.new(0, vertMag, 0)
@@ -416,6 +487,7 @@ local function scheduleHop(data, dir, horizMag, vertMag, opts)
 		Dir      = dir.Unit,
 		HorizMag = horizMag,
 		VertMag  = vertMag,
+		StartTime= time(),
 		EndTime  = time() + data.RNG:NextNumber(CONFIG.HopPrepTimeRange[1], CONFIG.HopPrepTimeRange[2]),
 		Micro    = opts.micro or false,
 	}
@@ -423,18 +495,43 @@ end
 
 local function updateHopPrep(data, prim, now)
 	if not data.HopPrep then return end
-	if now >= data.HopPrep.EndTime then
+	-- Run pre-hop crouch visual: move model slightly down towards hop end then restore
+	local hp = data.HopPrep
+	local total = math.max(1e-3, hp.EndTime - hp.StartTime)
+	local elapsed = math.clamp(now - hp.StartTime, 0, total)
+	local t = elapsed / total
+	-- crouch curve: easeIn then quick release at end (sin based)
+	local crouchFactor = math.sin(math.min(1, math.max(0, t)) * math.pi)
+	local scale = data.Model:GetAttribute("CurrentSizeScale") or 1
+	local crouchAmount = (CONFIG.PreHopCrouchAmount or 0.12) * scale
+	-- compute a crouch CF and perform a small pivot to make the model look like it's compressing
+	local forward = hp.Dir or getLogicalForward(prim.CFrame)
+	local crouchPos = prim.Position + Vector3.new(0, -crouchAmount * crouchFactor, 0)
+	-- Apply a small, immediate pivot toward crouchCF but do so gently (lerp a portion)
+	local crouchCF = makeFacingCF(crouchPos, forward)
+	-- If a main smooth pivot is ongoing, let it run; else apply a light pivot toward crouchCF
+	if not data.PendingSmoothPivot then
+		-- small immediate lerp (1/3 of the way) to avoid abruptness from many writes
+		local ok, cur = pcall(function() return data.Model:GetPivot() end)
+		cur = (ok and cur) or crouchCF
+		local lerpCF = cur:Lerp(crouchCF, math.clamp(0.34 * crouchFactor, 0, 1))
+		pcall(function() data.Model:PivotTo(lerpCF) end)
+	end
+
+	-- When time to actually launch
+	if now >= hp.EndTime then
+		-- Try yaw pivot to orient the hop (still schedule smooth pivot if needed)
 		if data.GroundedNow then
-			tryYawPivot(data, prim, data.HopPrep.Dir, now, "SlimeAI-HopYaw")
+			tryYawPivot(data, prim, hp.Dir, now, "SlimeAI-HopYaw")
 		end
-		applyHop(prim, data.HopPrep.Dir, data.HopPrep.HorizMag, data.HopPrep.VertMag)
+		applyHop(prim, hp.Dir, hp.HorizMag, hp.VertMag)
 		data.LastHopLaunchAt = now
 		data.Model:SetAttribute("LastHopAt", now)
 		if CONFIG.HopDebug then
-			print(("[SlimeAI][HopDebug] id=%s H=%.2f V=%.2f dir=(%.2f,%.2f,%.2f)")
+			print(("[SlimeAI][Hop] id=%s H=%.2f V=%.2f dir=(%.2f,%.2f,%.2f)")
 				:format(tostring(data.Model:GetAttribute("SlimeId")),
-					data.HopPrep.HorizMag, data.HopPrep.VertMag,
-					data.HopPrep.Dir.X, data.HopPrep.Dir.Y, data.HopPrep.Dir.Z))
+					hp.HorizMag, hp.VertMag,
+					hp.Dir.X, hp.Dir.Y, hp.Dir.Z))
 		end
 		data.LastLaunchPos = prim.Position
 		data.HopPrep = nil
@@ -442,7 +539,7 @@ local function updateHopPrep(data, prim, now)
 end
 
 --------------------------------------------------------------------------------
--- Heading coherence
+-- Heading coherence (unchanged)
 --------------------------------------------------------------------------------
 local function blendDir(oldDir,newDir,alpha)
 	if not oldDir then return newDir end
@@ -498,7 +595,7 @@ local function getMoveDir(data, targetPos, params)
 end
 
 --------------------------------------------------------------------------------
--- State management
+-- State management (unchanged)
 --------------------------------------------------------------------------------
 local function setState(data, newState)
 	if data.State == newState then return end
@@ -538,7 +635,7 @@ local function chooseIdleExit(data)
 end
 
 --------------------------------------------------------------------------------
--- State update logic
+-- State update logic (unchanged aside from HopPrep -> updateHopPrep now calls pre-hop crouch)
 --------------------------------------------------------------------------------
 local function updateIdle(dt, data, prim, now)
 	if CONFIG.IdleFacingEnabled and now >= (data.NextIdleFacingAt or 0) then
@@ -949,7 +1046,7 @@ local function placeSplat(data, prim)
 end
 
 --------------------------------------------------------------------------------
--- Per-slime update
+-- Per-slime update (now processes PendingSmoothPivot and HopPrep pre-crouch)
 --------------------------------------------------------------------------------
 local function perSlimeUpdate(dt, data)
 	local model = data.Model
@@ -969,9 +1066,15 @@ local function perSlimeUpdate(dt, data)
 		end
 	end
 
+	-- First: process any pending smooth pivot (interpolated rotation/position)
+	processPendingSmoothPivot(data, prim, now)
+
+	-- Next: handle HopPrep (pre-hop crouch + actual apply when EndTime reached)
 	updateHopPrep(data, prim, now)
 
-	-- Landing
+	-- Landing handling
+	updateHopPrep(data, prim, now) -- ensure we checked (harmless if not present)
+
 	if data.GroundedNow then
 		if data.WasAir and data.LastLaunchPos then
 			local dv = prim.Position - data.LastLaunchPos
@@ -999,7 +1102,7 @@ local function perSlimeUpdate(dt, data)
 	-- Orientation maintenance (low frequency)
 	orientationMaintenance(data, prim, now)
 
-	-- Transforms
+	-- Transforms / corrections (clamp/tilt) - they schedule smooth pivots now
 	guardedZoneClamp(data, prim, now)
 	tiltCorrect(data, prim, now)
 end

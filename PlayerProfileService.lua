@@ -10,7 +10,10 @@
 -- - Fixed debug.shadow crash: captured original Lua debug library and use it for tracebacks.
 -- - Added PlayerProfileService.ApplySale for atomic sale application (coins + inventory removals + verified persist).
 -- - Added CoinsChanged BindableEvent + exported .CoinsChanged Event for consumers to subscribe to profile-driven coin updates.
--- - Default CONFIG.Debug = false (no spam). Set CONFIG.Debug=true for verbose debug.
+-- - Default CONFIG.Debug = true (for debugging runs). Set CONFIG.Debug=false for less noisy output.
+-- - NEW: Fires PreExitInventorySaved bindable (ServerScriptService.Modules.PreExitInventorySaved) when a pre-exit verified save
+--   completes (or fails) for callers that request a PreExit/PreExitInventorySync save. WorldAssetCleanup listens for this event
+--   to know when it is safe to run destruction of world assets.
 -----------------------------------------------------------------------
 
 local DataStoreService     = game:GetService("DataStoreService")
@@ -29,7 +32,7 @@ local PlayerProfileService = {}
 
 local LUA_DEBUG = debug
 local CONFIG = {
-	Debug = false,
+	Debug = true,
 }
 local PRODUCTION_SAFE_MODE = true
 local PPS_DEBUG_UPDATEASYNC = CONFIG.Debug
@@ -42,9 +45,9 @@ local serverClosing    = false
 local lastSaveResult   = {}
 local SAVE_DEBOUNCE_SECONDS = 0.35
 local PERIODIC_FLUSH_INTERVAL = 5
-local EXIT_SAVE_ATTEMPTS      = 3
+local EXIT_SAVE_ATTEMPTS      = 3          -- keep default outside shutdown
 local EXIT_SAVE_BACKOFF       = 0.4
-local EXIT_SAVE_VERIFY_DELAY  = 0.15
+local EXIT_SAVE_VERIFY_DELAY  = 0.06   
 
 local SUSPICIOUS_SAVE_BLOCK_WINDOW = 5
 local SAVE_RATE_WINDOW = 1
@@ -71,6 +74,24 @@ end
 
 local function log(...)
 	debug(...)
+end
+
+local function safe_traceback()
+	-- Return a best-effort traceback string without risking calls into a shadowed/modified debug object.
+	local ok, tb = pcall(function()
+		-- Prefer the captured LUA_DEBUG if available, otherwise fall back to global debug.traceback
+		if LUA_DEBUG and type(LUA_DEBUG.traceback) == "function" then
+			return LUA_DEBUG.traceback()
+		end
+		if debug and type(debug.traceback) == "function" then
+			return debug.traceback()
+		end
+		return "no-debug-traceback-available"
+	end)
+	if ok and tb then
+		return tb
+	end
+	return "traceback-unavailable"
 end
 
 local function keyFor(uid)
@@ -210,6 +231,27 @@ do
 		return be
 	end)
 	if ok and ev then _SaveCompleteBindable = ev end
+end
+
+-- NEW: Bindable used to signal PreExitInventorySaved. We will create/find and fire it when pre-exit verified saves complete (or fail).
+local function firePreExitInventorySaved(userId, savedFlag)
+	pcall(function()
+		local parent = ServerScriptService:FindFirstChild("Modules") or ServerScriptService
+		local be = parent:FindFirstChild("PreExitInventorySaved")
+		if not be then
+			-- create it if missing
+			local ok, created = pcall(function()
+				local b = Instance.new("BindableEvent")
+				b.Name = "PreExitInventorySaved"
+				b.Parent = parent
+				return b
+			end)
+			if ok then be = created end
+		end
+		if be and be.IsA and be:IsA("BindableEvent") then
+			pcall(function() be:Fire(userId, savedFlag and true or false) end)
+		end
+	end)
 end
 
 -- NEW: CoinsChanged bindable for profile-driven coin updates.
@@ -579,6 +621,23 @@ local function appendAuditRecord(tag, payloadTable)
 	end
 end
 
+-- Small profile summary for debug (lightweight, safe)
+local function smallProfileSummaryForDebug(p)
+	if not p or type(p) ~= "table" then return {} end
+	local s = {}
+	s.userId = p.userId
+	s.persistentId = p.persistentId
+	s.meta_keys = (p.meta and next(p.meta)) and true or false
+	-- surface likely spawn/plot candidate fields
+	s.plotCandidate = (p.extra and p.extra.plotId) or (p.meta and p.meta.plotId) or (p.core and p.core.plotId) or nil
+	s.captured = (p.inventory and p.inventory.capturedSlimes and #p.inventory.capturedSlimes) or 0
+	s.world = (p.inventory and p.inventory.worldSlimes and #p.inventory.worldSlimes) or 0
+	s.eggTools = (p.inventory and p.inventory.eggTools and #p.inventory.eggTools) or 0
+	s.foodTools = (p.inventory and p.inventory.foodTools and #p.inventory.foodTools) or 0
+	s.coins = (p.core and p.core.coins) or nil
+	return s
+end
+
 local function loadProfile(userId)
 	local key = keyFor(userId)
 	local data = nil
@@ -616,6 +675,17 @@ local function loadProfile(userId)
 		debug(("[PPS][PersistentId] Assigned persistentId=%s to userId=%s (will persist)"):format(tostring(pid), tostring(userId)))
 	end
 	profileCache[userId] = data
+
+	-- Lightweight load debug summary for correlation (non-spammy)
+	pcall(function()
+		local ok, json = pcall(function() return HttpService:JSONEncode(smallProfileSummaryForDebug(data)) end)
+		if ok and json then
+			print("[PlayerProfileService][DEBUG][PPS][LOAD_DEBUG] userId=" .. tostring(userId) .. " profile_summary=" .. tostring(json))
+		else
+			print("[PlayerProfileService][DEBUG][PPS][LOAD_DEBUG] userId=" .. tostring(userId) .. " profile_summary=<encode-failed>")
+		end
+	end)
+
 	debug(string.format("[PPS][DEBUG] loaded profile %s coins=%s eggTools=%d foodTools=%d capturedSlimes=%d worldSlimes=%d worldEggs=%d dataVersion=%s persistentId=%s",
 		tostring(userId),
 		tostring((data.core and data.core.coins) or 0),
@@ -852,7 +922,8 @@ end
 pcall(function()
 	game:BindToClose(function()
 		serverClosing = true
-		awaitAllQueues(6)
+		-- Keep BindToClose short: wait briefly for debounced queue flush but avoid long blocking.
+		awaitAllQueues(3)
 	end)
 end)
 
@@ -1053,11 +1124,19 @@ function PlayerProfileService.GetOrAssignPersistentId(...)
 	if type(playerOrProfile) == "table" and playerOrProfile.inventory and playerOrProfile ~= profile then
 	end
 	if profile.persistentId and type(profile.persistentId) == "string" then
+		-- If a Player instance was passed, ensure attribute is set for handshake
+		if typeof(playerOrProfile) == "Instance" and playerOrProfile:IsA("Player") and playerOrProfile.SetAttribute then
+			pcall(function() playerOrProfile:SetAttribute("PersistentId", profile.persistentId) end)
+		end
 		return profile.persistentId
 	end
 	local pid = generatePersistentId(userId or profile.userId)
 	profile.persistentId = pid
 	scheduleSave(userId, "AssignPersistentId")
+	-- If we were called with a Player instance, set attribute for downstream code (PlotManager)
+	if typeof(playerOrProfile) == "Instance" and playerOrProfile:IsA("Player") and playerOrProfile.SetAttribute then
+		pcall(function() playerOrProfile:SetAttribute("PersistentId", pid) end)
+	end
 	debug(("[PPS][PersistentId] Assigned persistentId=%s to userId=%s via GetOrAssign"):format(tostring(pid), tostring(userId)))
 	return pid
 end
@@ -1469,6 +1548,11 @@ function PlayerProfileService.ForceFullSaveNow(...)
 			prof.meta.__lastSavedSnapshot = deepCopy(prof)
 		end
 		fireSaveComplete(userId, true)
+		-- If this ForceFullSaveNow was called for a PreExit flow, notify PreExitInventorySaved listeners that a save was observed.
+		local reasonStr = tostring(reason or "")
+		if reasonStr:find("PreExit") then
+			pcall(function() firePreExitInventorySaved(userId, true) end)
+		end
 		return true
 	end
 
@@ -1485,6 +1569,11 @@ function PlayerProfileService.ForceFullSaveNow(...)
 				scheduleSave(userId, reason or "ForceFullSave_EarlyAbort")
 			else
 				debug("ForceFullSaveNow skipping fallback schedule due to noFallback option for userId", userId)
+			end
+			-- If PreExit flow, notify that verified save did not complete
+			local reasonStr = tostring(reason or "")
+			if reasonStr:find("PreExit") then
+				pcall(function() firePreExitInventorySaved(userId, false) end)
 			end
 			return false
 		end
@@ -1510,6 +1599,11 @@ function PlayerProfileService.ForceFullSaveNow(...)
 		appendAuditRecord("blocked_verified_save", audit)
 		warn(("Prevented suspicious ForceFullSaveNow for userId=%s reason=%s validation=%s (audit recorded)"):format(tostring(userId), tostring(reason or "unspecified"), tostring(vreason)))
 		debug("[PPS][BLOCKED VERIFIED TRACEBACK]", trace)
+		-- If PreExit flow, notify that verified save did not complete
+		local reasonStr = tostring(reason or "")
+		if reasonStr:find("PreExit") then
+			pcall(function() firePreExitInventorySaved(userId, false) end)
+		end
 		return false
 	end
 
@@ -1567,6 +1661,8 @@ function PlayerProfileService.ForceFullSaveNow(...)
 
 	saveLocks[userId] = nil
 
+	local reasonStr = tostring(reason or "")
+
 	if okOverall then
 		local prof = profileCache[userId]
 		if prof then
@@ -1576,6 +1672,12 @@ function PlayerProfileService.ForceFullSaveNow(...)
 		lastSaveResult[userId] = { ts = os.clock(), success = true }
 		fireSaveComplete(userId, true)
 		debug(("ForceFullSaveNow succeeded for userId=%s (duration=%.2fs)"):format(tostring(userId), os.clock() - startT))
+
+		-- If this save was requested as part of a PreExit flow (reason contains "PreExit"), notify interested consumers
+		if reasonStr:find("PreExit") then
+			pcall(function() firePreExitInventorySaved(userId, true) end)
+		end
+
 		return true
 	else
 		lastSaveResult[userId] = { ts = os.clock(), success = false }
@@ -1588,6 +1690,12 @@ function PlayerProfileService.ForceFullSaveNow(...)
 		else
 			warn(("ForceFullSaveNow failed for userId=%s after attempts; noFallback set so skipping async retry"):format(tostring(userId)))
 		end
+
+		-- If this save was requested as part of a PreExit flow (reason contains "PreExit"), notify interested consumers the verified save did not complete.
+		if reasonStr:find("PreExit") then
+			pcall(function() firePreExitInventorySaved(userId, false) end)
+		end
+
 		return false
 	end
 end
